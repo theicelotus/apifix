@@ -1,0 +1,472 @@
+"""Sandbox orchestration against a fake Docker: no daemon needed."""
+
+from __future__ import annotations
+
+import json
+import textwrap
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import pytest
+
+from apifix.engine import sandbox as sandbox_mod
+from apifix.engine.docker import ProcResult
+from apifix.engine.sandbox import (
+    CONTAINER_ENV,
+    SandboxConfig,
+    container_user,
+    run_sandbox,
+)
+from apifix.engine.test_results import TestCounts
+
+CANARY = "s3cr3t-canary-value"
+
+
+# --- fake docker ----------------------------------------------------------------------------
+
+
+@dataclass
+class Call:
+    args: list[str]
+    timeout: float
+
+    def opt(self, flag: str) -> list[str]:
+        return [self.args[i + 1] for i, a in enumerate(self.args[:-1]) if a == flag]
+
+    @property
+    def name(self) -> str:
+        return self.opt("--name")[0]
+
+    @property
+    def network(self) -> str:
+        return self.opt("--network")[0]
+
+    @property
+    def mounts(self) -> dict[str, tuple[Path, str]]:
+        out = {}
+        for spec in self.opt("--volume"):
+            host, container, mode = spec.split(":")
+            out[container] = (Path(host), mode)
+        return out
+
+    @property
+    def phase(self) -> str:
+        return (
+            "install"
+            if "install" in self.args[self.args.index("/apifix/driver.py") :][:2]
+            else "test"
+        )
+
+    @property
+    def image(self) -> str:
+        return self.args[self.args.index("python") - 1]
+
+
+def ok(stdout: str = "", stderr: str = "") -> ProcResult:
+    return ProcResult(0, stdout, stderr, False, 0.1)
+
+
+def exited(code: int, stdout: str = "", stderr: str = "") -> ProcResult:
+    return ProcResult(code, stdout, stderr, False, 0.1)
+
+
+TIMED_OUT = ProcResult(None, "partial", "", True, 5.0)
+
+
+@dataclass
+class FakeDocker:
+    install: list[ProcResult] = field(default_factory=lambda: [ok()])
+    test: Callable[[Call], ProcResult] | None = None
+    usable: bool = True
+    calls: list[Call] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
+    seen_dirs: set[Path] = field(default_factory=set)
+    # container name -> {mount point: files in it when the container started}
+    snapshots: dict[str, dict[str, list[str]]] = field(default_factory=dict)
+
+    def available(self) -> tuple[bool, str]:
+        return self.usable, "" if self.usable else "docker not usable: permission denied"
+
+    def run(self, args, timeout_s):
+        call = Call(list(args), timeout_s)
+        self.calls.append(call)
+        self.seen_dirs |= {host for host, _ in call.mounts.values()}
+        self.snapshots[call.name] = {
+            point: sorted(p.relative_to(host).as_posix() for p in host.rglob("*"))
+            for point, (host, _) in call.mounts.items()
+        }
+        if call.phase == "install":
+            return self.install.pop(0)
+        assert self.test is not None, "unexpected test phase"
+        return self.test(call)
+
+    def remove_container(self, name):
+        self.removed.append(name)
+
+
+def write_driver_json(call: Call, method: str = "editable") -> Path:
+    results = call.mounts["/results"][0]
+    (results / "driver.json").write_text(json.dumps({"install_method": method}))
+    return results
+
+
+def junit(passed: int = 0, failed: int = 0, skipped: int = 0) -> str:
+    cases = [f'<testcase classname="tests.test_a" name="test_p{i}"/>' for i in range(passed)]
+    cases += [
+        f'<testcase classname="tests.test_a" name="test_f{i}"><failure/></testcase>'
+        for i in range(failed)
+    ]
+    cases += [
+        f'<testcase classname="tests.test_a" name="test_s{i}"><skipped/></testcase>'
+        for i in range(skipped)
+    ]
+    return f"<testsuites><testsuite>{''.join(cases)}</testsuite></testsuites>"
+
+
+def pytest_run(passed=0, failed=0, skipped=0, exit_code=None, method="editable"):
+    def behave(call: Call) -> ProcResult:
+        results = write_driver_json(call, method)
+        (results / "junit.xml").write_text(junit(passed, failed, skipped))
+        code = exit_code if exit_code is not None else (1 if failed else 0)
+        return exited(code, stdout="pytest output")
+
+    return behave
+
+
+@pytest.fixture
+def repo(tmp_path) -> Path:
+    root = tmp_path / "repo"
+    files = {
+        "pyproject.toml": """
+            [project]
+            name = "demo"
+            dependencies = ["openai==0.28.1"]
+            [tool.pytest.ini_options]
+            """,
+        "src/demo/__init__.py": "",
+        "tests/test_a.py": "def test_x():\n    assert True\n",
+        ".git/config": "[remote]\nurl = https://token@github.com/x/y\n",
+        ".venv/lib/junk.py": "",
+    }
+    for rel, text in files.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(textwrap.dedent(text))
+    return root
+
+
+@pytest.fixture(autouse=True)
+def canary_env(monkeypatch):
+    monkeypatch.setenv("APIFIX_CANARY_SECRET", CANARY)
+    monkeypatch.setenv("OPENAI_API_KEY", CANARY)
+
+
+# --- happy path and security properties -----------------------------------------------------
+
+
+def test_passing_run(repo):
+    docker = FakeDocker(test=pytest_run(passed=2, skipped=1))
+    result = run_sandbox(repo, docker=docker)
+    assert result.status == "passed", result.reason
+    assert result.counts == TestCounts(total=3, passed=2, skipped=1)
+    assert len(result.tests) == 3
+    assert result.install_method == "editable"
+    assert result.image == "python:3.11-slim"
+    assert result.python_version == "3.11"
+    assert result.runner == "pytest"
+    assert [p.name for p in result.install_attempts] == ["install"]
+    assert result.test is not None and result.test.network == "none"
+    assert result.duration_s > 0
+
+
+def test_phases_have_the_right_network(repo):
+    docker = FakeDocker(test=pytest_run(passed=1))
+    run_sandbox(repo, docker=docker)
+    install, test = docker.calls
+    assert (install.phase, install.network) == ("install", "bridge")
+    assert (test.phase, test.network) == ("test", "none")
+
+
+def test_install_phase_never_sees_the_repo(repo):
+    docker = FakeDocker(test=pytest_run(passed=1))
+    run_sandbox(repo, docker=docker)
+    install = docker.calls[0]
+    assert set(install.mounts) == {"/manifest", "/deps", "/apifix"}
+    for host, _ in install.mounts.values():
+        assert not host.resolve().is_relative_to(repo.resolve())
+    seen = docker.snapshots[install.name]
+    assert seen["/manifest"] == ["constraints.txt", "requirements.txt"]
+    assert seen["/apifix"] == ["driver.py"]
+    assert seen["/deps"] == []
+    assert install.mounts["/manifest"][1] == "ro,z"
+
+
+def test_mount_modes(repo):
+    docker = FakeDocker(test=pytest_run(passed=1))
+    run_sandbox(repo, docker=docker)
+    install, test = docker.calls
+    assert install.mounts["/deps"][1] == "rw,z"
+    assert test.mounts["/deps"][1] == "ro,z"  # tests cannot tamper with dependencies
+    assert test.mounts["/work"][1] == "rw,z"  # the repo copy is writable
+    assert test.mounts["/results"][1] == "rw,z"
+    assert test.mounts["/apifix"][1] == "ro,z"
+    assert test.opt("--workdir") == ["/work"]
+
+
+def test_work_is_a_copy_without_vcs_or_venvs(repo):
+    seen: dict[str, list[str]] = {}
+
+    def behave(call):
+        work = call.mounts["/work"][0]
+        seen["files"] = sorted(p.relative_to(work).as_posix() for p in work.rglob("*"))
+        return pytest_run(passed=1)(call)
+
+    run_sandbox(repo, docker=FakeDocker(test=behave))
+    assert "tests/test_a.py" in seen["files"]
+    assert not any(f.startswith((".git", ".venv")) for f in seen["files"])
+    assert (repo / ".git" / "config").exists()  # original untouched
+
+
+def test_hardening_flags_on_every_container(repo):
+    config = SandboxConfig(cpus=1.5, memory="1g", pids_limit=128)
+    docker = FakeDocker(test=pytest_run(passed=1))
+    run_sandbox(repo, config=config, docker=docker)
+    for call in docker.calls:
+        assert "--read-only" in call.args
+        assert call.opt("--cap-drop") == ["ALL"]
+        assert call.opt("--security-opt") == ["no-new-privileges"]
+        assert call.opt("--cpus") == ["1.5"]
+        assert call.opt("--memory") == ["1g"] and call.opt("--memory-swap") == ["1g"]
+        assert call.opt("--pids-limit") == ["128"]
+        assert call.opt("--label") == ["apifix=1"]
+        (user,) = call.opt("--user")
+        assert not user.startswith("0:") and user != "0"
+        assert "--privileged" not in call.args
+
+
+def test_no_host_environment_reaches_containers(repo):
+    docker = FakeDocker(test=pytest_run(passed=1))
+    run_sandbox(repo, docker=docker)
+    for call in docker.calls:
+        assert CANARY not in " ".join(call.args)
+        env = dict(e.split("=", 1) for e in call.opt("--env"))
+        assert env == CONTAINER_ENV
+        assert "--env-file" not in call.args
+
+
+def test_container_user_is_never_root(monkeypatch):
+    monkeypatch.setattr(sandbox_mod.os, "getuid", lambda: 1000)
+    monkeypatch.setattr(sandbox_mod.os, "getgid", lambda: 1000)
+    assert container_user() == "1000:1000"
+    monkeypatch.setattr(sandbox_mod.os, "getuid", lambda: 0)
+    monkeypatch.setattr(sandbox_mod.os, "getgid", lambda: 0)
+    assert container_user() == "65534:65534"
+
+
+def test_timeouts_per_phase(repo):
+    config = SandboxConfig(install_timeout_s=111, test_timeout_s=22)
+    docker = FakeDocker(test=pytest_run(passed=1))
+    run_sandbox(repo, config=config, docker=docker)
+    assert [c.timeout for c in docker.calls] == [111, 22]
+
+
+def test_python_version_selects_image(repo):
+    (repo / ".python-version").write_text("3.9\n")
+    docker = FakeDocker(test=pytest_run(passed=1))
+    result = run_sandbox(repo, docker=docker)
+    assert result.image == "python:3.9-slim"
+    assert {c.image for c in docker.calls} == {"python:3.9-slim"}
+
+
+# --- cleanup --------------------------------------------------------------------------------
+
+
+def assert_cleaned_up(docker: FakeDocker):
+    assert sorted(docker.removed) == sorted(c.name for c in docker.calls)
+    assert len(set(docker.removed)) == len(docker.calls)  # unique names
+    for d in docker.seen_dirs:
+        assert not d.exists(), f"temp dir left behind: {d}"
+
+
+def test_cleanup_on_success(repo):
+    docker = FakeDocker(test=pytest_run(passed=1))
+    run_sandbox(repo, docker=docker)
+    assert_cleaned_up(docker)
+
+
+def test_cleanup_on_test_timeout(repo):
+    def behave(call):
+        write_driver_json(call, "pythonpath")  # written before the tests started
+        return TIMED_OUT
+
+    docker = FakeDocker(test=behave)
+    result = run_sandbox(repo, docker=docker)
+    assert result.status == "timeout"
+    assert result.install_method == "pythonpath"
+    assert result.test is not None and result.test.status == "timeout"
+    assert_cleaned_up(docker)
+
+
+def test_cleanup_when_docker_raises(repo):
+    def behave(call):
+        raise KeyboardInterrupt
+
+    docker = FakeDocker(test=behave)
+    with pytest.raises(KeyboardInterrupt):
+        run_sandbox(repo, docker=docker)
+    assert_cleaned_up(docker)
+
+
+def test_install_timeout_skips_tests(repo):
+    docker = FakeDocker(install=[TIMED_OUT])
+    result = run_sandbox(repo, docker=docker)
+    assert result.status == "timeout"
+    assert result.test is None
+    assert len(docker.calls) == 1
+    assert_cleaned_up(docker)
+
+
+# --- install retries ------------------------------------------------------------------------
+
+
+def test_build_error_retries_on_full_image(repo):
+    build_error = exited(1, stderr="error: command 'gcc' failed: No such file or directory")
+    docker = FakeDocker(install=[build_error, ok()], test=pytest_run(passed=1))
+    result = run_sandbox(repo, docker=docker)
+    assert result.status == "passed"
+    assert [p.image for p in result.install_attempts] == ["python:3.11-slim", "python:3.11"]
+    assert result.image == "python:3.11"
+    assert docker.calls[-1].image == "python:3.11"  # tests run where the install worked
+    assert any("retrying with python:3.11" in n for n in result.notes)
+
+
+def test_build_error_on_full_image_gives_up(repo):
+    build_error = exited(1, stderr="Failed building wheel for psycopg2")
+    docker = FakeDocker(install=[build_error, build_error])
+    result = run_sandbox(repo, docker=docker)
+    assert (result.status, result.reason) == ("error", "dependency install failed")
+    assert len(result.install_attempts) == 2
+    assert result.test is None
+
+
+def test_lockfile_used_then_dropped_on_conflict(repo):
+    (repo / "requirements.txt").write_text("openai==0.28.1\nrequests==2.31.0\n")
+    conflict = exited(1, stderr="ERROR: ResolutionImpossible: for help visit ...")
+    docker = FakeDocker(install=[conflict, ok()], test=pytest_run(passed=1))
+    result = run_sandbox(repo, docker=docker)
+    assert result.lockfile == "requirements.txt (fully pinned)"
+    assert [p.constraints_applied for p in result.install_attempts] == [True, False]
+    assert result.lockfile_applied is False
+    first, second = docker.calls[0], docker.calls[1]
+    assert first.args[-1] == "--constraints" and second.args[-1] == "install"
+    assert result.status == "passed"
+
+
+def test_lockfile_applied(repo):
+    (repo / "requirements.txt").write_text("openai==0.28.1\n")
+    docker = FakeDocker(test=pytest_run(passed=1))
+    result = run_sandbox(repo, docker=docker)
+    assert result.lockfile_applied is True
+    assert result.install_attempts[0].constraints_applied is True
+
+
+def test_plain_install_failure_is_not_retried(repo):
+    docker = FakeDocker(install=[exited(1, stderr="ERROR: Invalid requirement")])
+    result = run_sandbox(repo, docker=docker)
+    assert result.status == "error" and len(result.install_attempts) == 1
+
+
+def test_docker_run_failure_is_error(repo):
+    docker = FakeDocker(install=[exited(125, stderr="Unable to find image")])
+    result = run_sandbox(repo, docker=docker)
+    assert result.status == "error"
+    assert result.install_attempts[0].status == "error"
+
+
+# --- statuses -------------------------------------------------------------------------------
+
+
+def test_no_tests_is_unverified_without_docker(tmp_path):
+    (tmp_path / "app.py").write_text("x = 1\n")
+    docker = FakeDocker(usable=False)
+    result = run_sandbox(tmp_path, docker=docker)
+    assert (result.status, result.reason) == ("unverified", "no test files found")
+    assert docker.calls == []
+
+
+def test_failed_tests(repo):
+    result = run_sandbox(repo, docker=FakeDocker(test=pytest_run(passed=3, failed=2)))
+    assert result.status == "failed"
+    assert result.counts == TestCounts(total=5, passed=3, failed=2)
+    assert result.reason == "2 failed, 0 errors"
+
+
+def test_all_skipped_is_unverified(repo):
+    result = run_sandbox(repo, docker=FakeDocker(test=pytest_run(skipped=4)))
+    assert (result.status, result.reason) == ("unverified", "all 4 tests skipped")
+
+
+def test_no_tests_collected_is_unverified(repo):
+    def behave(call):
+        write_driver_json(call)
+        return exited(5)
+
+    result = run_sandbox(repo, docker=FakeDocker(test=behave))
+    assert (result.status, result.reason) == ("unverified", "pytest collected no tests")
+
+
+def test_pytest_crash_without_report_is_error(repo):
+    def behave(call):
+        write_driver_json(call)
+        return exited(4, stderr="ERROR: usage")
+
+    result = run_sandbox(repo, docker=FakeDocker(test=behave))
+    assert result.status == "error"
+
+
+def test_oom_kill_is_error(repo):
+    def behave(call):
+        write_driver_json(call)
+        return exited(137)
+
+    result = run_sandbox(repo, docker=FakeDocker(test=behave))
+    assert result.status == "error" and "out of memory" in result.reason
+
+
+def test_driver_never_started_is_error(repo):
+    result = run_sandbox(repo, docker=FakeDocker(test=lambda call: exited(1)))
+    assert (result.status, result.reason) == ("error", "the test phase did not start")
+
+
+def test_pythonpath_fallback_is_recorded(repo):
+    result = run_sandbox(repo, docker=FakeDocker(test=pytest_run(passed=1, method="pythonpath")))
+    assert result.install_method == "pythonpath"
+    assert any("PYTHONPATH" in n for n in result.notes)
+
+
+def test_unittest_runner(tmp_path):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_a.py").write_text("import unittest\n")
+
+    def behave(call):
+        write_driver_json(call, "pythonpath")
+        return exited(
+            1,
+            stderr="test_a (test_a.T.test_a) ... ok\ntest_b (test_a.T.test_b) ... FAIL\n"
+            "Ran 2 tests in 0.01s\n\nFAILED (failures=1)\n",
+        )
+
+    result = run_sandbox(tmp_path, docker=FakeDocker(test=behave))
+    assert result.runner == "unittest"
+    assert result.status == "failed"
+    assert result.counts == TestCounts(total=2, passed=1, failed=1)
+
+
+def test_docker_unavailable(repo):
+    result = run_sandbox(repo, docker=FakeDocker(usable=False))
+    assert result.status == "error" and "permission denied" in result.reason
+
+
+def test_not_a_directory(tmp_path):
+    with pytest.raises(NotADirectoryError):
+        run_sandbox(tmp_path / "missing", docker=FakeDocker())

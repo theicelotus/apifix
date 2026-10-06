@@ -5,10 +5,13 @@ import textwrap
 import pytest
 
 from apifix.engine.dependencies import (
+    allows,
+    build_system_requires,
     entirely_below,
     is_dependency_file,
     parse_dependency_file,
     parse_version,
+    requirements_from_file,
 )
 from apifix.engine.scanner import scan
 
@@ -200,3 +203,37 @@ def test_malformed_dependency_file_recorded(tmp_path):
     result = scan(tmp_path, "openai-v1")
     assert [e.file for e in result.parse_errors] == ["pyproject.toml"]
     assert len(result.findings) == 1
+
+
+@pytest.mark.parametrize(
+    ("clauses", "version", "ok"),
+    [
+        ((), "1.0", True),
+        (((">=", "3.8"),), "3.11", True),
+        (((">=", "3.8"), ("<", "3.11")), "3.11", False),
+        ((("~=", "3.9.0"),), "3.9.18", True),
+        ((("~=", "3.9.0"),), "3.10.0", False),
+        ((("==", "3.11.*"),), "3.11.4", True),
+        ((("!=", "3.11.*"),), "3.11.4", False),
+        ((("==", "0.28.1"),), "0.28.1", True),
+        ((("<=", "1.0"),), "1.0.0", True),
+        (((">", "1.0"),), "1.0", False),
+    ],
+)
+def test_allows(clauses, version, ok):
+    assert allows(clauses, version) is ok
+
+
+def test_requirements_txt_keeps_markers_and_drops_local_code():
+    text = "requests>=2 ; python_version >= '3.8'\n-e .\n./vendored\nfile:../x\nfoo @ file:///tmp/foo\n"
+    assert requirements_from_file("requirements.txt", text) == [
+        "requests>=2 ; python_version >= '3.8'"
+    ]
+
+
+def test_build_system_requires():
+    assert build_system_requires('[build-system]\nrequires = ["flit_core>=3.2"]\n', False) == [
+        "flit_core>=3.2"
+    ]
+    assert build_system_requires(None, has_setup=True) == ["setuptools", "wheel"]
+    assert build_system_requires(None, has_setup=False) == []

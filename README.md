@@ -3,7 +3,8 @@
 Automatically fixes Python code broken by library breaking changes, verifies each fix in a
 network-less sandbox, and reports the evidence.
 
-Current status: the scanner for the OpenAI 0.x -> 1.x migration.
+Current status: the scanner for the OpenAI 0.x -> 1.x migration, and the Docker test sandbox
+(`apifix.engine.sandbox.run_sandbox`).
 
 ```
 pip install -e '.[dev]'
