@@ -1,4 +1,8 @@
-"""Command-line entry point: ``apifix scan <path> --migration openai-v1 [--json]``."""
+"""Command-line entry point.
+
+apifix scan <path> --migration openai-v1 [--json]
+apifix cleanup [--dry-run]      remove containers/temp dirs left by interrupted runs
+"""
 
 from __future__ import annotations
 
@@ -7,6 +11,8 @@ import json
 import sys
 from dataclasses import asdict
 
+from apifix.engine.cleanup import CleanupReport, cleanup
+from apifix.engine.docker import DockerCLI
 from apifix.engine.migrations import available_migrations
 from apifix.engine.models import ScanResult
 from apifix.engine.scanner import scan
@@ -21,7 +27,17 @@ def main(argv: list[str] | None = None) -> int:
     p_scan.add_argument("path", help="local repo directory or file")
     p_scan.add_argument("--migration", required=True, choices=available_migrations())
     p_scan.add_argument("--json", action="store_true", help="machine-readable output")
+    p_clean = sub.add_parser(
+        "cleanup",
+        help="remove apifix containers and temp dirs left behind by crashed or killed runs",
+    )
+    p_clean.add_argument("--dry-run", action="store_true", help="only list what would go")
     args = parser.parse_args(argv)
+
+    if args.command == "cleanup":
+        report = cleanup(DockerCLI(), dry_run=args.dry_run)
+        print(_cleanup_text(report))
+        return EXIT_FINDINGS if report.errors else EXIT_CLEAN
 
     if args.path.startswith(("http://", "https://", "git@")):
         print("apifix: GitHub URLs are not supported yet; clone locally first", file=sys.stderr)
@@ -34,6 +50,19 @@ def main(argv: list[str] | None = None) -> int:
 
     print(_to_json(result) if args.json else _to_text(result))
     return EXIT_FINDINGS if result.findings else EXIT_CLEAN
+
+
+def _cleanup_text(report: CleanupReport) -> str:
+    verb = "would remove" if report.dry_run else "removed"
+    lines = [f"{verb} container {c}" for c in report.removed_containers]
+    lines += [f"{verb} temp dir {d}" for d in report.removed_dirs]
+    lines += [f"skipped {s}" for s in report.skipped]
+    lines += [f"error: {e}" for e in report.errors]
+    summary = (
+        f"{len(report.removed_containers)} container(s), {len(report.removed_dirs)} temp dir(s)"
+    )
+    lines.append(f"{verb} {summary}" + ("" if lines else ": nothing left over"))
+    return "\n".join(lines)
 
 
 def _to_json(result: ScanResult) -> str:

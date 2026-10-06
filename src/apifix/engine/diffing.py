@@ -1,0 +1,72 @@
+"""Compare an original tree with a fixed tree: which files changed, and which lines."""
+
+from __future__ import annotations
+
+import difflib
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+
+from apifix.engine.walk import iter_files
+
+ChangeKind = Literal["added", "deleted", "modified"]
+
+
+@dataclass(frozen=True)
+class FileChange:
+    path: str  # relative, POSIX separators
+    kind: ChangeKind
+    # 1-based line numbers in the FIXED file that were added or rewritten (empty for deletions
+    # and binary files).
+    changed_lines: tuple[int, ...] = ()
+    removed_lines: int = 0  # lines of the original that are gone
+
+    @property
+    def is_python(self) -> bool:
+        return self.path.endswith(".py")
+
+
+def read_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _files(root: Path) -> dict[str, Path]:
+    return {f.relative_to(root).as_posix(): f for f in iter_files(root)}
+
+
+def diff_trees(original: Path, fixed: Path) -> list[FileChange]:
+    before, after = _files(original), _files(fixed)
+    changes = []
+    for rel in sorted(before.keys() | after.keys()):
+        old, new = before.get(rel), after.get(rel)
+        if new is None:
+            text = read_text(old) if old else None
+            changes.append(FileChange(rel, "deleted", (), len(text.splitlines()) if text else 0))
+            continue
+        if old is not None and old.read_bytes() == new.read_bytes():
+            continue
+        old_text = read_text(old) if old is not None else ""
+        new_text = read_text(new)
+        kind: ChangeKind = "added" if old is None else "modified"
+        if old_text is None or new_text is None:  # binary or undecodable
+            changes.append(FileChange(rel, kind))
+            continue
+        changed, removed = changed_lines(old_text, new_text)
+        changes.append(FileChange(rel, kind, changed, removed))
+    return changes
+
+
+def changed_lines(old: str, new: str) -> tuple[tuple[int, ...], int]:
+    """(lines of `new` that were inserted or replaced, number of `old` lines removed)."""
+    a, b = old.splitlines(), new.splitlines()
+    changed: list[int] = []
+    removed = 0
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if op in ("replace", "insert"):
+            changed.extend(range(j1 + 1, j2 + 1))
+        if op in ("replace", "delete"):
+            removed += i2 - i1
+    return tuple(changed), removed

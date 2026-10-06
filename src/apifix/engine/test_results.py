@@ -6,6 +6,7 @@ just a changed total. Runner output is untrusted (the repo's code produced it).
 
 from __future__ import annotations
 
+import json
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from typing import Literal
 Outcome = Literal["passed", "failed", "error", "skipped"]
 
 MAX_REPORT_BYTES = 50_000_000
+MAX_MESSAGE = 500
 _SEVERITY = {"passed": 0, "skipped": 1, "error": 2, "failed": 3}
 
 
@@ -23,6 +25,7 @@ class TestCaseResult:
 
     id: str
     outcome: Outcome
+    message: str = ""  # start of the failure/error text; empty for passes and skips
 
 
 @dataclass(frozen=True)
@@ -38,6 +41,14 @@ class TestCounts:
 
 class ReportError(ValueError):
     pass
+
+
+def _clip(text: str) -> str:
+    return text.strip()[:MAX_MESSAGE]
+
+
+def _unittest_id(name: str, where: str) -> str:
+    return where if where.endswith(f".{name}") else f"{where}.{name}"
 
 
 def counts_from(cases: list[TestCaseResult]) -> TestCounts:
@@ -67,16 +78,21 @@ def parse_junit(xml_text: str) -> tuple[TestCounts, list[TestCaseResult]]:
     cases = []
     for tc in root.iter("testcase"):
         classname, name = tc.get("classname", ""), tc.get("name", "")
-        tags = {child.tag for child in tc}
-        if "failure" in tags:
+        children = {child.tag: child for child in tc}
+        if "failure" in children:
             outcome: Outcome = "failed"
-        elif "error" in tags:
+        elif "error" in children:
             outcome = "error"
-        elif "skipped" in tags:  # includes xfail
+        elif "skipped" in children:  # includes xfail
             outcome = "skipped"
         else:
             outcome = "passed"
-        cases.append(TestCaseResult(f"{classname}::{name}" if classname else name, outcome))
+        message = ""
+        if outcome in ("failed", "error"):
+            node = children["failure" if outcome == "failed" else "error"]
+            message = _clip(f"{node.get('message', '')}\n{node.text or ''}")
+        test_id = f"{classname}::{name}" if classname else name
+        cases.append(TestCaseResult(test_id, outcome, message))
     cases = _dedupe(cases)
     return counts_from(cases), cases
 
@@ -93,6 +109,11 @@ _UNITTEST_STATUS: dict[str, Outcome] = {
     "expected failure": "skipped",
     "unexpected success": "failed",
 }
+_UNITTEST_BLOCK = re.compile(
+    r"^(?:ERROR|FAIL): (?P<name>\w+) \((?P<where>[\w.]+)\)[^\n]*\n-{20,}\n(?P<body>.*?)"
+    r"(?=^={20,}$|^-{20,}\nRan |\Z)",
+    re.M | re.S,
+)
 _RAN = re.compile(r"^Ran (\d+) tests? in ", re.M)
 _SUMMARY = re.compile(r"^(OK|FAILED)(?: \((.*)\))?\s*$", re.M)
 
@@ -100,12 +121,17 @@ _SUMMARY = re.compile(r"^(OK|FAILED)(?: \((.*)\))?\s*$", re.M)
 def parse_unittest_output(text: str) -> tuple[TestCounts, list[TestCaseResult]]:
     """Parse `python -m unittest -v` output (stderr). The summary lines are authoritative for
     counts; per-test lines are best effort (test output can interleave with them)."""
+    messages = {
+        _unittest_id(m.group("name"), m.group("where")): _clip(m.group("body"))
+        for m in _UNITTEST_BLOCK.finditer(text)
+    }
     cases = []
     for m in _UNITTEST_LINE.finditer(text):
         name, where, status = m.group("name"), m.group("where"), m.group("status")
-        test_id = where if where.endswith(f".{name}") else f"{where}.{name}"
+        test_id = _unittest_id(name, where)
         outcome = "skipped" if status.startswith("skipped") else _UNITTEST_STATUS[status]
-        cases.append(TestCaseResult(test_id, outcome))
+        message = messages.get(test_id, "") if outcome in ("failed", "error") else ""
+        cases.append(TestCaseResult(test_id, outcome, message))
     cases = _dedupe(cases)
 
     ran = _RAN.findall(text)
@@ -123,3 +149,40 @@ def parse_unittest_output(text: str) -> tuple[TestCounts, list[TestCaseResult]]:
     skipped = fields.get("skipped", 0) + fields.get("expected failures", 0)
     passed = max(0, total - failed - errors - skipped)
     return TestCounts(total, passed, failed, skipped, errors), cases
+
+
+# --- coverage -------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FileCoverage:
+    executed: frozenset[int]
+    missing: frozenset[int]
+
+    @property
+    def executable(self) -> frozenset[int]:
+        return self.executed | self.missing
+
+
+def parse_coverage_json(text: str, root: str = "/work") -> dict[str, FileCoverage]:
+    """Parse `coverage json` output into {path relative to root: executed/missing lines}."""
+    if len(text) > MAX_REPORT_BYTES:
+        raise ReportError("coverage report too large")
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise ReportError(f"invalid coverage json: {exc}") from exc
+    files = data.get("files") if isinstance(data, dict) else None
+    if not isinstance(files, dict):
+        raise ReportError("coverage json has no 'files' table")
+    out = {}
+    prefix = root.rstrip("/") + "/"
+    for path, info in files.items():
+        if not isinstance(path, str) or not isinstance(info, dict):
+            continue
+        rel = path[len(prefix) :] if path.startswith(prefix) else path
+        out[rel.removeprefix("./")] = FileCoverage(
+            executed=frozenset(n for n in info.get("executed_lines", []) if isinstance(n, int)),
+            missing=frozenset(n for n in info.get("missing_lines", []) if isinstance(n, int)),
+        )
+    return out

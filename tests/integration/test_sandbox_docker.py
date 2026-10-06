@@ -12,8 +12,9 @@ from pathlib import Path
 
 import pytest
 
+from apifix.engine.cleanup import cleanup
 from apifix.engine.docker import DockerCLI
-from apifix.engine.sandbox import SandboxConfig, run_sandbox
+from apifix.engine.sandbox import WORKSPACE_PREFIX, SandboxConfig, run_sandbox
 
 _usable, _why = DockerCLI().available()
 pytestmark = [pytest.mark.docker, pytest.mark.skipif(not _usable, reason=_why or "no docker")]
@@ -28,14 +29,27 @@ def make_repo(root: Path, files: dict[str, str]) -> Path:
     return root
 
 
-def apifix_containers() -> list[str]:
+def apifix_containers() -> set[str]:
     out = subprocess.run(
-        ["docker", "ps", "-a", "--filter", "label=apifix=1", "-q"],
+        ["docker", "ps", "-a", "--no-trunc", "--filter", "label=apifix=1", "-q"],
         capture_output=True,
         text=True,
         check=True,
     )
-    return out.stdout.split()
+    return set(out.stdout.split())
+
+
+@pytest.fixture
+def no_leftover_containers():
+    """Compare apifix containers before and after the test, so containers left over from an
+    earlier crash (or another run) do not fail it. Call the returned check at the end."""
+    before = apifix_containers()
+
+    def check() -> None:
+        leftover = apifix_containers() - before
+        assert not leftover, f"containers not removed: {sorted(leftover)}"
+
+    return check
 
 
 SECURITY_TESTS = """
@@ -75,7 +89,7 @@ def test_root_filesystem_is_read_only():
 """
 
 
-def test_security_properties_hold_inside_the_sandbox(tmp_path, monkeypatch):
+def test_security_properties_hold_inside_the_sandbox(tmp_path, monkeypatch, no_leftover_containers):
     monkeypatch.setenv("APIFIX_CANARY_SECRET", "s3cr3t")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     repo = make_repo(tmp_path / "repo", {"tests/test_security.py": SECURITY_TESTS})
@@ -83,7 +97,7 @@ def test_security_properties_hold_inside_the_sandbox(tmp_path, monkeypatch):
     assert result.status == "passed", (result.reason, result.test and result.test.stdout)
     assert result.counts.passed == 6
     assert not (repo / "written-by-test.txt").exists()  # only the copy was written
-    assert apifix_containers() == []
+    no_leftover_containers()
 
 
 def test_failing_tests_and_editable_install(tmp_path):
@@ -176,7 +190,7 @@ def test_unittest_repo(tmp_path):
     assert (result.counts.passed, result.counts.skipped) == (1, 1)
 
 
-def test_timeout_kills_and_removes_the_container(tmp_path):
+def test_timeout_kills_and_removes_the_container(tmp_path, no_leftover_containers):
     repo = make_repo(
         tmp_path / "repo",
         {"tests/test_slow.py": "import time\n\ndef test_slow():\n    time.sleep(600)\n"},
@@ -184,9 +198,35 @@ def test_timeout_kills_and_removes_the_container(tmp_path):
     config = SandboxConfig(install_timeout_s=300, test_timeout_s=10)
     result = run_sandbox(repo, config)
     assert result.status == "timeout"
-    assert apifix_containers() == []
+    no_leftover_containers()
 
 
 def test_no_tests(tmp_path):
     repo = make_repo(tmp_path / "repo", {"app.py": "x = 1\n"})
     assert run_sandbox(repo, CONFIG).status == "unverified"
+
+
+def test_cleanup_removes_an_orphaned_container_and_its_workspace(tmp_path):
+    """What a power loss leaves behind: a labeled container whose owner is gone."""
+    root = tmp_path / f"{WORKSPACE_PREFIX}orphan"
+    (root / "deps").mkdir(parents=True)
+    name = f"apifix-test-orphan-{tmp_path.name[-8:]}"
+    subprocess.run(
+        ["docker", "create", "--name", name, "--label", "apifix=1"]
+        + ["--label", f"apifix.workspace={root}", f"python:{CONFIG.default_python}-slim"]
+        + ["true"],
+        check=True,
+        capture_output=True,
+    )
+    try:
+        report = cleanup(DockerCLI(), temp_dir=tmp_path, min_age_s=0)
+        assert f"{name} (created)" in report.removed_containers
+        assert report.removed_dirs == [str(root)]
+        assert (
+            name
+            not in subprocess.run(
+                ["docker", "ps", "-a", "--format", "{{.Names}}"], capture_output=True, text=True
+            ).stdout.split()
+        )
+    finally:
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True)

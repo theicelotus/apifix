@@ -27,7 +27,8 @@ dashboard. Do not build these until asked.
 
 ```
 src/apifix/
-  cli.py              `apifix scan <path> --migration openai-v1 [--json]`
+  cli.py              `apifix scan <path> --migration openai-v1 [--json]`,
+                      `apifix cleanup [--dry-run]`
   api/                FastAPI app (later)
   worker/             background jobs (later)
   engine/
@@ -38,12 +39,18 @@ src/apifix/
     migrations/       one package per migration; registry in __init__.py
       openai_v1/      rules.py (pure data tables) + migration-specific heuristics
     project.py        target repo facts: Python version, test runner, install plan, lockfile pins
-    sandbox.py        two-phase Docker run (install with network, test without)
+    sandbox.py        two-phase Docker run (install with network, test without); sessions
+                      install once and run tests repeatedly; optional coverage
     sandbox_driver.py runs INSIDE containers (Python 3.8+ compatible, stdlib only)
     docker.py         DockerClient protocol + `docker` CLI implementation (bounded output)
+    cleanup.py        removes containers / temp workspaces left by crashed or killed runs
     test_results.py   JUnit / unittest output -> counts + per-test outcomes
+    diffing.py        original vs fixed tree: changed files and changed lines
+    tampering.py      AST comparison of test files: removed/weakened asserts, skips, ...
+    scope.py          CI/tooling config changes (warned, not rejected)
+    verifier.py       baseline vs fix: per-test deltas, flaky rerun, tampering, completeness,
+                      changed-line coverage -> verdict + reasons + PR report section
     agent.py          LLM loop: propose -> verify -> retry           (not built yet)
-    verifier.py       test results; checks agent didn't weaken tests (not built yet)
 benchmark/            real repos + scoring
 tests/                pytest; fixtures/ holds realistic sample code
 ```
@@ -79,6 +86,7 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 .venv/bin/pytest -q -m docker        # only the Docker integration tests
 .venv/bin/ruff check . && .venv/bin/ruff format --check .
 .venv/bin/apifix scan tests/fixtures/openai_v0 --migration openai-v1 [--json]
+.venv/bin/apifix cleanup [--dry-run]  # after a crash/power loss: orphaned containers + temp dirs
 ```
 
 ## Known limitations (scanner)
@@ -118,3 +126,28 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 - Third-party sdists still execute their own build scripts during the networked install phase
   (that is what installing them means). The repo's own code never does.
 - Each run reinstalls dependencies from scratch (no caching between runs yet).
+- A crash or power loss can leave `apifix`-labeled containers and `apifix-sandbox-*` temp
+  dirs behind; `apifix cleanup` removes them. A workspace counts as stale when no process
+  holds its flock (`.apifix.lock`) and it is over a minute old; containers count as orphaned
+  when their `apifix.workspace` label points at a stale or missing workspace. Running
+  containers without that label (from older versions) are listed, not removed. Only the
+  system temp dir and the dirs named in container labels are searched.
+
+## Known limitations (verifier)
+
+- Test identity is the runner's test ID (pytest JUnit `classname::name`, unittest dotted id).
+  A renamed test is only recognised if its body is unchanged; otherwise it is "deleted".
+- Assertion checks are heuristics on the AST: assertions are paired by position within a test,
+  strength is a coarse scale (exact / partial / truthiness / always-true), and assertions moved
+  into helper functions are not followed. Adding assertions can hide a weakened one.
+- References into the migrated library (`openai.*`) may change freely in tests. Swapping one
+  specific class for another is not flagged, except catching the library's base exceptions
+  (`OpenAIError`, `APIError`, `APIStatusError`), which counts as broadening.
+- Tests needing a network service or credentials are recognised by failure-message markers.
+- Flakiness: newly failing tests are rerun once (whole test phase); a regression that fails
+  intermittently can pass the rerun and be reported as flaky.
+- Changed-line coverage is line coverage of the test process only (no subprocesses). Changed
+  files the tests never imported count non-blank, non-comment lines as unexecuted. A repo's own
+  coverage/pytest-cov configuration can interfere with the `coverage run` wrapper.
+- Scope warnings use the scanner's findings per file, so legitimate edits in files without
+  findings (e.g. mock data helpers) are still warned about.

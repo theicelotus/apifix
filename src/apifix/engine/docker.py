@@ -40,6 +40,18 @@ class ProcResult:
     duration_s: float
 
 
+@dataclass(frozen=True)
+class ContainerInfo:
+    id: str
+    name: str
+    state: str  # created, running, exited, ...
+    workspace: str  # value of the apifix.workspace label ("" if absent)
+
+
+class DockerError(RuntimeError):
+    pass
+
+
 class DockerClient(Protocol):
     def available(self) -> tuple[bool, str]:
         """(usable, reason if not)."""
@@ -51,6 +63,10 @@ class DockerClient(Protocol):
 
     def remove_container(self, name: str) -> None:
         """Force-remove a container if it exists. Must not raise."""
+        ...
+
+    def list_containers(self, label: str) -> list[ContainerInfo]:
+        """All containers (any state) carrying `label`. Raises DockerError."""
         ...
 
 
@@ -153,3 +169,34 @@ class DockerCLI:
                 env=self._env(),
                 stdin=subprocess.DEVNULL,
             )
+
+    def list_containers(self, label: str) -> list[ContainerInfo]:
+        fmt = '{{.ID}}\t{{.Names}}\t{{.State}}\t{{.Label "apifix.workspace"}}'
+        try:
+            proc = subprocess.run(
+                [self.binary, "ps", "--all", "--no-trunc", "--filter", f"label={label}"]
+                + ["--format", fmt],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=self._env(),
+                stdin=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise DockerError(f"docker ps failed: {exc}") from exc
+        if proc.returncode != 0:
+            raise DockerError(f"docker ps failed: {proc.stderr.strip() or proc.stdout.strip()}")
+        return parse_ps_output(proc.stdout)
+
+
+def parse_ps_output(text: str) -> list[ContainerInfo]:
+    containers = []
+    for line in text.splitlines():
+        fields = line.split("\t", 3)
+        if len(fields) < 3 or not fields[0]:
+            continue
+        workspace = fields[3] if len(fields) == 4 else ""
+        if workspace == "<no value>":  # older docker versions print this for a missing label
+            workspace = ""
+        containers.append(ContainerInfo(fields[0], fields[1], fields[2], workspace))
+    return containers

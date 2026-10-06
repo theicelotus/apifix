@@ -185,7 +185,7 @@ class TestPlan:
     reason: str
 
 
-_TEST_FILE_RE = re.compile(r"^(test_.*|.*_test|tests)\.py$")
+TEST_FILE_RE = re.compile(r"^(test_.*|.*_test|tests)\.py$")
 _PYTEST_CONFIG_SECTIONS = {
     "pyproject.toml": re.compile(r"^\[tool\.pytest(\.ini_options)?\]", re.M),
     "setup.cfg": re.compile(r"^\[tool:pytest\]", re.M),
@@ -221,7 +221,7 @@ def _pytest_signal(repo: Path, rel_files: list[str]) -> str | None:
 
 def detect_tests(repo: Path) -> TestPlan:
     rel_files = [f.relative_to(repo).as_posix() for f in iter_files(repo)]
-    test_files = tuple(f for f in rel_files if _TEST_FILE_RE.match(Path(f).name))
+    test_files = tuple(f for f in rel_files if TEST_FILE_RE.match(Path(f).name))
     if not test_files:
         return TestPlan(None, (), (), "no test files found")
 

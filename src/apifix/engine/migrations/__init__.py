@@ -12,6 +12,11 @@ from apifix.engine.models import Finding
 class Migration(Protocol):
     name: str
     summary: str
+    # Top-level modules of the migrated library: test edits that only rename references into
+    # them are the migration itself, not test changes.
+    api_modules: frozenset[str]
+    # The library's catch-all exception classes; catching these in tests counts as broadening.
+    broad_exceptions: frozenset[str]
 
     def check_python(self, file: str, tree: ast.Module, source: str) -> list[Finding]:
         """Return findings for one parsed Python file."""

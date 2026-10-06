@@ -15,6 +15,7 @@ from apifix.engine.docker import ProcResult
 from apifix.engine.sandbox import (
     CONTAINER_ENV,
     TEST_PHASE_ENV,
+    Sandbox,
     SandboxConfig,
     container_user,
     run_sandbox,
@@ -85,6 +86,7 @@ class FakeDocker:
     seen_dirs: set[Path] = field(default_factory=set)
     # container name -> {mount point: files in it when the container started}
     snapshots: dict[str, dict[str, list[str]]] = field(default_factory=dict)
+    requirements: list[str] = field(default_factory=list)  # manifest seen by each install
 
     def available(self) -> tuple[bool, str]:
         return self.usable, "" if self.usable else "docker not usable: permission denied"
@@ -98,6 +100,8 @@ class FakeDocker:
             for point, (host, _) in call.mounts.items()
         }
         if call.phase == "install":
+            manifest = call.mounts["/manifest"][0]
+            self.requirements.append((manifest / "requirements.txt").read_text())
             return self.install.pop(0)
         assert self.test is not None, "unexpected test phase"
         return self.test(call)
@@ -239,7 +243,12 @@ def test_hardening_flags_on_every_container(repo):
         assert call.opt("--cpus") == ["1.5"]
         assert call.opt("--memory") == ["1g"] and call.opt("--memory-swap") == ["1g"]
         assert call.opt("--pids-limit") == ["128"]
-        assert call.opt("--label") == ["apifix=1"]
+        label, workspace = call.opt("--label")
+        assert label == "apifix=1"
+        # labeled with its workspace (for `apifix cleanup`), the dir its mounts live in
+        key, _, root = workspace.partition("=")
+        assert key == "apifix.workspace"
+        assert all(host.parent == Path(root) for host, _ in call.mounts.values())
         (user,) = call.opt("--user")
         assert not user.startswith("0:") and user != "0"
         assert "--privileged" not in call.args
@@ -484,3 +493,73 @@ def test_docker_unavailable(repo):
 def test_not_a_directory(tmp_path):
     with pytest.raises(NotADirectoryError):
         run_sandbox(tmp_path / "missing", docker=FakeDocker())
+
+
+# --- sessions -------------------------------------------------------------------------------
+
+
+def test_session_installs_once_and_gives_each_run_a_fresh_copy(repo):
+    def behave(call):
+        work = call.mounts["/work"][0]
+        leftover = (work / "leftover.txt").exists()
+        (work / "leftover.txt").write_text("from a previous run")
+        result = pytest_run(passed=1)(call)
+        return exited(result.exit_code, stdout=f"leftover={leftover}")
+
+    docker = FakeDocker(test=behave)
+    with Sandbox(docker=docker).session(repo) as session:
+        first, second = session.run_tests(), session.run_tests()
+    assert [c.phase for c in docker.calls] == ["install", "test", "test"]
+    assert first.test.stdout == "leftover=False"
+    assert second.test.stdout == "leftover=False"
+    assert first.status == second.status == "passed"
+    assert len(first.install_attempts) == len(second.install_attempts) == 1
+    assert_cleaned_up(docker)
+
+
+def coverage_run(call):
+    results = call.mounts["/results"][0]
+    behave = pytest_run(passed=1)
+    proc = behave(call)
+    if "--coverage" in call.args:
+        (results / "coverage.json").write_text(
+            json.dumps(
+                {"files": {"src/demo/__init__.py": {"executed_lines": [1], "missing_lines": [2]}}}
+            )
+        )
+    return proc
+
+
+def test_coverage_session(repo):
+    docker = FakeDocker(test=coverage_run)
+    with Sandbox(docker=docker).session(repo, coverage=True) as session:
+        measured = session.run_tests()
+        plain = session.run_tests(coverage=False)
+    assert "coverage" in docker.requirements[0].splitlines()
+    assert "--coverage" in docker.calls[1].args and "--coverage" not in docker.calls[2].args
+    assert measured.coverage["src/demo/__init__.py"].executed == {1}
+    assert plain.coverage is None
+
+
+def test_coverage_needs_a_coverage_session(repo):
+    docker = FakeDocker(test=coverage_run)
+    with Sandbox(docker=docker).session(repo) as session:
+        result = session.run_tests(coverage=True)  # coverage was never installed
+    assert "coverage" not in docker.requirements[0].splitlines()
+    assert "--coverage" not in docker.calls[1].args
+    assert result.coverage is None
+
+
+def test_missing_coverage_report_is_noted(repo):
+    docker = FakeDocker(test=pytest_run(passed=1))
+    result = Sandbox(docker=docker).run(repo, coverage=True)
+    assert result.coverage is None
+    assert any("no report" in n for n in result.notes)
+
+
+def test_session_without_tests_never_touches_docker(tmp_path):
+    docker = FakeDocker(usable=False)
+    with Sandbox(docker=docker).session(tmp_path) as session:
+        assert session.run_tests().status == "unverified"
+        assert session.run_tests().status == "unverified"
+    assert docker.calls == []

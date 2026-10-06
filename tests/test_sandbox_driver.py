@@ -141,3 +141,40 @@ def test_exit_code_is_propagated_and_recorded(env):
 
 def test_usage_error():
     assert driver.main(["bogus"]) == 2
+
+
+@pytest.fixture(scope="module")
+def deps_with_coverage(tmp_path_factory) -> Path:
+    """Like deps_dir, but `coverage` is importable (borrowed from apifix's own dev venv)."""
+    import coverage
+
+    deps = tmp_path_factory.mktemp("deps-cov")
+    subprocess.check_call([sys.executable, "-m", "venv", "--without-pip", str(deps / "venv")])
+    site = driver._site_dirs(str(deps / "venv" / "bin" / "python"))[0]
+    Path(site, "borrowed.pth").write_text(str(Path(coverage.__file__).parent.parent) + "\n")
+    return deps
+
+
+def test_coverage_wraps_the_test_command(env, deps_with_coverage, monkeypatch):
+    work, results = env
+    monkeypatch.setattr(driver, "DEPS", str(deps_with_coverage))
+    (work / "src" / "demo" / "__init__.py").write_text(
+        "def used():\n    return 1\n\n\ndef unused():\n    return 2\n"
+    )
+    (work / "test_demo.py").write_text("import demo\n\nassert demo.used() == 1\n")
+    rc = driver.test(["{python}", "-m", "test_demo"], coverage=True)
+    assert rc == 0
+    report = _report(results)
+    assert report["command"][2:4] == ["coverage", "run"]
+    assert report["coverage_exit_code"] == 0
+    data = json.loads((results / "coverage.json").read_text())
+    (key,) = [k for k in data["files"] if k.endswith("demo/__init__.py")]
+    assert data["files"][key]["executed_lines"] == [1, 2, 5]  # `unused` body not run
+    assert data["files"][key]["missing_lines"] == [6]
+
+
+def test_coverage_flag_in_main(env, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(driver, "test", lambda cmd, coverage=False: seen.update(c=coverage) or 0)
+    assert driver.main(["test", "--coverage", "--", "x"]) == 0
+    assert seen == {"c": True}

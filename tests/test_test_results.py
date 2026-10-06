@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from apifix.engine.test_results import (
     ReportError,
     TestCaseResult,
     TestCounts,
+    parse_coverage_json,
     parse_junit,
     parse_unittest_output,
 )
@@ -30,10 +33,14 @@ JUNIT = """<?xml version="1.0" encoding="utf-8"?>
 def test_parse_junit():
     counts, cases = parse_junit(JUNIT)
     assert counts == TestCounts(total=6, passed=1, failed=1, skipped=2, errors=2)
-    assert TestCaseResult("tests.test_chat::test_retry[3]", "failed") in cases
+    outcomes = {c.id: c.outcome for c in cases}
+    assert outcomes["tests.test_chat::test_retry[3]"] == "failed"
     # a pass plus a teardown error for the same test collapses to the worse outcome
-    assert TestCaseResult("tests.test_db::test_teardown", "error") in cases
-    assert TestCaseResult("tests/test_broken.py", "error") in cases
+    assert outcomes["tests.test_db::test_teardown"] == "error"
+    assert outcomes["tests/test_broken.py"] == "error"
+    messages = {c.id: c.message for c in cases}
+    assert messages["tests.test_chat::test_retry[3]"] == "assert 1 == 2\ntrace"
+    assert messages["tests.test_chat::test_answer"] == ""
 
 
 def test_parse_junit_empty_suite():
@@ -94,6 +101,49 @@ def test_parse_unittest_legacy_format_and_ok_summary():
     counts, cases = parse_unittest_output(text)
     assert counts == TestCounts(total=2, passed=1, skipped=1)
     assert cases[0] == TestCaseResult("test_mod.T.test_a", "passed")
+
+
+def test_parse_unittest_failure_messages():
+    text = """\
+test_ok (m.T.test_ok) ... ok
+test_net (m.T.test_net) ... ERROR
+
+======================================================================
+ERROR: test_net (m.T.test_net)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+openai.APIConnectionError: Connection error.
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.01s
+
+FAILED (errors=1)
+"""
+    _, cases = parse_unittest_output(text)
+    by_id = {c.id: c for c in cases}
+    assert by_id["m.T.test_ok"].message == ""
+    assert "APIConnectionError" in by_id["m.T.test_net"].message
+
+
+def test_parse_coverage_json():
+    text = json.dumps(
+        {
+            "files": {
+                "/work/src/app.py": {"executed_lines": [1, 2, 5], "missing_lines": [6]},
+                "src/rel.py": {"executed_lines": [], "missing_lines": [1]},
+            }
+        }
+    )
+    cov = parse_coverage_json(text)
+    assert cov["src/app.py"].executed == {1, 2, 5}
+    assert cov["src/app.py"].executable == {1, 2, 5, 6}
+    assert cov["src/rel.py"].missing == {1}
+
+
+@pytest.mark.parametrize("text", ["not json", "[]", '{"files": 3}'])
+def test_parse_coverage_json_rejects_bad_reports(text):
+    with pytest.raises(ReportError):
+        parse_coverage_json(text)
 
 
 def test_parse_unittest_without_summary_counts_lines():

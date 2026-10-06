@@ -2,7 +2,8 @@
 and stdlib-only. The host never imports this module; it is copied into the container.
 
     driver.py install [--constraints]   network on;  sees /manifest and /deps only
-    driver.py test -- <cmd...>          network off; /deps read-only, /work = repo copy
+    driver.py test [--coverage] -- <cmd...>
+                                        network off; /deps read-only, /work = repo copy
 
 Test phase layout: /deps is read-only, so an overlay venv in /tmp sees the dependencies via a
 .pth file that calls site.addsitedir(); the repo is installed into the overlay (editable, no
@@ -56,7 +57,7 @@ def _write_results(data):
         json.dump(data, f)
 
 
-def test(command):
+def test(command, coverage=False):
     deps_venv = os.path.join(DEPS, "venv")
     subprocess.check_call([sys.executable, "-m", "venv", "--without-pip", OVERLAY])
     overlay_python = _venv_python(OVERLAY)
@@ -84,10 +85,20 @@ def test(command):
     print("[apifix] repo install method: " + method, file=sys.stderr, flush=True)
 
     command = [overlay_python if part == "{python}" else part for part in command]
+    coverage = coverage and command[1:2] == ["-m"]  # wrap `python -m <runner> ...` only
+    if coverage:
+        env["COVERAGE_FILE"] = os.path.join(RESULTS, ".coverage")
+        command = [command[0], "-m", "coverage", "run", "--source", WORK, "-m"] + command[2:]
     data = {"install_method": method, "install_log": log, "command": command}
     _write_results(data)  # written before the tests run, in case they time out
     rc = subprocess.call(command, env=env, cwd=WORK)
     data["exit_code"] = rc
+    if coverage:
+        report = [overlay_python, "-m", "coverage", "json", "--ignore-errors"]
+        report += ["-o", os.path.join(RESULTS, "coverage.json")]
+        data["coverage_exit_code"] = subprocess.call(
+            report, env=env, cwd=WORK, stdout=subprocess.DEVNULL
+        )
     _write_results(data)
     return rc
 
@@ -97,7 +108,12 @@ def main(argv):
         return install("--constraints" in argv[1:])
     if argv[:2] == ["test", "--"]:
         return test(argv[2:])
-    print("usage: driver.py install [--constraints] | test -- <cmd...>", file=sys.stderr)
+    if argv[:3] == ["test", "--coverage", "--"]:
+        return test(argv[3:], coverage=True)
+    print(
+        "usage: driver.py install [--constraints] | test [--coverage] -- <cmd...>",
+        file=sys.stderr,
+    )
     return 2
 
 

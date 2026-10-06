@@ -7,16 +7,21 @@
 
 Containers run as a non-root user with CPU/memory/pid limits, a read-only root filesystem, no
 capabilities and only a fixed set of environment variables. Containers and temp dirs are
-always removed, including on timeouts and errors.
+always removed, including on timeouts and errors. If the process dies anyway (crash, power
+loss), `apifix cleanup` removes what it left behind: each workspace holds an flock for its
+lifetime and each container is labeled with its workspace, so leftovers are recognisable.
 """
 
 from __future__ import annotations
 
+import contextlib
+import copy
+import dataclasses
+import fcntl
 import json
 import os
 import shutil
 import tempfile
-import time
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -33,9 +38,11 @@ from apifix.engine.project import (
     detect_tests,
 )
 from apifix.engine.test_results import (
+    FileCoverage,
     ReportError,
     TestCaseResult,
     TestCounts,
+    parse_coverage_json,
     parse_junit,
     parse_unittest_output,
 )
@@ -46,6 +53,10 @@ PhaseStatus = Literal["ok", "failed", "timeout", "error", "skipped"]
 InstallMethod = Literal["editable", "pythonpath"]
 
 DRIVER = Path(__file__).with_name("sandbox_driver.py")
+CONTAINER_LABEL = "apifix=1"
+WORKSPACE_LABEL = "apifix.workspace"  # container label: the host workspace it mounts
+WORKSPACE_PREFIX = "apifix-sandbox-"
+WORKSPACE_LOCK = ".apifix.lock"  # flock held by the owning process while the workspace lives
 NOBODY = 65534
 DOCKER_RUN_FAILED = 125  # `docker run` itself failed (bad image, daemon error, ...)
 KILLED = 137  # SIGKILL, typically the OOM killer
@@ -132,6 +143,8 @@ class SandboxResult:
     test: PhaseResult | None = None
     counts: TestCounts = field(default_factory=TestCounts)
     tests: list[TestCaseResult] = field(default_factory=list)
+    # Line coverage of the repo copy (paths relative to the repo), when requested and measured.
+    coverage: dict[str, FileCoverage] | None = None
     duration_s: float = 0.0
 
 
@@ -164,11 +177,12 @@ def container_args(
     user: str,
     workdir: str | None = None,
     extra_env: Mapping[str, str] | None = None,
+    workspace: Path | None = None,
 ) -> list[str]:
     """Arguments for `docker run`. Pure, so the security properties are unit-testable."""
     args = [
         "--name", name,
-        "--label", "apifix=1",
+        "--label", CONTAINER_LABEL,
         "--network", network,
         "--user", user,
         "--read-only",
@@ -180,6 +194,8 @@ def container_args(
         "--memory-swap", config.memory,
         "--pids-limit", str(config.pids_limit),
     ]  # fmt: skip
+    if workspace is not None:
+        args += ["--label", f"{WORKSPACE_LABEL}={workspace}"]
     for key, value in {**CONTAINER_ENV, **(extra_env or {})}.items():
         args += ["--env", f"{key}={value}"]
     for m in mounts:
@@ -193,7 +209,8 @@ class _Workspace:
     """Host temp dirs bind-mounted into the containers; removed by cleanup()."""
 
     def __init__(self, repo: Path, plan: InstallPlan) -> None:
-        self.root = Path(tempfile.mkdtemp(prefix="apifix-sandbox-"))
+        self.root = Path(tempfile.mkdtemp(prefix=WORKSPACE_PREFIX))
+        self._lock = lock_workspace(self.root)
         self.manifest = self.root / "manifest"
         self.deps = self.root / "deps"
         self.work = self.root / "work"
@@ -209,6 +226,16 @@ class _Workspace:
             for d in (self.deps, self.work, self.results):
                 _make_world_writable(d)
 
+    def reset_work(self, repo: Path) -> None:
+        """Fresh repo copy and empty results dir, so one test run cannot affect the next."""
+        for d in (self.work, self.results):
+            shutil.rmtree(d, ignore_errors=True)
+        self.results.mkdir()
+        shutil.copytree(repo, self.work, symlinks=True, ignore=_ignore_tooling_dirs)
+        if os.getuid() == 0:
+            for d in (self.work, self.results):
+                _make_world_writable(d)
+
     def reset_deps(self) -> None:
         shutil.rmtree(self.deps, ignore_errors=True)
         self.deps.mkdir()
@@ -217,6 +244,29 @@ class _Workspace:
 
     def cleanup(self) -> None:
         shutil.rmtree(self.root, ignore_errors=True)
+        if self._lock is not None:
+            unlock_workspace(self._lock)
+            self._lock = None
+
+
+def lock_workspace(root: Path) -> int | None:
+    """Take the workspace's lock without blocking; return its fd, or None if it is held. The
+    kernel releases the lock when the holder exits, however it exits."""
+    fd = os.open(root / WORKSPACE_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def unlock_workspace(fd: int) -> None:
+    with contextlib.suppress(OSError):
+        os.close(fd)
 
 
 def _ignore_tooling_dirs(directory: str, names: list[str]) -> set[str]:
@@ -244,50 +294,17 @@ class Sandbox:
         )
         self.user = container_user()
 
-    def run(self, repo_path: str | os.PathLike[str]) -> SandboxResult:
-        start = time.monotonic()
-        repo = Path(repo_path).resolve()
-        if not repo.is_dir():
-            raise NotADirectoryError(f"not a directory: {repo}")
-        python = detect_python_version(repo, self.config.default_python)
-        tests = detect_tests(repo)
-        result = SandboxResult(
-            status="error",
-            reason="",
-            python_version=python.version,
-            python_version_source=python.source,
-            runner=tests.runner,
-            test_command=list(tests.command),
-        )
-        try:
-            self._run(repo, tests, result)
-        finally:
-            result.duration_s = time.monotonic() - start
-        return result
+    def session(
+        self, repo_path: str | os.PathLike[str], *, coverage: bool = False
+    ) -> SandboxSession:
+        """Install once, run the test phase as often as needed. Use as a context manager."""
+        return SandboxSession(self, repo_path, coverage=coverage)
+
+    def run(self, repo_path: str | os.PathLike[str], *, coverage: bool = False) -> SandboxResult:
+        with self.session(repo_path, coverage=coverage) as session:
+            return session.run_tests()
 
     # phases
-
-    def _run(self, repo: Path, tests: TestPlan, result: SandboxResult) -> None:
-        if not tests.test_files:
-            result.status, result.reason = "unverified", "no test files found"
-            return
-        plan = build_install_plan(repo, tests.runner)
-        result.dependency_sources = list(plan.sources)
-        result.lockfile = plan.lockfile
-        result.notes = list(plan.notes)
-
-        usable, why = self.docker.available()
-        if not usable:
-            result.reason = why
-            return
-        workspace = _Workspace(repo, plan)
-        try:
-            image = self._install(workspace, plan, result)
-            if image is None:
-                return
-            self._test(workspace, image, tests, result)
-        finally:
-            workspace.cleanup()
 
     def _install(self, ws: _Workspace, plan: InstallPlan, result: SandboxResult) -> str | None:
         """Install dependencies; return the image that worked, or None (result is filled in)."""
@@ -303,7 +320,7 @@ class Sandbox:
                 Mount(ws.deps, "/deps", writable=True),
                 Mount(ws.tooling, "/apifix", writable=False),
             ]
-            phase = self._phase("install", image, "bridge", command, mounts, None)
+            phase = self._phase("install", image, "bridge", command, mounts, None, ws.root)
             phase.constraints_applied = use_constraints
             result.install_attempts.append(phase)
             result.image = image
@@ -332,15 +349,23 @@ class Sandbox:
         result.reason = "dependency install failed"
         return None
 
-    def _test(self, ws: _Workspace, image: str, tests: TestPlan, result: SandboxResult) -> None:
-        command = ["python", "/apifix/driver.py", "test", "--", *tests.command]
+    def _test(
+        self,
+        ws: _Workspace,
+        image: str,
+        tests: TestPlan,
+        result: SandboxResult,
+        coverage: bool,
+    ) -> None:
+        command = ["python", "/apifix/driver.py", "test"]
+        command += ["--coverage", "--", *tests.command] if coverage else ["--", *tests.command]
         mounts = [
             Mount(ws.deps, "/deps", writable=False),
             Mount(ws.work, "/work", writable=True),
             Mount(ws.results, "/results", writable=True),
             Mount(ws.tooling, "/apifix", writable=False),
         ]
-        phase = self._phase("test", image, "none", command, mounts, "/work")
+        phase = self._phase("test", image, "none", command, mounts, "/work", ws.root)
         result.test = phase
 
         driver = _read_json(ws.results / "driver.json")
@@ -363,6 +388,8 @@ class Sandbox:
             result.status = "error"
             result.reason = "the test phase did not start"
             return
+        if coverage:
+            result.coverage = self._read_coverage(ws, result)
 
         if tests.runner == "pytest":
             report = ws.results / "junit.xml"
@@ -396,6 +423,18 @@ class Sandbox:
             result.status = "failed"
             result.reason = f"test runner exited {phase.exit_code}"
 
+    @staticmethod
+    def _read_coverage(ws: _Workspace, result: SandboxResult) -> dict[str, FileCoverage] | None:
+        report = ws.results / "coverage.json"
+        if not report.is_file():
+            result.notes.append("coverage was requested but no report was produced")
+            return None
+        try:
+            return parse_coverage_json(report.read_text(errors="replace"))
+        except ReportError as exc:
+            result.notes.append(f"coverage report unusable: {exc}")
+            return None
+
     def _phase(
         self,
         name: Literal["install", "test"],
@@ -404,6 +443,7 @@ class Sandbox:
         command: list[str],
         mounts: list[Mount],
         workdir: str | None,
+        workspace: Path,
     ) -> PhaseResult:
         container = f"apifix-{name}-{uuid.uuid4().hex[:12]}"
         args = container_args(
@@ -416,6 +456,7 @@ class Sandbox:
             user=self.user,
             workdir=workdir,
             extra_env=TEST_PHASE_ENV if name == "test" else None,
+            workspace=workspace,
         )
         timeout = self.config.install_timeout_s if name == "install" else self.config.test_timeout_s
         try:
@@ -457,3 +498,86 @@ def run_sandbox(
     docker: DockerClient | None = None,
 ) -> SandboxResult:
     return Sandbox(config, docker).run(repo_path)
+
+
+class SandboxSession:
+    """One repo, one dependency install, any number of test runs.
+
+    Each `run_tests()` returns a full SandboxResult (install details included) and starts from a
+    fresh copy of the repo. `close()` removes everything; prefer `with sandbox.session(...)`.
+    """
+
+    def __init__(
+        self, sandbox: Sandbox, repo_path: str | os.PathLike[str], *, coverage: bool
+    ) -> None:
+        self.sandbox = sandbox
+        self.repo = Path(repo_path).resolve()
+        if not self.repo.is_dir():
+            raise NotADirectoryError(f"not a directory: {self.repo}")
+        self.coverage = coverage
+        python = detect_python_version(self.repo, sandbox.config.default_python)
+        self.tests = detect_tests(self.repo)
+        self.base = SandboxResult(
+            status="error",
+            reason="",
+            python_version=python.version,
+            python_version_source=python.source,
+            runner=self.tests.runner,
+            test_command=list(self.tests.command),
+        )
+        self._workspace: _Workspace | None = None
+        self._image: str | None = None
+        self._prepared = False
+        self._runs = 0
+
+    def __enter__(self) -> SandboxSession:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._workspace is not None:
+            self._workspace.cleanup()
+            self._workspace = None
+
+    def _prepare(self) -> None:
+        if self._prepared:
+            return
+        self._prepared = True
+        base = self.base
+        if not self.tests.test_files:
+            base.status, base.reason = "unverified", "no test files found"
+            return
+        plan = build_install_plan(self.repo, self.tests.runner)
+        if self.coverage and "coverage" not in plan.requirements:
+            plan = dataclasses.replace(plan, requirements=(*plan.requirements, "coverage"))
+        base.dependency_sources = list(plan.sources)
+        base.lockfile = plan.lockfile
+        base.notes = list(plan.notes)
+
+        usable, why = self.sandbox.docker.available()
+        if not usable:
+            base.reason = why
+            return
+        self._workspace = _Workspace(self.repo, plan)
+        self._image = self.sandbox._install(self._workspace, plan, base)
+
+    def run_tests(self, *, coverage: bool | None = None) -> SandboxResult:
+        """Run the test phase. `coverage` defaults to the session setting (it can only be
+        turned on if the session was opened with coverage=True, since it must be installed)."""
+        self._prepare()
+        result = copy.deepcopy(self.base)
+        try:
+            if self._image is None or self._workspace is None:
+                return result
+            if self._runs:
+                self._workspace.reset_work(self.repo)
+            self._runs += 1
+            measure = self.coverage if coverage is None else (coverage and self.coverage)
+            self.sandbox._test(self._workspace, self._image, self.tests, result, measure)
+            return result
+        finally:
+            # This run's cost: the (shared) install plus its own test phase.
+            phases = [*result.install_attempts, *([result.test] if result.test else [])]
+            result.duration_s = sum(p.duration_s for p in phases)
