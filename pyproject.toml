@@ -22,7 +22,9 @@ packages = ["src/apifix"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
-markers = ["docker: needs a usable Docker daemon and network access (skipped otherwise)"]
+markers = [
+    "docker: needs a Docker daemon and network; opt-in with --docker (skipped if unusable)",
+]
 
 [tool.ruff]
 line-length = 100

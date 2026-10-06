@@ -11,6 +11,28 @@ from apifix.engine.scanner import scan
 FIXTURES = Path(__file__).parent / "fixtures" / "openai_v0"
 
 
+# --- Docker integration tests are opt-in ----------------------------------------------------
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--docker",
+        action="store_true",
+        help="also run tests marked `docker` (real Docker daemon + network; slow)",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    markexpr = config.getoption("markexpr") or ""
+    asked_for_docker = "docker" in markexpr and "not docker" not in markexpr
+    if config.getoption("--docker") or asked_for_docker:
+        return
+    deselected = [item for item in items if item.get_closest_marker("docker")]
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+        items[:] = [item for item in items if not item.get_closest_marker("docker")]
+
+
 @pytest.fixture
 def fixture_findings():
     """Findings for one fixture file, scanned on its own."""

@@ -57,6 +57,9 @@ tests/                pytest; fixtures/ holds realistic sample code
   Repo code (including setup.py) and tests only ever run in the `--network none` test phase.
 - **Secrets never enter the sandbox** (no API keys in env, mounts, or images).
 - Small, testable steps. Every module ships with tests.
+- **Before every commit, run the full suite including Docker tests** (`pytest -q --docker`) plus
+  ruff, and commit only if everything passes. Docker tests skip if Docker is unusable; a skip
+  is not a pass, so fix Docker access rather than committing on skips.
 
 ## Conventions
 
@@ -71,8 +74,9 @@ tests/                pytest; fixtures/ holds realistic sample code
 
 ```
 python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
-.venv/bin/pytest -q                  # Docker integration tests skip if Docker is unusable
-.venv/bin/pytest -q -m docker        # only the Docker integration tests (need network)
+.venv/bin/pytest -q                  # fast run: Docker integration tests are deselected
+.venv/bin/pytest -q --docker         # full suite, including Docker tests (~2 min, needs network)
+.venv/bin/pytest -q -m docker        # only the Docker integration tests
 .venv/bin/ruff check . && .venv/bin/ruff format --check .
 .venv/bin/apifix scan tests/fixtures/openai_v0 --migration openai-v1 [--json]
 ```
