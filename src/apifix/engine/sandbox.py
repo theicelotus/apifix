@@ -18,7 +18,7 @@ import shutil
 import tempfile
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -59,6 +59,11 @@ CONTAINER_ENV: dict[str, str] = {
     "PIP_NO_CACHE_DIR": "1",
     "PYTHONDONTWRITEBYTECODE": "1",
     "PYTHONUNBUFFERED": "1",
+}
+# Added in the test phase only. .git is not copied into the sandbox, so setuptools-scm cannot
+# derive a version and the offline editable install would fail without this.
+TEST_PHASE_ENV: dict[str, str] = {
+    "SETUPTOOLS_SCM_PRETEND_VERSION": "0.0.0",
 }
 
 BUILD_ERROR_MARKERS = (
@@ -158,6 +163,7 @@ def container_args(
     config: SandboxConfig,
     user: str,
     workdir: str | None = None,
+    extra_env: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Arguments for `docker run`. Pure, so the security properties are unit-testable."""
     args = [
@@ -174,7 +180,7 @@ def container_args(
         "--memory-swap", config.memory,
         "--pids-limit", str(config.pids_limit),
     ]  # fmt: skip
-    for key, value in CONTAINER_ENV.items():
+    for key, value in {**CONTAINER_ENV, **(extra_env or {})}.items():
         args += ["--env", f"{key}={value}"]
     for m in mounts:
         args += ["--volume", m.arg()]
@@ -409,6 +415,7 @@ class Sandbox:
             config=self.config,
             user=self.user,
             workdir=workdir,
+            extra_env=TEST_PHASE_ENV if name == "test" else None,
         )
         timeout = self.config.install_timeout_s if name == "install" else self.config.test_timeout_s
         try:

@@ -14,6 +14,7 @@ from apifix.engine import sandbox as sandbox_mod
 from apifix.engine.docker import ProcResult
 from apifix.engine.sandbox import (
     CONTAINER_ENV,
+    TEST_PHASE_ENV,
     SandboxConfig,
     container_user,
     run_sandbox,
@@ -247,11 +248,24 @@ def test_hardening_flags_on_every_container(repo):
 def test_no_host_environment_reaches_containers(repo):
     docker = FakeDocker(test=pytest_run(passed=1))
     run_sandbox(repo, docker=docker)
+    install, test = docker.calls
     for call in docker.calls:
         assert CANARY not in " ".join(call.args)
-        env = dict(e.split("=", 1) for e in call.opt("--env"))
-        assert env == CONTAINER_ENV
         assert "--env-file" not in call.args
+    assert env_of(install) == CONTAINER_ENV
+    assert env_of(test) == {**CONTAINER_ENV, **TEST_PHASE_ENV}
+
+
+def env_of(call: Call) -> dict[str, str]:
+    return dict(e.split("=", 1) for e in call.opt("--env"))
+
+
+def test_setuptools_scm_version_is_pretended_in_test_phase_only(repo):
+    docker = FakeDocker(test=pytest_run(passed=1))
+    run_sandbox(repo, docker=docker)
+    install, test = docker.calls
+    assert env_of(test)["SETUPTOOLS_SCM_PRETEND_VERSION"] == "0.0.0"
+    assert "SETUPTOOLS_SCM_PRETEND_VERSION" not in env_of(install)
 
 
 def test_container_user_is_never_root(monkeypatch):

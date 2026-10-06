@@ -92,10 +92,12 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 - Local-path, editable and VCS dependencies (`-e .`, `./libs/x`, Poetry `path`/`git`) are not
   installed. The repo itself is installed offline in the test phase (`pip install --no-deps
   --no-build-isolation -e`), using the build backend from `[build-system] requires`; if that
-  fails (dynamic versions like setuptools_scm without `.git`, missing build deps) the repo is put
-  on `PYTHONPATH` instead (`install_method` records which).
-- `.git` is not copied into the sandbox (it can hold credentials), so tests or builds that need
-  git metadata fail or fall back to `PYTHONPATH`.
+  fails (e.g. missing build deps) the repo is put on `PYTHONPATH` instead (`install_method`
+  records which).
+- `.git` is not copied into the sandbox (it can hold credentials). setuptools-scm projects get
+  `SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0` in the test phase, so they install as version 0.0.0;
+  tests that check the real version, other VCS-versioning backends, or tests that need git
+  metadata will fail or fall back to `PYTHONPATH`.
 - Lockfiles (`poetry.lock`, `Pipfile.lock`, fully pinned requirements files) are applied as pip
   constraints, not exact environments: only pins of packages that get installed apply. Pins that
   contradict a declared requirement (e.g. after a fix bumped a version) are dropped, and if pip

@@ -121,6 +121,38 @@ def test_failing_tests_and_editable_install(tmp_path):
     assert "tests.test_calc::test_broken" in {t.id for t in result.tests if t.outcome == "failed"}
 
 
+def test_setuptools_scm_project_installs_without_git(tmp_path):
+    repo = make_repo(
+        tmp_path / "repo",
+        {
+            "pyproject.toml": """
+            [build-system]
+            requires = ["setuptools>=64", "setuptools-scm>=8"]
+            build-backend = "setuptools.build_meta"
+
+            [project]
+            name = "scmdemo"
+            dynamic = ["version"]
+
+            [tool.setuptools_scm]
+
+            [tool.setuptools.packages.find]
+            where = ["src"]
+            """,
+            "src/scmdemo/__init__.py": "",
+            "tests/test_version.py": """
+            from importlib.metadata import version
+
+            def test_installed_with_pretend_version():
+                assert version("scmdemo") == "0.0.0"
+            """,
+        },
+    )
+    result = run_sandbox(repo, CONFIG)
+    assert result.install_method == "editable", result.notes
+    assert result.status == "passed", (result.reason, result.test and result.test.stdout)
+
+
 def test_unittest_repo(tmp_path):
     repo = make_repo(
         tmp_path / "repo",
