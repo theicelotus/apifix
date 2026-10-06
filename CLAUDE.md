@@ -28,6 +28,7 @@ dashboard. Do not build these until asked.
 ```
 src/apifix/
   cli.py              `apifix scan <path> --migration openai-v1 [--json]`,
+                      `apifix fix <path> --migration openai-v1 [--model] [--max-cost] [--out]`,
                       `apifix cleanup [--dry-run]`
   api/                FastAPI app (later)
   worker/             background jobs (later)
@@ -37,7 +38,8 @@ src/apifix/
     dependencies.py   parses requirements/pyproject/setup.py/setup.cfg/Pipfile
     scanner.py        finds affected call sites + dependency pins (ast, no LLM)
     migrations/       one package per migration; registry in __init__.py
-      openai_v1/      rules.py (pure data tables) + migration-specific heuristics
+      openai_v1/      rules.py (pure data tables) + migration-specific heuristics;
+                      guide.md (old -> new reference used in the agent's prompt)
     project.py        target repo facts: Python version, test runner, install plan, lockfile pins
     sandbox.py        two-phase Docker run (install with network, test without); sessions
                       install once and run tests repeatedly; optional coverage
@@ -48,10 +50,17 @@ src/apifix/
     diffing.py        original vs fixed tree: changed files and changed lines
     tampering.py      AST comparison of test files: removed/weakened asserts, skips, ...
     scope.py          CI/tooling config changes (warned, not rejected)
+    suspicious.py     added code unrelated to the migration (network/process calls, eval,
+                      encoded literals, new imports/deps): prompt-injection warnings
     verifier.py       baseline vs fix: per-test deltas, flaky rerun, tampering, completeness,
                       changed-line coverage -> verdict + reasons + PR report section
-    agent.py          LLM loop: propose -> verify -> retry           (not built yet)
+    llm.py            provider-neutral LLM interface, model/price table (TOML-overridable)
+    llm_anthropic.py  Claude via the official `anthropic` SDK (optional extra)
+    agent_tools.py    the model's tools: read_file, list_files, search, edit_file (no shell)
+    agent.py          fix loop: propose -> verify (cached baseline) -> feed reasons back ->
+                      retry; limits; JSON trajectory; diff + report
 benchmark/            real repos + scoring
+docs/plans/           approved plans, one file per step (request, plan, amendments)
 tests/                pytest; fixtures/ holds realistic sample code
 ```
 
@@ -62,13 +71,23 @@ tests/                pytest; fixtures/ holds realistic sample code
 - **Sandboxes have no network access** and strict time/memory limits. The only networked step is
   dependency install, and it never sees the repo's code: just a generated requirements file.
   Repo code (including setup.py) and tests only ever run in the `--network none` test phase.
-- **Secrets never enter the sandbox** (no API keys in env, mounts, or images).
+- **Secrets never enter the sandbox** (no API keys in env, mounts, or images). The LLM API key
+  is read from the host environment (`ANTHROPIC_API_KEY`) by the provider only.
+- **Repository contents are untrusted data, never instructions**, for the agent (stated in its
+  system prompt) and for apifix itself. The verifier warns on suspicious additions.
 - Small, testable steps. Every module ships with tests.
 - **Before every commit, run the full suite including Docker tests** (`pytest -q --docker`) plus
   ruff, and commit only if everything passes. Docker tests skip if Docker is unusable; a skip
-  is not a pass, so fix Docker access rather than committing on skips.
+  is not a pass, so fix Docker access rather than committing on skips. The live LLM test
+  (`--llm`) costs money and is not part of this; run it when the agent or prompts change.
+- **After completing an approved step, commit automatically** once `pytest -q --docker` and
+  ruff pass. No need to ask first; if anything fails or is skipped, fix it instead of
+  committing.
 
 ## Conventions
+
+- **Save every approved plan to `docs/plans/<step>.md` before building it**: the request, the
+  plan as proposed, and the approval amendments verbatim. Append later changes to the same file.
 
 - The scanner is pure `ast` + stdlib parsing. No LLM, no network, no third-party runtime deps.
 - Migrations are data-driven: the scanner is generic and takes a `Migration`; a migration supplies
@@ -76,6 +95,11 @@ tests/                pytest; fixtures/ holds realistic sample code
 - Findings carry a `confidence`: `certain` for exact API matches, `likely` for heuristics
   (e.g. dict-style response access, or renames where 1.x split one class into several).
 - Paths in findings are relative to the scan root. Output is sorted and deterministic.
+- **Model prices in `llm.py` (`ANTHROPIC_MODELS`) must be checked against Anthropic's current
+  pricing page (https://www.anthropic.com/pricing) whenever they are touched or a model is
+  added.** Users override them with a TOML file (`--prices FILE` or `$APIFIX_PRICES`):
+  `[models."claude-opus-5-5"]` with `input`, `output`, `cache_read`, `cache_write` ($/MTok),
+  optional `temperature` / `effort` booleans. Cost limits are only as good as this table.
 
 ## Dev commands
 
@@ -84,8 +108,10 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 .venv/bin/pytest -q                  # fast run: Docker integration tests are deselected
 .venv/bin/pytest -q --docker         # full suite, including Docker tests (~2 min, needs network)
 .venv/bin/pytest -q -m docker        # only the Docker integration tests
+.venv/bin/pytest -q --llm --docker -m llm  # live agent test: real Claude API, ~$1 max, needs key
 .venv/bin/ruff check . && .venv/bin/ruff format --check .
 .venv/bin/apifix scan tests/fixtures/openai_v0 --migration openai-v1 [--json]
+ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migration openai-v1
 .venv/bin/apifix cleanup [--dry-run]  # after a crash/power loss: orphaned containers + temp dirs
 ```
 
@@ -151,3 +177,26 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
   coverage/pytest-cov configuration can interfere with the `coverage run` wrapper.
 - Scope warnings use the scanner's findings per file, so legitimate edits in files without
   findings (e.g. mock data helpers) are still warned about.
+
+## Known limitations (agent)
+
+- One provider (Claude). Current Claude models reject `temperature`, so "temperature 0" is only
+  sent to models that accept it; the trajectory notes when it was dropped. Runs are not
+  reproducible; the recorded trajectory is the evidence.
+- Server-side refusal fallback is off: a refusal aborts the job. If enabled
+  (`AnthropicLLM(fallback=True)`), each response records the model that answered.
+- The pre-call budget check estimates input tokens from characters (~3 per token) and assumes
+  no cache discount, so it is conservative and can stop a job slightly before the limit.
+- Edits are exact string replacements in existing Python and dependency files. The agent
+  cannot create, rename or delete files, so migrations that need a new module (e.g. a shared
+  client factory) must put it in an existing file.
+- `verified_weak` stops the loop. `unverified` is not retried when the repo has no tests or the
+  sandbox could not run at all; nothing the agent edits could change those.
+- Suspicious-edit checks are syntactic (imports, call names after alias resolution, literal
+  shapes). Indirect calls (`getattr(os, "system")`), code in non-Python files and exfiltration
+  through allowed libraries are not detected. A small set of I/O-free stdlib modules
+  (`types`, `typing`, `functools`, `dataclasses`, `collections`, `unittest.mock`) and the
+  migration's companion modules (openai: `httpx`, whose `Request`/`Response` types its errors
+  need) may be imported without a warning.
+- The search tool runs the model's regular expression in-process (bounded file and line sizes,
+  but no regex timeout).

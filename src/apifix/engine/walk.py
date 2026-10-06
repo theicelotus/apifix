@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -48,3 +49,14 @@ def iter_files(root: Path) -> Iterator[Path]:
             file = here / name
             if not file.is_symlink():
                 yield file
+
+
+def copy_repo(src: Path, dst: Path) -> None:
+    """Copy a repo without its tooling dirs (.git, venvs, caches). Symlinks are copied as links,
+    never followed."""
+    shutil.copytree(src, dst, symlinks=True, ignore=_ignore_skipped_dirs)
+
+
+def _ignore_skipped_dirs(directory: str, names: list[str]) -> set[str]:
+    here = Path(directory)
+    return {n for n in names if (here / n).is_dir() and is_skipped_dir(here / n)}

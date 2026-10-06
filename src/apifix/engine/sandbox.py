@@ -46,7 +46,7 @@ from apifix.engine.test_results import (
     parse_junit,
     parse_unittest_output,
 )
-from apifix.engine.walk import is_skipped_dir
+from apifix.engine.walk import copy_repo
 
 Status = Literal["passed", "failed", "unverified", "error", "timeout"]
 PhaseStatus = Literal["ok", "failed", "timeout", "error", "skipped"]
@@ -221,7 +221,7 @@ class _Workspace:
         (self.manifest / "requirements.txt").write_text("\n".join(plan.requirements) + "\n")
         (self.manifest / "constraints.txt").write_text("\n".join(plan.constraints) + "\n")
         shutil.copy2(DRIVER, self.tooling / "driver.py")
-        shutil.copytree(repo, self.work, symlinks=True, ignore=_ignore_tooling_dirs)
+        copy_repo(repo, self.work)
         if os.getuid() == 0:  # containers run as nobody: let it write where it must
             for d in (self.deps, self.work, self.results):
                 _make_world_writable(d)
@@ -231,7 +231,7 @@ class _Workspace:
         for d in (self.work, self.results):
             shutil.rmtree(d, ignore_errors=True)
         self.results.mkdir()
-        shutil.copytree(repo, self.work, symlinks=True, ignore=_ignore_tooling_dirs)
+        copy_repo(repo, self.work)
         if os.getuid() == 0:
             for d in (self.work, self.results):
                 _make_world_writable(d)
@@ -267,12 +267,6 @@ def lock_workspace(root: Path) -> int | None:
 def unlock_workspace(fd: int) -> None:
     with contextlib.suppress(OSError):
         os.close(fd)
-
-
-def _ignore_tooling_dirs(directory: str, names: list[str]) -> set[str]:
-    return {
-        n for n in names if (Path(directory) / n).is_dir() and is_skipped_dir(Path(directory) / n)
-    }
 
 
 def _make_world_writable(path: Path) -> None:

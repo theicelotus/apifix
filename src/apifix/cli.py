@@ -1,6 +1,7 @@
 """Command-line entry point.
 
 apifix scan <path> --migration openai-v1 [--json]
+apifix fix <path> --migration openai-v1 [--model M] [--max-cost USD] [--out DIR]
 apifix cleanup [--dry-run]      remove containers/temp dirs left by interrupted runs
 """
 
@@ -10,6 +11,8 @@ import argparse
 import json
 import sys
 from dataclasses import asdict
+from datetime import datetime
+from pathlib import Path
 
 from apifix.engine.cleanup import CleanupReport, cleanup
 from apifix.engine.docker import DockerCLI
@@ -27,6 +30,17 @@ def main(argv: list[str] | None = None) -> int:
     p_scan.add_argument("path", help="local repo directory or file")
     p_scan.add_argument("--migration", required=True, choices=available_migrations())
     p_scan.add_argument("--json", action="store_true", help="machine-readable output")
+    p_fix = sub.add_parser("fix", help="fix a copy of the repo with an LLM agent, then verify it")
+    p_fix.add_argument("path", help="local repo directory (never modified)")
+    p_fix.add_argument("--migration", required=True, choices=available_migrations())
+    p_fix.add_argument("--provider", help="LLM provider (default: $APIFIX_PROVIDER or anthropic)")
+    p_fix.add_argument("--model", help="model (default: $APIFIX_MODEL or claude-opus-5-5)")
+    p_fix.add_argument("--prices", help="TOML file overriding model prices ($APIFIX_PRICES)")
+    p_fix.add_argument(
+        "--max-cost", type=float, default=5.0, help="US dollar limit for the job (default 5)"
+    )
+    p_fix.add_argument("--max-retries", type=int, default=3)
+    p_fix.add_argument("--out", help="output directory (default: ./apifix-out/<timestamp>)")
     p_clean = sub.add_parser(
         "cleanup",
         help="remove apifix containers and temp dirs left behind by crashed or killed runs",
@@ -34,6 +48,8 @@ def main(argv: list[str] | None = None) -> int:
     p_clean.add_argument("--dry-run", action="store_true", help="only list what would go")
     args = parser.parse_args(argv)
 
+    if args.command == "fix":
+        return _fix(args)
     if args.command == "cleanup":
         report = cleanup(DockerCLI(), dry_run=args.dry_run)
         print(_cleanup_text(report))
@@ -50,6 +66,42 @@ def main(argv: list[str] | None = None) -> int:
 
     print(_to_json(result) if args.json else _to_text(result))
     return EXIT_FINDINGS if result.findings else EXIT_CLEAN
+
+
+def _fix(args: argparse.Namespace) -> int:
+    from apifix.engine.agent import AgentConfig, fix
+    from apifix.engine.llm import LLMError, get_llm
+    from apifix.engine.sandbox import Sandbox
+
+    if args.path.startswith(("http://", "https://", "git@")):
+        print("apifix: GitHub URLs are not supported yet; clone locally first", file=sys.stderr)
+        return EXIT_USAGE
+    if not Path(args.path).is_dir():
+        print(f"apifix: not a directory: {args.path}", file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        llm = get_llm(args.provider, args.model, prices=args.prices)
+        config = AgentConfig(max_cost_usd=args.max_cost, max_retries=args.max_retries)
+        result = fix(args.path, args.migration, llm=llm, sandbox=Sandbox(), config=config)
+    except (LLMError, ValueError) as exc:
+        print(f"apifix: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    out = Path(args.out or Path("apifix-out") / datetime.now().strftime("%Y%m%d-%H%M%S"))
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "fix.diff").write_text(result.diff)
+    (out / "report.md").write_text(result.report_markdown)
+    verification = result.verification.to_dict() if result.verification else None
+    (out / "verification.json").write_text(json.dumps(verification, indent=2) + "\n")
+    (out / "trajectory.json").write_text(json.dumps(result.trajectory, indent=2) + "\n")
+    print(f"{result.outcome}: {result.reason}")
+    print(
+        f"{result.attempts} attempt(s), {result.usage.total:,} tokens, ${result.cost_usd:.2f}; "
+        f"wrote fix.diff, report.md, verification.json, trajectory.json to {out}"
+    )
+    if result.outcome in ("verified", "verified_weak", "no_findings"):
+        return EXIT_CLEAN
+    return EXIT_USAGE if result.outcome == "aborted" else EXIT_FINDINGS
 
 
 def _cleanup_text(report: CleanupReport) -> str:

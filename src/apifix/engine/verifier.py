@@ -12,12 +12,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
+from apifix.engine.dependencies import is_dependency_file
 from apifix.engine.diffing import FileChange, diff_trees, read_text
 from apifix.engine.migrations import Migration, get_migration
 from apifix.engine.models import Finding
 from apifix.engine.sandbox import Sandbox, SandboxResult
 from apifix.engine.scanner import scan
 from apifix.engine.scope import tooling_change
+from apifix.engine.suspicious import check_dependencies, check_python
 from apifix.engine.tampering import (
     PYTEST_CONFIG_FILES,
     TestEdit,
@@ -131,17 +133,17 @@ class Verification:
             "findings_before": self.findings_before,
             "remaining_findings": [asdict(f) for f in self.remaining_findings],
             "runs": {
-                name: _run_summary(run)
+                name: run_summary(run)
                 for name, run in (("baseline", self.baseline), ("fixed", self.fixed))
             }
-            | ({"rerun": _run_summary(self.rerun)} if self.rerun else {}),
+            | ({"rerun": run_summary(self.rerun)} if self.rerun else {}),
         }
 
     def report_markdown(self) -> str:
         return _report(self)
 
 
-def _run_summary(run: SandboxResult) -> dict:
+def run_summary(run: SandboxResult) -> dict:
     return {
         "status": run.status,
         "reason": run.reason,
@@ -554,6 +556,37 @@ def _scope_reasons(
     return reasons
 
 
+def _suspicious_reasons(
+    original: Path, fixed: Path, changes: list[FileChange], migration: Migration
+) -> list[Reason]:
+    """Additions unrelated to the migration (possible prompt injection); warnings only."""
+    reasons = []
+    for ch in changes:
+        if ch.kind == "deleted":
+            continue
+        old = read_text(original / ch.path) if ch.kind != "added" else None
+        new = read_text(fixed / ch.path)
+        found = []
+        if ch.is_python:
+            found += check_python(
+                ch.path, old, new, migration.api_modules, migration.companion_modules
+            )
+        if is_dependency_file(ch.path):
+            found += check_dependencies(ch.path, old, new, migration.api_modules)
+        reasons += [
+            Reason(
+                "suspicious_edit",
+                "warn",
+                f"{e.detail} ({e.kind}); a migration should not need this",
+                (),
+                e.file,
+                e.line,
+            )
+            for e in found
+        ]
+    return reasons
+
+
 def _evidence_reasons(
     fixed: SandboxResult, coverage: ChangedLineCoverage, config: VerifierConfig
 ) -> list[Reason]:
@@ -650,6 +683,7 @@ def verify(
         + _edit_reasons(edits, delta)
         + _scan_reasons(after_scan.findings, new_errors)
         + _scope_reasons(original, fixed, changes, {f.file for f in before_scan.findings})
+        + _suspicious_reasons(original, fixed, changes, mig)
         + _evidence_reasons(fixed_run, coverage, config)
     )
     return Verification(

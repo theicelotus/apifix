@@ -9,28 +9,36 @@ from apifix.engine.models import Finding
 from apifix.engine.scanner import scan
 
 FIXTURES = Path(__file__).parent / "fixtures" / "openai_v0"
+# Fixture repos are data (some contain their own tests); never collect them.
+collect_ignore = ["fixtures"]
 
 
-# --- Docker integration tests are opt-in ----------------------------------------------------
+# --- Docker and LLM tests are opt-in ----------------------------------------------------------
+
+OPT_IN = {
+    "docker": "also run tests marked `docker` (real Docker daemon + network; slow)",
+    "llm": "also run tests marked `llm` (real LLM API calls; cost money, need an API key)",
+}
 
 
 def pytest_addoption(parser):
-    parser.addoption(
-        "--docker",
-        action="store_true",
-        help="also run tests marked `docker` (real Docker daemon + network; slow)",
-    )
+    for marker, help in OPT_IN.items():
+        parser.addoption(f"--{marker}", action="store_true", help=help)
 
 
 def pytest_collection_modifyitems(config, items):
     markexpr = config.getoption("markexpr") or ""
-    asked_for_docker = "docker" in markexpr and "not docker" not in markexpr
-    if config.getoption("--docker") or asked_for_docker:
-        return
-    deselected = [item for item in items if item.get_closest_marker("docker")]
+    keep = {
+        m
+        for m in OPT_IN
+        if config.getoption(f"--{m}") or (m in markexpr and f"not {m}" not in markexpr)
+    }
+    deselected = [
+        item for item in items if any(item.get_closest_marker(m) for m in set(OPT_IN) - keep)
+    ]
     if deselected:
         config.hook.pytest_deselected(items=deselected)
-        items[:] = [item for item in items if not item.get_closest_marker("docker")]
+        items[:] = [item for item in items if item not in deselected]
 
 
 @pytest.fixture

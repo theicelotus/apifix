@@ -70,3 +70,29 @@ def changed_lines(old: str, new: str) -> tuple[tuple[int, ...], int]:
         if op in ("replace", "delete"):
             removed += i2 - i1
     return tuple(changed), removed
+
+
+def unified_diff(original: Path, fixed: Path, changes: list[FileChange] | None = None) -> str:
+    """A `git apply`-able unified diff of the text files that changed."""
+    out = []
+    for ch in changes if changes is not None else diff_trees(original, fixed):
+        old = read_text(original / ch.path) if ch.kind != "added" else ""
+        new = read_text(fixed / ch.path) if ch.kind != "deleted" else ""
+        if old is None or new is None:
+            out.append(f"Binary files a/{ch.path} and b/{ch.path} differ\n")
+            continue
+        a = "/dev/null" if ch.kind == "added" else f"a/{ch.path}"
+        b = "/dev/null" if ch.kind == "deleted" else f"b/{ch.path}"
+        lines = list(
+            difflib.unified_diff(old.splitlines(keepends=True), new.splitlines(keepends=True), a, b)
+        )
+        for i, line in enumerate(lines):
+            if not line.endswith("\n"):
+                lines[i] = line + "\n\\ No newline at end of file\n"
+        header = f"diff --git a/{ch.path} b/{ch.path}\n"
+        if ch.kind == "added":
+            header += "new file mode 100644\n"
+        elif ch.kind == "deleted":
+            header += "deleted file mode 100644\n"
+        out.append(header + "".join(lines))
+    return "".join(out)

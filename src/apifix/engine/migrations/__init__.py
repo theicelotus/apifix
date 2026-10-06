@@ -17,6 +17,11 @@ class Migration(Protocol):
     api_modules: frozenset[str]
     # The library's catch-all exception classes; catching these in tests counts as broadening.
     broad_exceptions: frozenset[str]
+    # Libraries whose types the new API uses (e.g. httpx for openai's error constructors): new
+    # imports of them are not suspicious.
+    companion_modules: frozenset[str]
+    # Short old -> new reference (Markdown) for the fix agent's prompt.
+    guide: str
 
     def check_python(self, file: str, tree: ast.Module, source: str) -> list[Finding]:
         """Return findings for one parsed Python file."""

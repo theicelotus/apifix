@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from pathlib import Path
 
 from apifix.engine.dependencies import DeclaredDependency, entirely_below
 from apifix.engine.migrations.openai_v1 import rules
@@ -15,6 +16,8 @@ class OpenAIV1Migration:
     summary = "OpenAI Python library 0.x -> 1.x"
     api_modules = frozenset({"openai"})
     broad_exceptions = frozenset({"OpenAIError", "APIError", "APIStatusError"})
+    companion_modules = frozenset({"httpx"})
+    guide = (Path(__file__).parent / "guide.md").read_text(encoding="utf-8")
 
     def check_python(self, file: str, tree: ast.Module, source: str) -> list[Finding]:
         return check_python(file, tree, source)

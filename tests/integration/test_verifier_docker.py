@@ -5,7 +5,6 @@ Needs Docker and network (installs openai 0.28.1 for the baseline and 1.x for th
 
 from __future__ import annotations
 
-import textwrap
 from pathlib import Path
 
 import pytest
@@ -13,47 +12,12 @@ import pytest
 from apifix.engine.docker import DockerCLI
 from apifix.engine.sandbox import Sandbox, SandboxConfig
 from apifix.engine.verifier import verify
+from tests.integration.tiny_repo import ORIGINAL, make_repo
 
 _usable, _why = DockerCLI().available()
 pytestmark = [pytest.mark.docker, pytest.mark.skipif(not _usable, reason=_why or "no docker")]
 
 CONFIG = SandboxConfig(install_timeout_s=600, test_timeout_s=180, memory="1g", cpus=1.0)
-
-ORIGINAL = {
-    "requirements.txt": "openai==0.28.1\npytest\n",
-    "app.py": """\
-        import openai
-
-
-        def ask(question):
-            response = openai.ChatCompletion.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": question}],
-            )
-            return response["choices"][0]["message"]["content"].strip()
-        """,
-    "tests/test_app.py": """\
-        from unittest import mock
-
-        from app import ask
-
-
-        def completion(text):
-            return {"choices": [{"message": {"content": text}}]}
-
-
-        @mock.patch("openai.ChatCompletion.create")
-        def test_ask(create):
-            create.return_value = completion("hello")
-            assert ask("hi") == "hello"
-
-
-        @mock.patch("openai.ChatCompletion.create")
-        def test_strips_whitespace(create):
-            create.return_value = completion("  hello\\n")
-            assert ask("hi") == "hello"
-        """,
-}
 
 GOOD_APP = """\
     import openai
@@ -97,13 +61,6 @@ GOOD_FIX = {
     "app.py": GOOD_APP,
     "tests/test_app.py": GOOD_TESTS,
 }
-
-
-def make_repo(root: Path, files: dict[str, str]) -> Path:
-    for rel, text in files.items():
-        (root / rel).parent.mkdir(parents=True, exist_ok=True)
-        (root / rel).write_text(textwrap.dedent(text))
-    return root
 
 
 @pytest.fixture(scope="module")
