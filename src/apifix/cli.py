@@ -2,6 +2,7 @@
 
 apifix scan <path> --migration openai-v1 [--json]
 apifix fix <path> --migration openai-v1 [--model M] [--max-cost USD] [--out DIR]
+apifix fix <path> --migration openai-v1 --provider openai-compat --model M [--base-url URL]
 apifix cleanup [--dry-run]      remove containers/temp dirs left by interrupted runs
 """
 
@@ -33,11 +34,33 @@ def main(argv: list[str] | None = None) -> int:
     p_fix = sub.add_parser("fix", help="fix a copy of the repo with an LLM agent, then verify it")
     p_fix.add_argument("path", help="local repo directory (never modified)")
     p_fix.add_argument("--migration", required=True, choices=available_migrations())
-    p_fix.add_argument("--provider", help="LLM provider (default: $APIFIX_PROVIDER or anthropic)")
-    p_fix.add_argument("--model", help="model (default: $APIFIX_MODEL or claude-opus-5-5)")
-    p_fix.add_argument("--prices", help="TOML file overriding model prices ($APIFIX_PRICES)")
     p_fix.add_argument(
+        "--provider",
+        choices=["anthropic", "openai-compat"],
+        help="LLM provider (default: $APIFIX_PROVIDER or anthropic)",
+    )
+    p_fix.add_argument(
+        "--model",
+        help="model (default: $APIFIX_MODEL, else claude-opus-5-5; required for openai-compat)",
+    )
+    p_fix.add_argument(
+        "--base-url",
+        help="openai-compat endpoint (default: $APIFIX_BASE_URL or http://localhost:11434/v1)",
+    )
+    p_fix.add_argument(
+        "--api-key-env",
+        help="openai-compat: env var holding the API key (default: APIFIX_LLM_API_KEY)",
+    )
+    p_fix.add_argument("--timeout", type=float, help="seconds per LLM request (default 600)")
+    p_fix.add_argument("--prices", help="TOML file overriding model prices ($APIFIX_PRICES)")
+    cost = p_fix.add_mutually_exclusive_group()
+    cost.add_argument(
         "--max-cost", type=float, default=5.0, help="US dollar limit for the job (default 5)"
+    )
+    cost.add_argument(
+        "--no-cost-limit",
+        action="store_true",
+        help="no dollar limit (e.g. an unpriced hosted endpoint); token limits still apply",
     )
     p_fix.add_argument("--max-retries", type=int, default=3)
     p_fix.add_argument("--out", help="output directory (default: ./apifix-out/<timestamp>)")
@@ -79,9 +102,22 @@ def _fix(args: argparse.Namespace) -> int:
     if not Path(args.path).is_dir():
         print(f"apifix: not a directory: {args.path}", file=sys.stderr)
         return EXIT_USAGE
+    options = {
+        key: value
+        for key, value in (
+            ("base_url", args.base_url),
+            ("api_key_env", args.api_key_env),
+            ("timeout_s", args.timeout),
+        )
+        if value is not None
+    }
     try:
-        llm = get_llm(args.provider, args.model, prices=args.prices)
-        config = AgentConfig(max_cost_usd=args.max_cost, max_retries=args.max_retries)
+        llm = get_llm(args.provider, args.model, prices=args.prices, **options)
+        notice = getattr(llm, "privacy_notice", None)
+        if notice:
+            print(notice, file=sys.stderr)
+        max_cost = None if args.no_cost_limit else args.max_cost
+        config = AgentConfig(max_cost_usd=max_cost, max_retries=args.max_retries)
         result = fix(args.path, args.migration, llm=llm, sandbox=Sandbox(), config=config)
     except (LLMError, ValueError) as exc:
         print(f"apifix: {exc}", file=sys.stderr)

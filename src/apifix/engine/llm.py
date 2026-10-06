@@ -39,6 +39,9 @@ class ToolCall:
     id: str
     name: str
     input: dict[str, Any]
+    # Set when the provider could not decode the arguments (e.g. invalid JSON); the agent sends
+    # it back to the model as a tool error instead of running the tool.
+    input_error: str = ""
 
 
 @dataclass(frozen=True)
@@ -115,6 +118,11 @@ class LLMClient(Protocol):
     def cost(self, usage: Usage, model: str | None = None) -> float | None:
         """US dollars for `usage` on `model` (default: the configured one); None if unknown."""
         ...
+
+
+# Optional provider methods, looked up with getattr by the agent:
+#   preflight() -> None        cheap check before the job starts (raise LLMError to stop it)
+#   endpoint: str | None       where requests go (recorded in the trajectory; no credentials)
 
 
 # --- model table ------------------------------------------------------------------------------
@@ -201,9 +209,9 @@ def load_model_table(
 
 # --- registry -------------------------------------------------------------------------------
 
-PROVIDERS = ("anthropic",)
+PROVIDERS = ("anthropic", "openai-compat")
 DEFAULT_PROVIDER = "anthropic"
-DEFAULT_MODELS = {"anthropic": "claude-opus-5-5"}
+DEFAULT_MODELS = {"anthropic": "claude-opus-5-5"}  # openai-compat: --model is required
 
 
 def get_llm(
@@ -214,11 +222,18 @@ def get_llm(
     **options: Any,
 ) -> LLMClient:
     """Build the configured provider. Defaults: $APIFIX_PROVIDER / $APIFIX_MODEL, then
-    anthropic / claude-opus-5-5."""
+    anthropic / claude-opus-5-5. openai-compat takes base_url, api_key_env and timeout_s."""
     provider = provider or os.environ.get("APIFIX_PROVIDER") or DEFAULT_PROVIDER
     if provider not in PROVIDERS:
         raise ValueError(f"unknown provider {provider!r} (available: {', '.join(PROVIDERS)})")
-    model = model or os.environ.get("APIFIX_MODEL") or DEFAULT_MODELS[provider]
+    model = model or os.environ.get("APIFIX_MODEL") or DEFAULT_MODELS.get(provider)
+    if provider == "openai-compat":
+        from apifix.engine.llm_openai_compat import OpenAICompatLLM
+
+        return OpenAICompatLLM(model, models=load_model_table({}, prices), **options)
+    unsupported = set(options) & {"base_url", "api_key_env"}
+    if unsupported:
+        raise ValueError(f"{', '.join(sorted(unsupported))} only apply to --provider openai-compat")
     from apifix.engine.llm_anthropic import AnthropicLLM
 
     return AnthropicLLM(model, models=load_model_table(ANTHROPIC_MODELS, prices), **options)

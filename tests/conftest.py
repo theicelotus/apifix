@@ -18,20 +18,25 @@ collect_ignore = ["fixtures"]
 OPT_IN = {
     "docker": "also run tests marked `docker` (real Docker daemon + network; slow)",
     "llm": "also run tests marked `llm` (real LLM API calls; cost money, need an API key)",
+    "local_llm": "also run tests marked `local_llm` (a local Ollama; slow, needs a model)",
 }
 
 
 def pytest_addoption(parser):
     for marker, help in OPT_IN.items():
-        parser.addoption(f"--{marker}", action="store_true", help=help)
+        parser.addoption(f"--{marker.replace('_', '-')}", action="store_true", help=help)
 
 
 def pytest_collection_modifyitems(config, items):
     markexpr = config.getoption("markexpr") or ""
+    words = set(markexpr.replace("(", " ").replace(")", " ").split())
+    negated = {w for w in words if w != "not"} & {
+        m for m in OPT_IN if f"not {m}" in " ".join(markexpr.split())
+    }
     keep = {
         m
         for m in OPT_IN
-        if config.getoption(f"--{m}") or (m in markexpr and f"not {m}" not in markexpr)
+        if config.getoption(f"--{m.replace('_', '-')}") or (m in words and m not in negated)
     }
     deselected = [
         item for item in items if any(item.get_closest_marker(m) for m in set(OPT_IN) - keep)

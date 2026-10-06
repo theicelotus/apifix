@@ -367,8 +367,14 @@ class _Job:
         if not self.price_known and self.config.max_cost_usd is not None:
             raise ValueError(
                 f"no price for model {self.llm.model}: add it to the price table "
-                "(APIFIX_PRICES / --prices) or run without a cost limit"
+                "(--prices / $APIFIX_PRICES; 0 for a free tier) or pass --no-cost-limit"
             )
+        preflight = getattr(self.llm, "preflight", None)
+        if callable(preflight):
+            try:
+                preflight()
+            except LLMError as exc:
+                return "aborted", f"preflight: {exc}"
         self.baseline = self.sandbox.run(self.repo)
         if self.baseline.status == "error" and self.baseline.reason.startswith("docker not usable"):
             return "aborted", f"sandbox unavailable before any LLM call: {self.baseline.reason}"
@@ -442,6 +448,7 @@ class _Job:
                 "migration": self.migration.name,
                 "provider": self.llm.provider,
                 "model": self.llm.model,
+                "endpoint": getattr(self.llm, "endpoint", None),
                 "config": dataclasses.asdict(self.config),
                 "notes": list(self.llm.notes),
                 "started_at": self.started.isoformat(),

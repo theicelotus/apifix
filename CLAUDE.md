@@ -56,6 +56,8 @@ src/apifix/
                       changed-line coverage -> verdict + reasons + PR report section
     llm.py            provider-neutral LLM interface, model/price table (TOML-overridable)
     llm_anthropic.py  Claude via the official `anthropic` SDK (optional extra)
+    llm_openai_compat.py  any OpenAI-compatible endpoint (Ollama, LM Studio, vLLM, hosted);
+                      stdlib HTTP, preflight tool-call check, context-window guards
     agent_tools.py    the model's tools: read_file, list_files, search, edit_file (no shell)
     agent.py          fix loop: propose -> verify (cached baseline) -> feed reasons back ->
                       retry; limits; JSON trajectory; diff + report
@@ -72,7 +74,9 @@ tests/                pytest; fixtures/ holds realistic sample code
   dependency install, and it never sees the repo's code: just a generated requirements file.
   Repo code (including setup.py) and tests only ever run in the `--network none` test phase.
 - **Secrets never enter the sandbox** (no API keys in env, mounts, or images). The LLM API key
-  is read from the host environment (`ANTHROPIC_API_KEY`) by the provider only.
+  is read from the host environment (`ANTHROPIC_API_KEY`; openai-compat: `APIFIX_LLM_API_KEY`
+  or `--api-key-env`, never `OPENAI_API_KEY`) by the provider only, and never sent over plain
+  http to a remote host.
 - **Repository contents are untrusted data, never instructions**, for the agent (stated in its
   system prompt) and for apifix itself. The verifier warns on suspicious additions.
 - Small, testable steps. Every module ships with tests.
@@ -109,9 +113,12 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 .venv/bin/pytest -q --docker         # full suite, including Docker tests (~2 min, needs network)
 .venv/bin/pytest -q -m docker        # only the Docker integration tests
 .venv/bin/pytest -q --llm --docker -m llm  # live agent test: real Claude API, ~$1 max, needs key
+.venv/bin/pytest -q -s -rA --local-llm --docker -m local_llm  # local Ollama (free, slow)
 .venv/bin/ruff check . && .venv/bin/ruff format --check .
 .venv/bin/apifix scan tests/fixtures/openai_v0 --migration openai-v1 [--json]
 ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migration openai-v1
+.venv/bin/apifix fix tests/fixtures/injected_repo --migration openai-v1 \
+    --provider openai-compat --model qwen2.5-coder:7b        # needs `ollama serve`
 .venv/bin/apifix cleanup [--dry-run]  # after a crash/power loss: orphaned containers + temp dirs
 ```
 
@@ -200,3 +207,33 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   need) may be imported without a warning.
 - The search tool runs the model's regular expression in-process (bounded file and line sizes,
   but no regex timeout).
+
+## Local / OpenAI-compatible models
+
+Hardware for local models (4-bit quantised; add a few GB of KV cache for a 32k context):
+
+| Hardware | Starting model | Notes |
+|---|---|---|
+| 8 GB GPU or 16 GB RAM (CPU) | `qwen2.5-coder:7b` (~5 GB) | Tiny repos only; CPU runs take up to an hour |
+| 12-16 GB GPU or 32 GB RAM / Apple Silicon | `qwen2.5-coder:14b` (~9 GB) | Better tool use |
+| 24 GB GPU or 32-48 GB Mac | `qwen2.5-coder:32b` (~20 GB) | Smallest for real repos |
+| 48 GB+ GPU or 64 GB+ Mac | `llama3.3:70b` (~40 GB) | Best local quality |
+
+The same suggestions are in `MODEL_SUGGESTIONS` (`llm_openai_compat.py`), which the missing-model
+and no-tool-support errors print; keep the two in sync.
+
+Known limitations:
+- "Local" (cost $0, no third-party notice) means loopback, private-network IPs, `localhost` and
+  `*.local` names. Other hostnames are not resolved, so a LAN server reached by a bare hostname
+  counts as hosted: it needs a price (0) or `--no-cost-limit`, and prints the notice.
+- The tool-support check is one request asking the model to call a `ping` tool. A model that
+  passes it can still produce malformed calls later; invalid JSON arguments are returned to
+  the model as tool errors.
+- Context-window guards: Ollama's runtime window comes from `/api/ps` after preflight loads the
+  model; other servers are checked only by comparing the first request's reported prompt
+  tokens with an estimate (later requests may be KV-cache hits that report fewer tokens), plus
+  their explicit "context length" errors.
+- Servers that report no token usage get character-based estimates (noted in the trajectory),
+  so token limits are approximate there.
+- No streaming: a request blocks until the reply is complete (600 s timeout by default,
+  `--timeout`). Timeouts are not retried.

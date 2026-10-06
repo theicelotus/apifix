@@ -26,6 +26,7 @@ addopts = "-ra"
 markers = [
     "docker: needs a Docker daemon and network; opt-in with --docker (skipped if unusable)",
     "llm: calls a real LLM API (costs money; needs ANTHROPIC_API_KEY); opt-in with --llm",
+    "local_llm: needs a reachable local Ollama with a tool-capable model; opt-in with --local-llm",
 ]
 
 [tool.ruff]

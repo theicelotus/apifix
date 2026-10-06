@@ -266,6 +266,10 @@ class Workspace:
         edit: EditRecord | None = None
         recorded = len(self.edits)
         try:
+            if call.input_error:
+                raise ToolError(
+                    f"{call.input_error}; call {call.name} again with valid JSON arguments"
+                )
             args = _arguments(call)
             if call.name == "read_file":
                 content = self.read_file(**args)

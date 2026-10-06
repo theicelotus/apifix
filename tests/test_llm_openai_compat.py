@@ -1,0 +1,571 @@
+"""OpenAI-compatible provider with fake HTTP (scripted transport, and one real local server)."""
+
+from __future__ import annotations
+
+import http.server
+import json
+import threading
+from dataclasses import dataclass, field
+
+import pytest
+
+from apifix.engine.llm import LLMError, Message, ModelInfo, ToolCall, ToolResult, ToolSpec, Usage
+from apifix.engine.llm_openai_compat import (
+    MAX_RESPONSE_BYTES,
+    ConnectFailed,
+    HTTPResponse,
+    OpenAICompatLLM,
+    is_local_host,
+    to_openai,
+    urllib_transport,
+)
+
+TOOLS = [ToolSpec("read_file", "Read a file.", {"type": "object", "properties": {}})]
+
+
+def reply(content=None, tool_calls=None, finish="stop", usage=True, model="qwen2.5-coder:7b"):
+    message = {"role": "assistant", "content": content}
+    if tool_calls is not None:
+        message["tool_calls"] = tool_calls
+    body = {"model": model, "choices": [{"index": 0, "message": message, "finish_reason": finish}]}
+    if usage:
+        body["usage"] = {"prompt_tokens": 120, "completion_tokens": 30}
+    return HTTPResponse(200, json.dumps(body).encode())
+
+
+def tool_call(name="read_file", arguments='{"path": "app.py"}', call_id="call_1"):
+    call = {"type": "function", "function": {"name": name, "arguments": arguments}}
+    if call_id is not None:
+        call["id"] = call_id
+    return call
+
+
+def error(status, message):
+    return HTTPResponse(status, json.dumps({"error": {"message": message}}).encode())
+
+
+@dataclass
+class FakeHTTP:
+    responses: list = field(default_factory=list)
+    requests: list = field(default_factory=list)
+
+    def __call__(self, req):
+        self.requests.append(req)
+        r = self.responses.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    def body(self, i=-1):
+        return json.loads(self.requests[i].body)
+
+
+def make(*responses, model="qwen2.5-coder:7b", **kw):
+    http = FakeHTTP(list(responses))
+    llm = OpenAICompatLLM(model, transport=http, sleep=lambda s: None, **kw)
+    return llm, http
+
+
+def complete(llm, messages=None, temperature=0.0):
+    return llm.complete(
+        system="be careful",
+        messages=messages or [Message("user", text="hi")],
+        tools=TOOLS,
+        max_tokens=1000,
+        temperature=temperature,
+    )
+
+
+# --- requests and responses -------------------------------------------------------------------
+
+
+def test_request_shape(monkeypatch):
+    monkeypatch.delenv("APIFIX_BASE_URL", raising=False)
+    monkeypatch.delenv("APIFIX_LLM_API_KEY", raising=False)
+    llm, http = make(reply("done"))
+    complete(llm)
+    (req,) = http.requests
+    assert (req.method, req.url) == ("POST", "http://localhost:11434/v1/chat/completions")
+    assert "Authorization" not in req.headers
+    assert req.timeout_s == 600.0
+    body = http.body()
+    assert body["model"] == "qwen2.5-coder:7b"
+    assert body["messages"] == [
+        {"role": "system", "content": "be careful"},
+        {"role": "user", "content": "hi"},
+    ]
+    assert body["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    assert (body["tool_choice"], body["temperature"], body["max_tokens"], body["stream"]) == (
+        "auto",
+        0.0,
+        1000,
+        False,
+    )
+
+
+def test_conversation_conversion():
+    messages = [
+        Message("user", text="task"),
+        Message("assistant", text="", tool_calls=[ToolCall("c1", "read_file", {"path": "a"})]),
+        Message("user", tool_results=[ToolResult("c1", "x = 1"), ToolResult("c2", "Error", True)]),
+        Message("assistant", text="Done."),
+        Message("user", text="feedback"),
+    ]
+    assert to_openai(messages) == [
+        {"role": "user", "content": "task"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path": "a"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "x = 1"},
+        {"role": "tool", "tool_call_id": "c2", "content": "Error"},
+        {"role": "assistant", "content": "Done."},
+        {"role": "user", "content": "feedback"},
+    ]
+
+
+def test_tool_call_response():
+    llm, _ = make(reply(None, [tool_call()], finish="tool_calls"))
+    r = complete(llm)
+    assert r.tool_calls == [ToolCall("call_1", "read_file", {"path": "app.py"})]
+    assert (r.stop_reason, r.text, r.model) == ("tool_use", "", "qwen2.5-coder:7b")
+    assert r.usage == Usage(input_tokens=120, output_tokens=30)
+    assert r.provider_blocks[0]["tool_calls"][0]["function"]["name"] == "read_file"
+
+
+@pytest.mark.parametrize(
+    ("finish", "calls", "stop"),
+    [
+        ("stop", None, "end_turn"),
+        ("length", None, "max_tokens"),
+        ("content_filter", None, "refusal"),
+        ("stop", [tool_call()], "tool_use"),  # some servers say "stop" with tool calls
+        ("tool_calls", [], "end_turn"),
+        ("weird", None, "other"),
+    ],
+)
+def test_finish_reasons(finish, calls, stop):
+    llm, _ = make(reply("x", calls, finish=finish))
+    assert complete(llm).stop_reason == stop
+
+
+def test_server_quirks():
+    calls = [
+        tool_call(call_id=None),  # missing id
+        tool_call(arguments={"path": "b"}),  # object instead of a JSON string
+        tool_call(arguments="{not json"),
+        tool_call(arguments='["a"]'),
+        tool_call(arguments=""),
+    ]
+    llm, _ = make(reply(None, calls, finish="tool_calls"))
+    got = complete(llm).tool_calls
+    assert got[0].id.startswith("call_") and got[0].input == {"path": "app.py"}
+    assert got[1].input == {"path": "b"}
+    assert "not valid JSON" in got[2].input_error and got[2].input == {}
+    assert got[3].input_error == "the arguments must be a JSON object"
+    assert got[4].input == {} and not got[4].input_error
+
+
+def test_content_parts_and_cached_tokens():
+    body = {
+        "model": "m",
+        "choices": [
+            {
+                "message": {
+                    "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "prompt_tokens_details": {"cached_tokens": 60},
+        },
+    }
+    llm, _ = make(HTTPResponse(200, json.dumps(body).encode()), model="m")
+    r = complete(llm)
+    assert r.text == "ab"
+    assert r.usage == Usage(input_tokens=40, output_tokens=5, cache_read_tokens=60)
+
+
+def test_missing_usage_is_estimated_and_noted():
+    llm, _ = make(reply("hello", usage=False))
+    r = complete(llm)
+    assert r.usage.input_tokens > 0 and r.usage.output_tokens == 1
+    assert "reported no token usage" in llm.notes[0]
+
+
+def test_reasoning_is_kept_in_the_trajectory_but_not_replayed():
+    body = json.loads(reply("Answer.").body)
+    body["choices"][0]["message"]["reasoning_content"] = "thinking..."
+    llm, _ = make(HTTPResponse(200, json.dumps(body).encode()))
+    r = complete(llm)
+    assert r.provider_blocks[0]["reasoning_content"] == "thinking..."
+    turn = Message(
+        "assistant", text=r.text, provider="openai-compat", provider_blocks=r.provider_blocks
+    )
+    assert to_openai([turn]) == [{"role": "assistant", "content": "Answer."}]
+
+
+# --- errors and retries -----------------------------------------------------------------------
+
+
+def test_model_without_tool_support():
+    llm, _ = make(error(400, "registry.ollama.ai/library/gemma:2b does not support tools"))
+    with pytest.raises(LLMError, match="does not support tool calls.*qwen2.5-coder:7b"):
+        complete(llm)
+
+
+def test_unknown_model_lists_the_servers_models():
+    models = HTTPResponse(
+        200, json.dumps({"data": [{"id": "llama3.1:8b"}, {"id": "qwen2.5-coder:14b"}]}).encode()
+    )
+    llm, http = make(
+        error(404, 'model "nope" not found, try pulling it first'), models, model="nope"
+    )
+    with pytest.raises(LLMError) as exc:
+        complete(llm)
+    assert "model 'nope' not found" in str(exc.value)
+    assert "Models on http://localhost:11434/v1: llama3.1:8b, qwen2.5-coder:14b" in str(exc.value)
+    assert "Starting points by hardware" in str(exc.value)
+    assert http.requests[1].url == "http://localhost:11434/v1/models"
+
+
+def test_context_overflow_error():
+    llm, _ = make(error(400, "This model's maximum context length is 8192 tokens"))
+    with pytest.raises(LLMError, match="exceeds the server's context window"):
+        complete(llm)
+
+
+def test_connection_refused_hints_at_ollama():
+    llm, http = make(ConnectFailed("[Errno 111] Connection refused"))
+    with pytest.raises(
+        LLMError, match=r"no server at http://localhost:11434/v1 \(is Ollama running"
+    ):
+        complete(llm)
+    assert len(http.requests) == 1  # refused: no retries
+
+
+def test_transient_errors_are_retried():
+    llm, http = make(error(503, "loading model"), ConnectFailed("reset by peer"), reply("ok"))
+    assert complete(llm).text == "ok"
+    assert len(http.requests) == 3
+
+
+def test_retries_are_bounded():
+    llm, http = make(error(503, "busy"), error(503, "busy"), error(503, "still busy"))
+    with pytest.raises(LLMError, match="HTTP 503 .*still busy"):
+        complete(llm)
+    assert len(http.requests) == 3
+
+
+def test_auth_errors_mention_the_key():
+    llm, _ = make(
+        error(401, "invalid key"),
+        base_url="https://api.example.com/v1",
+        models={"qwen2.5-coder:7b": ModelInfo(0, 0, 0, 0)},
+    )
+    with pytest.raises(LLMError, match="HTTP 401 .*check the API key"):
+        complete(llm)
+
+
+def test_garbage_response():
+    llm, _ = make(HTTPResponse(200, b"<html>proxy error</html>"))
+    with pytest.raises(LLMError, match="no choices"):
+        complete(llm)
+
+
+# --- preflight ----------------------------------------------------------------------------------
+
+
+def test_preflight_passes_and_reads_the_ollama_context_window():
+    ps = HTTPResponse(
+        200,
+        json.dumps({"models": [{"name": "qwen2.5-coder:7b", "context_length": 32768}]}).encode(),
+    )
+    llm, http = make(reply(None, [tool_call("ping", '{"ok": true}')], finish="tool_calls"), ps)
+    llm.preflight()
+    assert llm.context_window == 32768
+    assert http.requests[1].url == "http://localhost:11434/api/ps"
+    assert json.loads(http.requests[0].body)["tools"][0]["function"]["name"] == "ping"
+    assert "server context window: 32,768 tokens" in llm.notes
+
+
+def test_preflight_without_ps_endpoint_is_fine():
+    llm, _ = make(
+        reply(None, [tool_call("ping", "{}")], finish="tool_calls"),
+        error(404, "not found"),
+        base_url="http://localhost:1234/v1",
+    )
+    llm.preflight()
+    assert llm.context_window is None
+
+
+def test_preflight_fails_when_no_tool_call_is_made():
+    llm, _ = make(reply("Sure! The weather is nice."))
+    with pytest.raises(
+        LLMError, match="did not make a tool call when asked to. Use a tool-capable"
+    ):
+        llm.preflight()
+
+
+def test_preflight_explains_tool_calls_written_as_text():
+    llm, _ = make(reply('{"name": "ping", "arguments": {"ok": true}}'))
+    with pytest.raises(LLMError, match="wrote the call as text instead"):
+        llm.preflight()
+
+
+def test_small_context_window_fails_before_sending():
+    llm, http = make()
+    llm.context_window = 2048
+    long = [Message("user", text="x" * 20_000)]
+    with pytest.raises(
+        LLMError,
+        match=r"no longer fits the server's context window \(2,048 tokens\).*OLLAMA_CONTEXT_LENGTH",
+    ):
+        complete(llm, long)
+    assert http.requests == []
+
+
+def test_truncated_first_prompt_is_detected():
+    body = json.loads(reply("ok").body)
+    body["usage"]["prompt_tokens"] = 2048
+    llm, _ = make(HTTPResponse(200, json.dumps(body).encode()), reply("ok"))
+    with pytest.raises(LLMError, match="read only 2,048 of ~.* prompt tokens"):
+        complete(llm, [Message("user", text="word " * 8000)])
+
+
+def test_later_cached_prompts_are_not_mistaken_for_truncation():
+    small = json.loads(reply("ok").body)
+    small["usage"]["prompt_tokens"] = 50  # KV cache: only new tokens evaluated
+    llm, _ = make(reply("ok"), HTTPResponse(200, json.dumps(small).encode()))
+    complete(llm)
+    assert complete(llm, [Message("user", text="word " * 8000)]).text == "ok"
+
+
+# --- cost, keys, privacy ------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("host", "local"),
+    [
+        ("localhost", True),
+        ("127.0.0.1", True),
+        ("[::1]", True),
+        ("192.168.1.20", True),
+        ("10.0.0.5", True),
+        ("172.16.3.4", True),
+        ("gpu-box.local", True),
+        ("api.example.com", False),
+        ("8.8.8.8", False),
+        ("my-server", False),  # no DNS lookups
+    ],
+)
+def test_local_hosts(host, local):
+    assert is_local_host(host) is local
+
+
+def test_local_endpoints_are_free():
+    llm, _ = make()
+    assert llm.local and llm.cost(Usage(10**9, 10**9)) == 0.0
+    assert llm.privacy_notice is None
+    assert not any("third-party" in n for n in llm.notes)
+
+
+def test_hosted_endpoints_need_a_price_and_get_a_notice():
+    url = "https://api.example.com/openai/v1"
+    llm, _ = make(base_url=url)
+    assert llm.cost(Usage(1, 1)) is None
+    assert llm.privacy_notice == (
+        "notice: repository code will be sent to the third-party server "
+        "https://api.example.com/openai/v1"
+    )
+    assert "repository code is sent to the third-party server" in llm.notes[0]
+    priced, _ = make(base_url=url, models={"qwen2.5-coder:7b": ModelInfo(1.0, 2.0, 0, 0)})
+    assert priced.cost(Usage(1_000_000, 1_000_000)) == pytest.approx(3.0)
+
+
+def test_api_key_from_env(monkeypatch):
+    monkeypatch.setenv("APIFIX_LLM_API_KEY", "sk-local-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-must-not-be-used")
+    llm, http = make(
+        reply("ok"),
+        base_url="https://api.example.com/v1",
+        models={"qwen2.5-coder:7b": ModelInfo(0, 0, 0, 0)},
+    )
+    complete(llm)
+    assert http.requests[0].headers["Authorization"] == "Bearer sk-local-secret"
+    monkeypatch.setenv("MY_KEY", "sk-other")
+    llm, http = make(reply("ok"), api_key_env="MY_KEY")
+    complete(llm)
+    assert http.requests[0].headers["Authorization"] == "Bearer sk-other"
+
+
+def test_openai_api_key_is_never_read(monkeypatch):
+    monkeypatch.delenv("APIFIX_LLM_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-must-not-be-used")
+    llm, http = make(reply("ok"))
+    complete(llm)
+    assert "Authorization" not in http.requests[0].headers
+
+
+def test_key_is_never_sent_over_remote_http(monkeypatch):
+    monkeypatch.setenv("APIFIX_LLM_API_KEY", "sk-secret")
+    with pytest.raises(LLMError, match="over plain http to api.example.com") as exc:
+        make(base_url="http://api.example.com/v1")
+    assert "sk-secret" not in str(exc.value)
+    make(base_url="http://192.168.1.5:8000/v1")  # local http is fine
+
+
+def test_key_never_appears_in_errors_or_notes(monkeypatch):
+    monkeypatch.setenv("APIFIX_LLM_API_KEY", "sk-secret-123")
+    llm, _ = make(error(401, "bad"), base_url="https://api.example.com/v1")
+    with pytest.raises(LLMError) as exc:
+        complete(llm)
+    assert "sk-secret-123" not in str(exc.value) + json.dumps(llm.notes) + llm.endpoint
+
+
+@pytest.mark.parametrize(
+    ("url", "message"),
+    [
+        ("ftp://x/v1", "invalid base URL"),
+        ("localhost:11434", "invalid base URL"),
+        ("https://user:pw@api.example.com/v1", "not in the base URL"),
+    ],
+)
+def test_bad_base_urls(url, message):
+    with pytest.raises(LLMError, match=message):
+        make(base_url=url)
+
+
+def test_model_is_required_and_suggestions_are_given():
+    models = HTTPResponse(200, json.dumps({"data": [{"id": "qwen2.5-coder:7b"}]}).encode())
+    with pytest.raises(LLMError) as exc:
+        make(models, model=None)
+    text = str(exc.value)
+    assert text.startswith("--model is required for --provider openai-compat.")
+    assert "Models on http://localhost:11434/v1: qwen2.5-coder:7b." in text
+    assert "24 GB GPU or 32-48 GB Mac: qwen2.5-coder:32b" in text
+
+
+def test_base_url_from_env(monkeypatch):
+    monkeypatch.setenv("APIFIX_BASE_URL", "http://localhost:1234/v1/")
+    llm, http = make(reply("ok"))
+    complete(llm)
+    assert http.requests[0].url == "http://localhost:1234/v1/chat/completions"
+
+
+# --- the real urllib path, against a local HTTP server ------------------------------------------
+
+
+class _Handler(http.server.BaseHTTPRequestHandler):
+    seen: list = []
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        _Handler.seen.append((self.path, self.headers.get("Authorization"), json.loads(body)))
+        if self.path == "/v1/redirect/chat/completions":
+            self.send_response(302)
+            self.send_header("Location", "http://example.com/steal")
+            self.end_headers()
+            return
+        data = reply(None, [tool_call()], finish="tool_calls").body
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+@pytest.fixture
+def server():
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    _Handler.seen = []
+    yield f"http://127.0.0.1:{srv.server_address[1]}"
+    srv.shutdown()
+
+
+def test_real_http_round_trip(server, monkeypatch):
+    monkeypatch.setenv("APIFIX_LLM_API_KEY", "sk-local")
+    llm = OpenAICompatLLM("m", base_url=f"{server}/v1")
+    r = complete(llm)
+    assert r.tool_calls[0].input == {"path": "app.py"}
+    (path, auth, body) = _Handler.seen[0]
+    assert (path, auth, body["model"]) == ("/v1/chat/completions", "Bearer sk-local", "m")
+
+
+def test_redirects_are_not_followed(server):
+    llm = OpenAICompatLLM("m", base_url=f"{server}/v1/redirect")
+    with pytest.raises(LLMError, match="HTTP 302"):
+        complete(llm)
+    assert len(_Handler.seen) == 1
+
+
+def test_real_connection_refused():
+    import socket
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    llm = OpenAICompatLLM("m", base_url=f"http://127.0.0.1:{port}/v1")
+    with pytest.raises(LLMError, match="no server at .*is Ollama running"):
+        complete(llm)
+
+
+def test_oversized_responses_are_refused(monkeypatch):
+    class Big:
+        status = 200
+
+        def read(self, n):
+            return b"x" * n
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return None
+
+    monkeypatch.setattr(
+        "apifix.engine.llm_openai_compat._OPENER", type("O", (), {"open": lambda *a, **k: Big()})()
+    )
+    from apifix.engine.llm_openai_compat import HTTPRequest
+
+    with pytest.raises(LLMError, match=f"larger than {MAX_RESPONSE_BYTES:,} bytes"):
+        urllib_transport(HTTPRequest("GET", "http://localhost/v1/models", {}, None, 5))
+
+
+def test_docs_and_error_suggest_the_same_models():
+    import re
+    from pathlib import Path
+
+    from apifix.engine.llm_openai_compat import MODEL_SUGGESTIONS
+
+    root = Path(__file__).parent.parent
+    suggested = re.findall(r"(?:qwen2\.5-coder|llama3\.3):\d+b", MODEL_SUGGESTIONS)
+    assert len(suggested) == 4
+    for doc in ("README.md", "CLAUDE.md"):
+        text = (root / doc).read_text()
+        assert all(f"`{m}`" in text for m in suggested), doc

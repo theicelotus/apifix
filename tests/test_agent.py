@@ -549,3 +549,132 @@ def test_cli_fix_errors(tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     assert cli.main(["fix", str(tmp_path), "--migration", "openai-v1"]) == 2
     assert "ANTHROPIC_API_KEY is not set" in capsys.readouterr().err
+
+
+# --- openai-compat provider hooks ---------------------------------------------------------------
+
+
+def test_invalid_tool_arguments_go_back_to_the_model(repo):
+    bad = ToolCall("tu_bad", "edit_file", {}, input_error="the arguments were not valid JSON (x)")
+
+    def retry(messages):
+        (result,) = messages[-1].tool_results
+        assert result.is_error
+        assert "not valid JSON" in result.content and "again with valid JSON" in result.content
+        return tools(FIX_APP, FIX_REQS, FIX_TESTS)
+
+    result = go(repo, FakeLLM([tools(bad), retry, done()]))
+    assert result.outcome == "verified"
+
+
+def test_failed_preflight_aborts_before_the_sandbox(repo):
+    llm = FakeLLM([])
+
+    def preflight():
+        raise LLMError("model tiny does not support tool calls")
+
+    llm.preflight = preflight
+    sandbox = JudgingSandbox()
+    result = go(repo, llm, sandbox)
+    assert (result.outcome, result.reason) == (
+        "aborted",
+        "preflight: model tiny does not support tool calls",
+    )
+    assert sandbox.runs == [] and llm.requests == []
+
+
+def openai_compat_llm(*steps):
+    """A real OpenAICompatLLM on a scripted transport that replays agent steps as HTTP."""
+    from apifix.engine.llm_openai_compat import HTTPResponse, OpenAICompatLLM
+
+    def as_http(step: LLMResponse) -> HTTPResponse:
+        calls = [
+            {
+                "id": c.id,
+                "type": "function",
+                "function": {"name": c.name, "arguments": json.dumps(c.input)},
+            }
+            for c in step.tool_calls
+        ]
+        message = {"role": "assistant", "content": step.text or None}
+        if calls:
+            message["tool_calls"] = calls
+        body = {
+            "model": "qwen2.5-coder:7b",
+            "choices": [{"message": message, "finish_reason": "tool_calls" if calls else "stop"}],
+            "usage": {"prompt_tokens": 5000, "completion_tokens": 100},
+        }
+        return HTTPResponse(200, json.dumps(body).encode())
+
+    ping = tools(call("ping", ok=True))
+    queue = [as_http(s) for s in (ping, *steps)]
+    seen = []
+
+    def transport(req):
+        seen.append(req)
+        if req.url.endswith("/api/ps"):
+            return HTTPResponse(404, b"{}")
+        return queue.pop(0)
+
+    return OpenAICompatLLM("qwen2.5-coder:7b", transport=transport), seen
+
+
+def test_full_fix_through_the_openai_compat_provider(repo, monkeypatch):
+    from apifix.engine.sandbox import Sandbox
+    from tests.test_sandbox import FakeDocker, ok, pytest_run
+
+    canary = "sk-local-CANARY-42"
+    monkeypatch.setenv("APIFIX_LLM_API_KEY", canary)
+    llm, seen = openai_compat_llm(tools(FIX_APP, FIX_REQS, FIX_TESTS), done())
+    docker = FakeDocker(install=[ok() for _ in range(4)], test=pytest_run(passed=2))
+    result = go(repo, llm, Sandbox(docker=docker), max_cost_usd=0.01)
+    assert result.cost_usd == 0.0  # local endpoint
+    assert result.trajectory["job"]["endpoint"] == "http://localhost:11434/v1"
+    assert result.trajectory["job"]["provider"] == "openai-compat"
+    assert "+    r = client.chat.completions.create(" in result.diff
+    assert all(r.headers.get("Authorization") == f"Bearer {canary}" for r in seen)
+    for c in docker.calls:
+        assert canary not in " ".join(c.args)
+    assert canary not in json.dumps(result.trajectory)
+
+
+def test_cli_openai_compat_options(repo, tmp_path, monkeypatch, capsys):
+    seen = {}
+
+    def fake_get_llm(provider, model, *, prices=None, **options):
+        seen.update(provider=provider, model=model, options=options)
+        llm = FakeLLM([tools(FIX_APP, FIX_REQS, FIX_TESTS), done()], price=None)
+        llm.privacy_notice = "notice: repository code will be sent to the third-party server X"
+        return llm
+
+    monkeypatch.setattr("apifix.engine.llm.get_llm", fake_get_llm)
+    monkeypatch.setattr("apifix.engine.sandbox.Sandbox", lambda *a, **k: JudgingSandbox())
+    args = ["fix", str(repo), "--migration", "openai-v1", "--provider", "openai-compat"]
+    args += ["--model", "m", "--base-url", "https://x.example/v1", "--api-key-env", "K"]
+    args += ["--timeout", "30", "--no-cost-limit", "--out", str(tmp_path / "out")]
+    assert cli.main(args) == 0
+    assert seen == {
+        "provider": "openai-compat",
+        "model": "m",
+        "options": {"base_url": "https://x.example/v1", "api_key_env": "K", "timeout_s": 30.0},
+    }
+    err = capsys.readouterr().err
+    assert err == "notice: repository code will be sent to the third-party server X\n"
+
+
+def test_cli_unpriced_hosted_endpoint_is_refused(repo, tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("APIFIX_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("APIFIX_PRICES", raising=False)
+    args = ["fix", str(repo), "--migration", "openai-v1", "--provider", "openai-compat"]
+    args += ["--model", "m", "--base-url", "https://api.example.com/v1"]
+    assert cli.main(args) == 2
+    err = capsys.readouterr().err
+    assert "notice: repository code will be sent to the third-party server" in err
+    assert "no price for model m" in err and "--no-cost-limit" in err
+
+
+def test_base_url_is_rejected_for_anthropic(repo, monkeypatch, capsys):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    args = ["fix", str(repo), "--migration", "openai-v1", "--base-url", "http://localhost:1/v1"]
+    assert cli.main(args) == 2
+    assert "only apply to --provider openai-compat" in capsys.readouterr().err
