@@ -16,11 +16,18 @@ from pathlib import Path
 import pytest
 
 from apifix import cli
-from apifix.engine.agent import AgentConfig, fix, system_prompt
+from apifix.engine.agent import (
+    NO_CALL_NUDGE,
+    AgentConfig,
+    fix,
+    system_prompt,
+    tool_call_example,
+)
 from apifix.engine.llm import LLMError, LLMResponse, Message, ModelInfo, ToolCall, Usage
 from apifix.engine.llm_openai_compat import TEXT_CALLS_NOTE
 from apifix.engine.migrations import get_migration
 from apifix.engine.sandbox import SandboxResult
+from apifix.engine.scanner import scan
 from apifix.engine.test_results import FileCoverage
 from tests.test_verifier import (
     APP_NEW,
@@ -584,9 +591,10 @@ def test_failed_preflight_aborts_before_the_sandbox(repo):
     assert sandbox.runs == [] and llm.requests == []
 
 
-def openai_compat_llm(*steps, **options):
+def openai_compat_llm(*steps, ping_as_text=False, **options):
     """A real OpenAICompatLLM on a scripted transport that replays agent steps as HTTP. A str
-    step is a reply whose text is exactly that string."""
+    step is a reply whose text is exactly that string. `ping_as_text`: the model answers the
+    preflight ping with a call written as text (a text-format model)."""
     from apifix.engine.llm_openai_compat import HTTPResponse, OpenAICompatLLM
 
     def as_http(step: LLMResponse | str) -> HTTPResponse:
@@ -610,7 +618,8 @@ def openai_compat_llm(*steps, **options):
         }
         return HTTPResponse(200, json.dumps(body).encode())
 
-    ping = tools(call("ping", ok=True))
+    text_ping = '{"name": "ping", "arguments": {"ok": true}}'
+    ping = text_ping if ping_as_text else tools(call("ping", ok=True))
     queue = [as_http(s) for s in (ping, *steps)]
     seen = []
 
@@ -809,3 +818,121 @@ def test_strict_tool_calls_is_rejected_for_anthropic(repo, monkeypatch, capsys):
     args = ["fix", str(repo), "--migration", "openai-v1", "--strict-tool-calls"]
     assert cli.main(args) == 2
     assert "strict_tool_calls only apply to --provider openai-compat" in capsys.readouterr().err
+
+
+# --- text-format models: tool-call example and no-call nudge ----------------------------------
+
+EXAMPLE = "Tool calls: reply with exactly one JSON object and nothing else, for example:\n"
+ASKS_FOR_FILES = "Please provide the contents of app.py so I can help."
+
+
+def sent_system(seen) -> str:
+    return sent_messages(seen)[0]["content"]
+
+
+def test_tool_call_example_uses_a_repo_file(repo):
+    findings = scan(repo, "openai-v1").findings
+    first = {"name": "read_file", "arguments": {"path": findings[0].file}}
+    assert tool_call_example(findings) == "\n\n" + EXAMPLE + json.dumps(first)
+    assert (repo / findings[0].file).is_file()
+
+
+def test_text_format_model_gets_the_example_and_no_call_nudges(repo):
+    llm, seen = openai_compat_llm(
+        done(ASKS_FOR_FILES),
+        as_text(call("read_file", path="app.py")),
+        done("I cannot see the files."),
+        as_text(FIX_APP),
+        as_text(FIX_REQS),
+        as_text(FIX_TESTS),
+        done(),  # after an accepted edit: ends the turn, no nudge
+        ping_as_text=True,
+    )
+    result = go(repo, llm)
+    assert result.outcome == "verified"
+    system = sent_system(seen)
+    assert system.endswith(EXAMPLE + '{"name": "read_file", "arguments": {"path": "app.py"}}')
+    assert result.trajectory["system_prompt"] == system
+    assert result.trajectory["job"]["tool_call_example"] is True
+    (attempt,) = result.trajectory["attempts"]
+    assert attempt["nudges"] == [
+        {"kind": "no_tool_call", "response": 0, "message": NO_CALL_NUDGE},
+        {"kind": "no_tool_call", "response": 2, "message": NO_CALL_NUDGE},
+    ]
+    messages = sent_messages(seen)
+    nudged = [i for i, m in enumerate(messages) if m == {"role": "user", "content": NO_CALL_NUDGE}]
+    assert [messages[i - 1]["content"] for i in nudged] == [
+        ASKS_FOR_FILES,
+        "I cannot see the files.",
+    ]
+    assert (
+        "- Replies without a tool call before any edit (asked to call a tool): 2"
+        in result.report_markdown
+    )
+    assert "several tool calls" not in result.report_markdown
+
+
+def test_no_call_nudges_are_capped_per_attempt(repo):
+    llm, seen = openai_compat_llm(*[done(ASKS_FOR_FILES)] * 4, ping_as_text=True)
+    result = go(repo, llm, max_retries=0)
+    (attempt,) = result.trajectory["attempts"]
+    assert [n["kind"] for n in attempt["nudges"]] == ["no_tool_call"] * 3
+    assert attempt["result"] == "no_changes"
+    assert len([r for r in seen if r.url.endswith("/chat/completions")]) == 5  # ping + 4
+
+
+def test_nudge_kinds_have_separate_caps(repo):
+    two = f"{as_text(FIX_APP)}\n{as_text(FIX_REQS)}"
+    llm, _ = openai_compat_llm(
+        two, done(ASKS_FOR_FILES), two, done(ASKS_FOR_FILES), done(), ping_as_text=True
+    )
+    result = go(repo, llm, max_retries=0, max_one_call_nudges=1, max_no_call_nudges=1)
+    (attempt,) = result.trajectory["attempts"]
+    # the second multi-call reply is past its cap: plain text, which the no-call cap also covers
+    assert [n["kind"] for n in attempt["nudges"]] == ["multiple_text_tool_calls", "no_tool_call"]
+    assert attempt["result"] == "no_changes"
+
+
+def test_structured_call_models_get_neither(repo):
+    llm, seen = openai_compat_llm(done(ASKS_FOR_FILES))
+    result = go(repo, llm, max_retries=0)
+    assert EXAMPLE not in sent_system(seen)
+    assert result.trajectory["job"]["tool_call_example"] is False
+    (attempt,) = result.trajectory["attempts"]
+    assert attempt["nudges"] == [] and attempt["result"] == "no_changes"
+
+
+def test_strict_mode_gets_neither(repo):
+    llm, seen = openai_compat_llm(
+        as_text(call("read_file", path="app.py")), done(ASKS_FOR_FILES), strict_tool_calls=True
+    )
+    result = go(repo, llm, max_retries=0)
+    assert llm.text_tool_calls_seen is False
+    assert EXAMPLE not in sent_system(seen)
+    assert result.trajectory["job"]["tool_call_example"] is False
+    (attempt,) = result.trajectory["attempts"]
+    assert attempt["nudges"] == [] and attempt["tool_calls"] == []
+    assert len([r for r in seen if r.url.endswith("/chat/completions")]) == 2  # ping + 1
+
+
+def test_strict_mode_text_ping_still_fails_preflight(repo):
+    llm, _ = openai_compat_llm(ping_as_text=True, strict_tool_calls=True)
+    result = go(repo, llm)
+    assert result.outcome == "aborted" and "--strict-tool-calls" in result.reason
+
+
+def test_anthropic_provider_gets_neither(repo):
+    from apifix.engine.llm_anthropic import AnthropicLLM
+    from tests.test_llm import FakeClient, sdk_message
+
+    client = FakeClient(
+        sdk_message([{"type": "text", "text": as_text(call("read_file", path="app.py"))}]),
+    )
+    llm = AnthropicLLM("claude-opus-5-5", client=client)
+    result = go(repo, llm, max_retries=0)
+    (attempt,) = result.trajectory["attempts"]
+    assert attempt["nudges"] == [] and attempt["tool_calls"] == []
+    assert attempt["result"] == "no_changes"
+    ((_, kw),) = client.calls  # one request: the text reply ended the turn
+    assert all(EXAMPLE not in block["text"] for block in kw["system"])
+    assert result.trajectory["job"]["tool_call_example"] is False

@@ -215,3 +215,45 @@ report the result.
    trajectory's tool-call entries and counted in the report line.
 
 ## Later changes
+
+### 2026-10-07: tool-call example and no-call nudge for text-format models
+
+Request (verbatim):
+
+> For text-format models (openai-compat, non-strict mode), make two changes:
+>
+> Add one short example of a valid tool call (a read_file call on a repo file) to the system
+> prompt. Only add it when tool calls are parsed from text, not in strict mode or for the
+> Anthropic provider.
+> Add a no-call nudge. If a reply in an attempt contains no tool call and the task isn't
+> finished, reply: "You can't see files directly. Call a tool, for example read_file, to get
+> them." Use the same cap (3 per attempt) and record it in attempts[].nudges with a type that
+> distinguishes it from the multi-call nudge.
+>
+> Add tests for both, including that strict mode and the Anthropic provider are unaffected. Run
+> the full suite with --docker and ruff, then commit. Don't run the live tests.
+
+How it is built:
+
+- **Which models count as text-format.** The provider sets `text_tool_calls_seen = True` the
+  first time it parses a call from text, which can be the preflight ping. In strict mode it
+  never parses, so the flag stays False. The Anthropic provider has no such attribute. The
+  agent reads it with `getattr(llm, "text_tool_calls_seen", False) is True`, so `agent.py`
+  stays provider-neutral. A model that makes structured calls (also openai-compat, non-strict)
+  gets neither change, because a JSON-in-text example would only push it towards the weaker
+  format.
+- **Example.** Right after a successful preflight, if the flag is set, the system prompt gets
+  one paragraph appended: "Tool calls: reply with exactly one JSON object and nothing else, for
+  example:" followed by `{"name": "read_file", "arguments": {"path": "<first finding's
+  file>"}}` (a real repo file; findings are sorted). The system prompt is fixed for the whole
+  job, so models detected only later in the job do not get it. The trajectory already records
+  `system_prompt`; `job.tool_call_example` records whether it was added.
+- **No-call nudge.** In `_converse`, after the multi-call nudge and the max-tokens
+  continuation: when the reply has no tool call, the flag is set, and the attempt has no
+  accepted edit yet ("not finished", the same test that marks an attempt `no_changes`), the
+  agent replies "You can't see files directly. Call a tool, for example read_file, to get
+  them." and continues. The cap is `AgentConfig.max_no_call_nudges = 3` per attempt, counted
+  separately from the multi-call nudges. Each nudge is recorded in `attempts[].nudges` as
+  `{"kind": "no_tool_call", "response": i, "message": ...}`. A reply without a call after an
+  accepted edit still ends the turn, and so does one after the cap. The report counts these
+  nudges.

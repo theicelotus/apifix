@@ -246,3 +246,9 @@ Known limitations:
   object. Anything else is text (ends the turn). Two or more such calls in one reply run none
   and get "Send exactly one tool call per reply." (max 3 per attempt). JSON arrays of calls,
   other tag formats (e.g. `<function=...>`) and `<think>` preambles are not recognised.
+- Once a call has been parsed from text (usually the preflight ping), the model counts as
+  text-format: the system prompt gets one example call (`read_file` on the first finding's
+  file), and a reply without a call before any accepted edit gets "You can't see files
+  directly. ..." instead of ending the turn (max 3 per attempt, `kind: "no_tool_call"`). A
+  model first detected mid-job gets the nudge but not the example (the system prompt is fixed
+  per job). Strict mode and the Anthropic provider never get either.

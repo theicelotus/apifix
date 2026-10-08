@@ -11,6 +11,7 @@ the job cleanly with a reason. Everything is recorded in a JSON-able trajectory.
 from __future__ import annotations
 
 import dataclasses
+import json
 import shutil
 import tempfile
 import time
@@ -34,6 +35,7 @@ TRAJECTORY_VERSION = 1
 CHARS_PER_TOKEN = 3  # conservative estimate for the pre-call budget check
 MAX_FEEDBACK_REASONS = 40
 ONE_CALL_NUDGE = "Send exactly one tool call per reply."
+NO_CALL_NUDGE = "You can't see files directly. Call a tool, for example read_file, to get them."
 _RANK = {"verified": 3, "verified_weak": 2, "unverified": 1, "rejected": 0}
 
 
@@ -44,6 +46,9 @@ class AgentConfig:
     # Replies that are only several tool calls written as text (openai-compat): none is run and
     # the model is asked for one call per reply, at most this many times per attempt.
     max_one_call_nudges: int = 3
+    # Models that write tool calls as text: a reply without a call before any accepted edit gets
+    # NO_CALL_NUDGE instead of ending the turn, at most this many times per attempt.
+    max_no_call_nudges: int = 3
     max_tokens_per_job: int = 2_000_000
     max_cost_usd: float | None = 5.0
     max_output_tokens: int = 16_000
@@ -132,6 +137,15 @@ Migration guide:
 {migration.guide}"""
 
 
+def tool_call_example(findings: list[Finding]) -> str:
+    """Appended to the system prompt for models that write tool calls as text."""
+    call = {"name": "read_file", "arguments": {"path": findings[0].file}}
+    return (
+        "\n\nTool calls: reply with exactly one JSON object and nothing else, for example:\n"
+        + json.dumps(call)
+    )
+
+
 def task_prompt(findings: list[Finding]) -> str:
     lines = [
         "Migrate this repository. The scanner found these call sites "
@@ -210,6 +224,7 @@ class _Job:
         self.findings, self.config, self.work = findings, config, work
         self.ws = Workspace(work)
         self.system = system_prompt(migration)
+        self.tool_call_example = False
         self.messages: list[Message] = []
         self.attempts: list[Attempt] = []
         self.usage = Usage()
@@ -316,7 +331,11 @@ class _Job:
                 raise _Abort("refusal", f"the model declined the request ({response.refusal})")
             if not response.tool_calls:
                 several = response.multiple_text_tool_calls
-                if several >= 2 and len(attempt.nudges) < self.config.max_one_call_nudges:
+                if (
+                    several >= 2
+                    and self._nudges(attempt, "multiple_text_tool_calls")
+                    < self.config.max_one_call_nudges
+                ):
                     attempt.nudges.append(
                         {
                             "kind": "multiple_text_tool_calls",
@@ -335,6 +354,20 @@ class _Job:
                             "steps; end your turn with a short summary when done.",
                         )
                     )
+                    continue
+                if (
+                    self._text_tool_calls()
+                    and not any(e.accepted for e in attempt.edits)
+                    and self._nudges(attempt, "no_tool_call") < self.config.max_no_call_nudges
+                ):
+                    attempt.nudges.append(
+                        {
+                            "kind": "no_tool_call",
+                            "response": len(attempt.responses) - 1,
+                            "message": NO_CALL_NUDGE,
+                        }
+                    )
+                    self.messages.append(Message("user", text=NO_CALL_NUDGE))
                     continue
                 return  # end of turn: the attempt is complete
             results = []
@@ -364,6 +397,15 @@ class _Job:
                 )
                 results.append(ToolResult(call.id, outcome.content, outcome.is_error))
             self.messages.append(Message("user", tool_results=results))
+
+    def _text_tool_calls(self) -> bool:
+        """The provider has parsed tool calls from this model's reply text (openai-compat,
+        non-strict); other providers lack the attribute."""
+        return getattr(self.llm, "text_tool_calls_seen", False) is True
+
+    @staticmethod
+    def _nudges(attempt: Attempt, kind: str) -> int:
+        return sum(n["kind"] == kind for n in attempt.nudges)
 
     def _snapshot(self) -> dict[str, str]:
         return {
@@ -395,6 +437,9 @@ class _Job:
                 preflight()
             except LLMError as exc:
                 return "aborted", f"preflight: {exc}"
+        if self._text_tool_calls():
+            self.system += tool_call_example(self.findings)
+            self.tool_call_example = True
         self.baseline = self.sandbox.run(self.repo)
         if self.baseline.status == "error" and self.baseline.reason.startswith("docker not usable"):
             return "aborted", f"sandbox unavailable before any LLM call: {self.baseline.reason}"
@@ -470,6 +515,7 @@ class _Job:
                 "model": self.llm.model,
                 "endpoint": getattr(self.llm, "endpoint", None),
                 "strict_tool_calls": getattr(self.llm, "strict_tool_calls", None),
+                "tool_call_example": self.tool_call_example,
                 "config": dataclasses.asdict(self.config),
                 "notes": list(self.llm.notes),
                 "started_at": self.started.isoformat(),
@@ -524,11 +570,16 @@ def report_markdown(result_outcome: Outcome, reason: str, job: _Job, chosen: Att
             f"- Tool calls parsed from text: {len(from_text)} of {len(calls)}"
             + (f" ({as_string} with arguments as a JSON string)" if as_string else "")
         )
-    nudges = sum(len(a.nudges) for a in job.attempts)
-    if nudges:
+    nudges = [n["kind"] for a in job.attempts for n in a.nudges]
+    if nudges.count("multiple_text_tool_calls"):
         lines.append(
             f"- Replies with several tool calls as text (none run; asked for one per reply): "
-            f"{nudges}"
+            f"{nudges.count('multiple_text_tool_calls')}"
+        )
+    if nudges.count("no_tool_call"):
+        lines.append(
+            f"- Replies without a tool call before any edit (asked to call a tool): "
+            f"{nudges.count('no_tool_call')}"
         )
     lines += [f"- Note: {n}" for n in job.llm.notes]
     lines.append("")

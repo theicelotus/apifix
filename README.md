@@ -51,7 +51,10 @@ apifix fix ... --provider openai-compat --base-url http://gpu-box.local:8000/v1 
   tools, with valid arguments. A reply with prose around the JSON is just text. A reply holding
   several such calls runs none of them; the model is asked for one call per reply (at most 3
   times per attempt). The report counts these calls, the trajectory marks each one
-  (`"source": "parsed_from_text"`), and `--strict-tool-calls` turns this off.
+  (`"source": "parsed_from_text"`), and `--strict-tool-calls` turns this off. For such models
+  the system prompt also shows one example call, and a reply that asks for files instead of
+  calling a tool (before any edit) is answered with a reminder to call one (at most 3 times
+  per attempt).
 - Raise the context window. Agent conversations reach 30-100k tokens; a server that silently
   truncates prompts would drop apifix's rules. apifix reads Ollama's context window and
   stops with instructions if the conversation would not fit, and detects truncation on other

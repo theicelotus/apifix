@@ -184,6 +184,7 @@ class OpenAICompatLLM:
         self.models = dict(models or {})
         self.timeout_s = timeout_s
         self.strict_tool_calls = strict_tool_calls
+        self.text_tool_calls_seen = False  # a call was parsed from reply text (never if strict)
         self.transport = transport
         self.sleep = sleep
         self.notes: list[str] = []
@@ -386,6 +387,7 @@ class OpenAICompatLLM:
             parsed = parse_text_tool_call(text, tools)
             if parsed:
                 calls, text = [parsed], ""  # replayed as a structured call
+                self.text_tool_calls_seen = True
                 if TEXT_CALLS_NOTE not in self.notes:
                     self.notes.append(TEXT_CALLS_NOTE)
             else:
