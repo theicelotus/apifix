@@ -44,6 +44,14 @@ apifix fix ... --provider openai-compat --base-url http://gpu-box.local:8000/v1 
   model for your hardware (table below).
 - Before any sandbox work, apifix checks that the model really makes tool calls and fails with
   a clear error if it does not (many small models and some chat templates cannot).
+- Some models write a tool call as their reply text instead of in the tool-call field (e.g.
+  `qwen2.5-coder:7b` leaves out the `<tool_call>` tags Ollama looks for). apifix uses such a
+  reply as a call only if the whole reply is exactly one `{"name": ..., "arguments": {...}}`
+  object (optionally in one ```` ```json ```` fence or `<tool_call>` block) naming one of its
+  tools, with valid arguments. A reply with prose around the JSON is just text. A reply holding
+  several such calls runs none of them; the model is asked for one call per reply (at most 3
+  times per attempt). The report counts these calls, the trajectory marks each one
+  (`"source": "parsed_from_text"`), and `--strict-tool-calls` turns this off.
 - Raise the context window. Agent conversations reach 30-100k tokens; a server that silently
   truncates prompts would drop apifix's rules. apifix reads Ollama's context window and
   stops with instructions if the conversation would not fit, and detects truncation on other

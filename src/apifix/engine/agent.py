@@ -33,6 +33,7 @@ Outcome = Literal["verified", "verified_weak", "rejected", "unverified", "aborte
 TRAJECTORY_VERSION = 1
 CHARS_PER_TOKEN = 3  # conservative estimate for the pre-call budget check
 MAX_FEEDBACK_REASONS = 40
+ONE_CALL_NUDGE = "Send exactly one tool call per reply."
 _RANK = {"verified": 3, "verified_weak": 2, "unverified": 1, "rejected": 0}
 
 
@@ -40,6 +41,9 @@ _RANK = {"verified": 3, "verified_weak": 2, "unverified": 1, "rejected": 0}
 class AgentConfig:
     max_retries: int = 3
     max_tool_calls_per_attempt: int = 60
+    # Replies that are only several tool calls written as text (openai-compat): none is run and
+    # the model is asked for one call per reply, at most this many times per attempt.
+    max_one_call_nudges: int = 3
     max_tokens_per_job: int = 2_000_000
     max_cost_usd: float | None = 5.0
     max_output_tokens: int = 16_000
@@ -58,6 +62,7 @@ class Attempt:
     number: int
     responses: list[dict[str, Any]] = field(default_factory=list)
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    nudges: list[dict[str, Any]] = field(default_factory=list)
     edits: list[EditRecord] = field(default_factory=list)
     diff: str = ""
     verification: Verification | None = None
@@ -73,6 +78,7 @@ class Attempt:
             "result": self.result,
             "responses": self.responses,
             "tool_calls": self.tool_calls,
+            "nudges": self.nudges,
             "edits": [asdict(e) for e in self.edits],
             "diff": self.diff,
             "verification": self.verification.to_dict() if self.verification else None,
@@ -309,6 +315,18 @@ class _Job:
             if response.stop_reason == "refusal":
                 raise _Abort("refusal", f"the model declined the request ({response.refusal})")
             if not response.tool_calls:
+                several = response.multiple_text_tool_calls
+                if several >= 2 and len(attempt.nudges) < self.config.max_one_call_nudges:
+                    attempt.nudges.append(
+                        {
+                            "kind": "multiple_text_tool_calls",
+                            "calls": several,
+                            "response": len(attempt.responses) - 1,
+                            "message": ONE_CALL_NUDGE,
+                        }
+                    )
+                    self.messages.append(Message("user", text=ONE_CALL_NUDGE))
+                    continue
                 if response.stop_reason == "max_tokens":
                     self.messages.append(
                         Message(
@@ -336,6 +354,8 @@ class _Job:
                         "id": call.id,
                         "name": call.name,
                         "input": call.input,
+                        "source": call.source,
+                        "arguments_as_string": call.arguments_as_string,
                         "is_error": outcome.is_error,
                         "result_chars": len(outcome.content),
                         "result_head": outcome.content[:500],
@@ -449,6 +469,7 @@ class _Job:
                 "provider": self.llm.provider,
                 "model": self.llm.model,
                 "endpoint": getattr(self.llm, "endpoint", None),
+                "strict_tool_calls": getattr(self.llm, "strict_tool_calls", None),
                 "config": dataclasses.asdict(self.config),
                 "notes": list(self.llm.notes),
                 "started_at": self.started.isoformat(),
@@ -495,6 +516,20 @@ def report_markdown(result_outcome: Outcome, reason: str, job: _Job, chosen: Att
     answered = sorted({r["model"] for a in job.attempts for r in a.responses})
     if answered and answered != [job.llm.model]:
         lines.append(f"- Models that answered: {', '.join(f'`{m}`' for m in answered)}")
+    calls = [c for a in job.attempts for c in a.tool_calls]
+    from_text = [c for c in calls if c["source"] == "parsed_from_text"]
+    if from_text:
+        as_string = sum(c["arguments_as_string"] for c in from_text)
+        lines.append(
+            f"- Tool calls parsed from text: {len(from_text)} of {len(calls)}"
+            + (f" ({as_string} with arguments as a JSON string)" if as_string else "")
+        )
+    nudges = sum(len(a.nudges) for a in job.attempts)
+    if nudges:
+        lines.append(
+            f"- Replies with several tool calls as text (none run; asked for one per reply): "
+            f"{nudges}"
+        )
     lines += [f"- Note: {n}" for n in job.llm.notes]
     lines.append("")
     if chosen and chosen.verification:

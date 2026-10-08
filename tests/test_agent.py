@@ -18,6 +18,7 @@ import pytest
 from apifix import cli
 from apifix.engine.agent import AgentConfig, fix, system_prompt
 from apifix.engine.llm import LLMError, LLMResponse, Message, ModelInfo, ToolCall, Usage
+from apifix.engine.llm_openai_compat import TEXT_CALLS_NOTE
 from apifix.engine.migrations import get_migration
 from apifix.engine.sandbox import SandboxResult
 from apifix.engine.test_results import FileCoverage
@@ -583,11 +584,14 @@ def test_failed_preflight_aborts_before_the_sandbox(repo):
     assert sandbox.runs == [] and llm.requests == []
 
 
-def openai_compat_llm(*steps):
-    """A real OpenAICompatLLM on a scripted transport that replays agent steps as HTTP."""
+def openai_compat_llm(*steps, **options):
+    """A real OpenAICompatLLM on a scripted transport that replays agent steps as HTTP. A str
+    step is a reply whose text is exactly that string."""
     from apifix.engine.llm_openai_compat import HTTPResponse, OpenAICompatLLM
 
-    def as_http(step: LLMResponse) -> HTTPResponse:
+    def as_http(step: LLMResponse | str) -> HTTPResponse:
+        if isinstance(step, str):
+            step = done(step)
         calls = [
             {
                 "id": c.id,
@@ -616,7 +620,7 @@ def openai_compat_llm(*steps):
             return HTTPResponse(404, b"{}")
         return queue.pop(0)
 
-    return OpenAICompatLLM("qwen2.5-coder:7b", transport=transport), seen
+    return OpenAICompatLLM("qwen2.5-coder:7b", transport=transport, **options), seen
 
 
 def test_full_fix_through_the_openai_compat_provider(repo, monkeypatch):
@@ -678,3 +682,130 @@ def test_base_url_is_rejected_for_anthropic(repo, monkeypatch, capsys):
     args = ["fix", str(repo), "--migration", "openai-v1", "--base-url", "http://localhost:1/v1"]
     assert cli.main(args) == 2
     assert "only apply to --provider openai-compat" in capsys.readouterr().err
+
+
+# --- tool calls written as text (openai-compat) -----------------------------------------------
+
+
+def as_text(c: ToolCall, arguments_as_string: bool = False) -> str:
+    args = json.dumps(c.input) if arguments_as_string else c.input
+    return json.dumps({"name": c.name, "arguments": args})
+
+
+def sent_messages(seen):
+    """The messages of the last chat request the provider sent."""
+    chats = [r for r in seen if r.url.endswith("/chat/completions")]
+    return json.loads(chats[-1].body)["messages"]
+
+
+def test_text_tool_calls_are_run_and_marked(repo):
+    llm, seen = openai_compat_llm(
+        as_text(FIX_APP),
+        f"```json\n{as_text(FIX_REQS, arguments_as_string=True)}\n```",
+        tools(FIX_TESTS),
+        done(),
+    )
+    result = go(repo, llm)
+    assert result.outcome == "verified"
+    (attempt,) = result.trajectory["attempts"]
+    marks = [(c["name"], c["source"], c["arguments_as_string"]) for c in attempt["tool_calls"]]
+    assert marks == [
+        ("edit_file", "parsed_from_text", False),
+        ("edit_file", "parsed_from_text", True),
+        ("edit_file", "structured", False),
+    ]
+    assert not any(c["is_error"] for c in attempt["tool_calls"])
+    assert attempt["nudges"] == []
+    assert result.trajectory["job"]["strict_tool_calls"] is False
+    assert TEXT_CALLS_NOTE in result.trajectory["job"]["notes"]
+    assert "- Tool calls parsed from text: 2 of 3 (1 with arguments as a JSON string)" in (
+        result.report_markdown
+    )
+    # the parsed calls went back to the server as structured assistant tool calls
+    assistant = [m for m in sent_messages(seen) if m["role"] == "assistant"]
+    assert [m["content"] for m in assistant] == ["", "", ""]
+    assert [len(m["tool_calls"]) for m in assistant] == [1, 1, 1]
+
+
+def test_several_text_calls_get_a_nudge_and_none_run(repo):
+    two = f"{as_text(FIX_APP)}\n{as_text(FIX_REQS)}"
+    llm, seen = openai_compat_llm(two, tools(FIX_APP, FIX_REQS, FIX_TESTS), done())
+    result = go(repo, llm)
+    assert result.outcome == "verified"
+    (attempt,) = result.trajectory["attempts"]
+    assert attempt["nudges"] == [
+        {
+            "kind": "multiple_text_tool_calls",
+            "calls": 2,
+            "response": 0,
+            "message": "Send exactly one tool call per reply.",
+        }
+    ]
+    assert [c["source"] for c in attempt["tool_calls"]] == ["structured"] * 3
+    messages = sent_messages(seen)
+    nudge = messages.index({"role": "user", "content": "Send exactly one tool call per reply."})
+    assert messages[nudge - 1] == {"role": "assistant", "content": two}
+    assert (
+        "- Replies with several tool calls as text (none run; asked for one per reply): 1"
+        in result.report_markdown
+    )
+    assert "parsed from text" not in result.report_markdown
+
+
+def test_nudges_are_capped_per_attempt(repo):
+    two = f"{as_text(FIX_APP)}\n{as_text(FIX_REQS)}"
+    llm, seen = openai_compat_llm(two, two, two, two)
+    result = go(repo, llm, max_retries=0)
+    (attempt,) = result.trajectory["attempts"]
+    assert len(attempt["nudges"]) == 3 and attempt["tool_calls"] == []
+    assert attempt["result"] == "no_changes"  # the 4th reply was plain text: end of turn
+    assert (result.outcome, result.reason) == (
+        "aborted",
+        "no_changes: the model made no edits in any attempt",
+    )
+    assert len([r for r in seen if r.url.endswith("/chat/completions")]) == 5  # ping + 4
+
+
+def test_strict_tool_calls_leave_text_as_text(repo):
+    llm, _ = openai_compat_llm(as_text(FIX_APP), strict_tool_calls=True)
+    result = go(repo, llm, max_retries=0)
+    (attempt,) = result.trajectory["attempts"]
+    assert attempt["tool_calls"] == [] and attempt["result"] == "no_changes"
+    assert result.trajectory["job"]["strict_tool_calls"] is True
+    assert TEXT_CALLS_NOTE not in result.trajectory["job"]["notes"]
+
+
+def test_structured_call_missing_a_required_argument_is_a_tool_error(repo):
+    def retry(messages):
+        (result,) = messages[-1].tool_results
+        assert result.is_error and "missing required arguments: ['path']" in result.content
+        return tools(FIX_APP, FIX_REQS, FIX_TESTS)
+
+    result = go(repo, FakeLLM([tools(call("read_file")), retry, done()]))
+    assert result.outcome == "verified"
+
+
+def test_cli_strict_tool_calls(repo, tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_get_llm(provider, model, *, prices=None, **options):
+        seen.update(options)
+        return FakeLLM([done()], price=None)
+
+    monkeypatch.setattr("apifix.engine.llm.get_llm", fake_get_llm)
+    monkeypatch.setattr("apifix.engine.sandbox.Sandbox", lambda *a, **k: JudgingSandbox())
+    args = ["fix", str(repo), "--migration", "openai-v1", "--provider", "openai-compat"]
+    args += ["--model", "m", "--no-cost-limit", "--max-retries", "0"]
+    args += ["--out", str(tmp_path / "out")]
+    cli.main([*args, "--strict-tool-calls"])
+    assert seen == {"strict_tool_calls": True}
+    seen.clear()
+    cli.main(args)
+    assert seen == {}
+
+
+def test_strict_tool_calls_is_rejected_for_anthropic(repo, monkeypatch, capsys):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    args = ["fix", str(repo), "--migration", "openai-v1", "--strict-tool-calls"]
+    assert cli.main(args) == 2
+    assert "strict_tool_calls only apply to --provider openai-compat" in capsys.readouterr().err

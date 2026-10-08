@@ -29,6 +29,7 @@ dashboard. Do not build these until asked.
 src/apifix/
   cli.py              `apifix scan <path> --migration openai-v1 [--json]`,
                       `apifix fix <path> --migration openai-v1 [--model] [--max-cost] [--out]`,
+                      (openai-compat: `--base-url`, `--strict-tool-calls`),
                       `apifix cleanup [--dry-run]`
   api/                FastAPI app (later)
   worker/             background jobs (later)
@@ -57,7 +58,8 @@ src/apifix/
     llm.py            provider-neutral LLM interface, model/price table (TOML-overridable)
     llm_anthropic.py  Claude via the official `anthropic` SDK (optional extra)
     llm_openai_compat.py  any OpenAI-compatible endpoint (Ollama, LM Studio, vLLM, hosted);
-                      stdlib HTTP, preflight tool-call check, context-window guards
+                      stdlib HTTP, preflight tool-call check, context-window guards,
+                      tool calls written as reply text (`--strict-tool-calls` disables)
     agent_tools.py    the model's tools: read_file, list_files, search, edit_file (no shell)
     agent.py          fix loop: propose -> verify (cached baseline) -> feed reasons back ->
                       retry; limits; JSON trajectory; diff + report
@@ -237,3 +239,10 @@ Known limitations:
   so token limits are approximate there.
 - No streaming: a request blocks until the reply is complete (600 s timeout by default,
   `--timeout`). Timeouts are not retried.
+- Tool calls written as text (on unless `--strict-tool-calls`): used only when the server sent
+  no structured call and the whole reply is one `{"name", "arguments"}` object (bare, in one
+  ```` ```json ```` / ```` ``` ```` fence, or in one `<tool_call>` block) naming an offered tool,
+  with arguments that pass `validate_tool_input`; `arguments` may be a JSON string holding one
+  object. Anything else is text (ends the turn). Two or more such calls in one reply run none
+  and get "Send exactly one tool call per reply." (max 3 per attempt). JSON arrays of calls,
+  other tag formats (e.g. `<function=...>`) and `<think>` preambles are not recognised.

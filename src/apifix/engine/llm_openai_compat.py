@@ -9,6 +9,11 @@ hosted free tiers. Plain stdlib HTTP, no SDK.
 - ``preflight()`` checks that the model really makes tool calls before the job spends time on a
   sandbox install, and (for Ollama) reads the runtime context window so a too-small one fails
   loudly instead of silently truncating the prompt.
+- Some models write a tool call as their reply text instead of in the tool-call field (e.g.
+  qwen2.5-coder:7b leaves out the ``<tool_call>`` tags Ollama parses). A reply that is exactly
+  one well-formed call to an offered tool, optionally in one ```json fence or ``<tool_call>``
+  block, with valid arguments, is used as that call (``source="parsed_from_text"``); anything
+  else stays text. ``strict_tool_calls=True`` turns this off.
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -34,6 +40,7 @@ from apifix.engine.llm import (
     ToolCall,
     ToolSpec,
     Usage,
+    validate_tool_input,
 )
 
 DEFAULT_BASE_URL = "http://localhost:11434/v1"  # Ollama
@@ -60,6 +67,10 @@ _FINISH: dict[str, StopReason] = {
     "length": "max_tokens",
     "content_filter": "refusal",
 }
+TEXT_CALLS_NOTE = (
+    "the model writes tool calls as text; apifix parses replies that are exactly one JSON "
+    "tool call (--strict-tool-calls disables this)"
+)
 _PING = ToolSpec(
     "ping",
     "Reply to a connectivity check.",
@@ -157,6 +168,7 @@ class OpenAICompatLLM:
         api_key_env: str = API_KEY_ENV,
         models: Mapping[str, ModelInfo] | None = None,
         timeout_s: float = 600.0,
+        strict_tool_calls: bool = False,
         transport: Transport = urllib_transport,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -171,6 +183,7 @@ class OpenAICompatLLM:
         self.local = is_local_host(parts.hostname)
         self.models = dict(models or {})
         self.timeout_s = timeout_s
+        self.strict_tool_calls = strict_tool_calls
         self.transport = transport
         self.sleep = sleep
         self.notes: list[str] = []
@@ -337,7 +350,7 @@ class OpenAICompatLLM:
         status, data = self._call("POST", "/chat/completions", body)
         if status != 200:
             raise self._error(status, data)
-        response = self._parse(data, body)
+        response = self._parse(data, body, tools)
         self._requests += 1
         if self._requests == 1 and not self._usage_estimated:
             self._check_truncation(response.usage, estimate)
@@ -355,7 +368,7 @@ class OpenAICompatLLM:
                 "(Ollama: OLLAMA_CONTEXT_LENGTH=32768 ollama serve)"
             )
 
-    def _parse(self, data: Any, body: dict[str, Any]) -> LLMResponse:
+    def _parse(self, data: Any, body: dict[str, Any], tools: Sequence[ToolSpec]) -> LLMResponse:
         try:
             choice = data["choices"][0]
             message = choice["message"]
@@ -367,6 +380,16 @@ class OpenAICompatLLM:
         text = content or ""
         calls = [_tool_call(c) for c in message.get("tool_calls") or []]
         finish = choice.get("finish_reason") or ""
+        out_chars = len(text) + sum(len(json.dumps(c.input)) for c in calls)
+        several = 0
+        if not calls and text.strip() and finish != "content_filter" and not self.strict_tool_calls:
+            parsed = parse_text_tool_call(text, tools)
+            if parsed:
+                calls, text = [parsed], ""  # replayed as a structured call
+                if TEXT_CALLS_NOTE not in self.notes:
+                    self.notes.append(TEXT_CALLS_NOTE)
+            else:
+                several = count_text_tool_calls(text, tools)
         stop = "tool_use" if calls else _FINISH.get(finish, "other")
         if stop == "tool_use" and not calls:
             stop = "end_turn"
@@ -384,7 +407,6 @@ class OpenAICompatLLM:
             note = "the server reported no token usage; tokens are estimated from characters"
             if note not in self.notes:
                 self.notes.append(note)
-            out_chars = len(text) + sum(len(json.dumps(c.input)) for c in calls)
             usage = Usage(
                 input_tokens=len(json.dumps(body)) // CHARS_PER_TOKEN,
                 output_tokens=out_chars // CHARS_PER_TOKEN,
@@ -398,6 +420,7 @@ class OpenAICompatLLM:
             raw_stop_reason=finish,
             refusal="content_filter" if stop == "refusal" else "",
             provider_blocks=[message],
+            multiple_text_tool_calls=several,
         )
 
     # --- preflight --------------------------------------------------------------------------
@@ -414,7 +437,7 @@ class OpenAICompatLLM:
         status, data = self._call("POST", "/chat/completions", body)
         if status != 200:
             raise self._error(status, data)
-        response = self._parse(data, body)
+        response = self._parse(data, body, [_PING])
         if not any(c.name == "ping" for c in response.tool_calls):
             looks_like_json = '"name"' in response.text or "ping" in response.text
             detail = (
@@ -423,6 +446,8 @@ class OpenAICompatLLM:
                 if looks_like_json
                 else ""
             )
+            if looks_like_json and self.strict_tool_calls:
+                detail += " Text-format tool calls are disabled by --strict-tool-calls."
             raise LLMError(
                 f"model {self.model} did not make a tool call when asked to.{detail} Use a "
                 f"tool-capable model. {MODEL_SUGGESTIONS}"
@@ -497,3 +522,92 @@ def _tool_call(raw: Any) -> ToolCall:
     if not isinstance(parsed, dict):
         return ToolCall(call_id, name, {}, input_error="the arguments must be a JSON object")
     return ToolCall(call_id, name, parsed)
+
+
+# --- tool calls written as text -------------------------------------------------------------
+
+# One optional wrapper per call; ```json is tried before a bare ``` fence.
+_WRAPPERS = (("<tool_call>", "</tool_call>"), ("```json", "```"), ("```", "```"))
+_SPACE = re.compile(r"\s*")
+
+
+def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    keys = [k for k, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise ValueError("duplicate keys")
+    return dict(pairs)
+
+
+_DECODER = json.JSONDecoder(object_pairs_hook=_no_duplicate_keys)
+
+
+def _text_json_values(text: str) -> list[Any] | None:
+    """The JSON values `text` consists of, each bare or inside one fence / <tool_call> block,
+    separated only by whitespace; None if anything else is in it."""
+    values: list[Any] = []
+    i = _SPACE.match(text).end()
+    while i < len(text):
+        closer = None
+        for opener, close in _WRAPPERS:
+            if text.startswith(opener, i):
+                i, closer = i + len(opener), close
+                break
+        i = _SPACE.match(text, i).end()
+        try:
+            value, i = _DECODER.raw_decode(text, i)
+        except ValueError:
+            return None
+        i = _SPACE.match(text, i).end()
+        if closer is not None:
+            if not text.startswith(closer, i):
+                return None
+            i = _SPACE.match(text, i + len(closer)).end()
+        values.append(value)
+    return values
+
+
+def _call_shape(value: Any, tools: Sequence[ToolSpec]) -> tuple[ToolSpec, Any, bool] | None:
+    """(tool, arguments, arguments were a JSON string) if `value` is {"name", "arguments"} naming
+    an offered tool, with arguments an object or a string holding exactly one object."""
+    if not isinstance(value, dict) or set(value) != {"name", "arguments"}:
+        return None
+    spec = next((t for t in tools if t.name == value["name"]), None)
+    args = value["arguments"]
+    if spec is None:
+        return None
+    if isinstance(args, str):
+        try:
+            args = _DECODER.decode(args)
+        except ValueError:
+            return None
+        return (spec, args, True) if isinstance(args, dict) else None
+    return (spec, args, False) if isinstance(args, dict) else None
+
+
+def parse_text_tool_call(text: str, tools: Sequence[ToolSpec]) -> ToolCall | None:
+    """The tool call if `text` is exactly one call to an offered tool with valid arguments."""
+    values = _text_json_values(text)
+    if not values or len(values) != 1:
+        return None
+    shape = _call_shape(values[0], tools)
+    if shape is None:
+        return None
+    spec, args, as_string = shape
+    if validate_tool_input(spec.input_schema, args) is not None:
+        return None
+    return ToolCall(
+        f"call_{uuid.uuid4().hex[:12]}",
+        spec.name,
+        args,
+        source="parsed_from_text",
+        arguments_as_string=as_string,
+    )
+
+
+def count_text_tool_calls(text: str, tools: Sequence[ToolSpec]) -> int:
+    """How many calls `text` holds if it is nothing but two or more call-shaped objects (none
+    is run; the agent asks for one per reply), else 0."""
+    values = _text_json_values(text) or []
+    if len(values) >= 2 and all(_call_shape(v, tools) for v in values):
+        return len(values)
+    return 0

@@ -17,7 +17,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from apifix.engine.dependencies import is_dependency_file
-from apifix.engine.llm import ToolCall, ToolSpec
+from apifix.engine.llm import ToolCall, ToolSpec, validate_tool_input
 from apifix.engine.walk import SKIP_DIRS, iter_files
 
 MAX_READ_LINES = 2000
@@ -295,29 +295,16 @@ def editable(rel: str) -> bool:
     return rel.endswith(".py") or is_dependency_file(rel)
 
 
-_ARGS = {
-    "read_file": {"path": str, "start_line": int, "end_line": int},
-    "list_files": {"directory": str, "glob": str},
-    "search": {"pattern": str, "glob": str},
-    "edit_file": {"path": str, "old_string": str, "new_string": str, "replace_all": bool},
-}
+_SPECS = {t.name: t for t in TOOLS}
 
 
 def _arguments(call: ToolCall) -> dict[str, Any]:
-    spec = _ARGS.get(call.name)
+    spec = _SPECS.get(call.name)
     if spec is None:
         return {}
-    if not isinstance(call.input, dict):
-        raise ToolError("tool input must be an object")
-    unknown = set(call.input) - set(spec)
-    if unknown:
-        raise ToolError(f"unknown arguments: {sorted(unknown)}")
-    for key, value in call.input.items():
-        kind = spec[key]
-        if value is not None and (
-            not isinstance(value, kind) or (kind is int and isinstance(value, bool))
-        ):
-            raise ToolError(f"{key} must be {kind.__name__}")
+    problem = validate_tool_input(spec.input_schema, call.input)
+    if problem:
+        raise ToolError(problem)
     return {k: v for k, v in call.input.items() if v is not None}
 
 

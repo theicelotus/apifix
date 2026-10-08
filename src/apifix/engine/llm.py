@@ -42,6 +42,10 @@ class ToolCall:
     # Set when the provider could not decode the arguments (e.g. invalid JSON); the agent sends
     # it back to the model as a tool error instead of running the tool.
     input_error: str = ""
+    # "structured" (the server's tool-call field) or "parsed_from_text" (the model wrote the
+    # call as its reply text; openai-compat only).
+    source: str = "structured"
+    arguments_as_string: bool = False  # parsed from text with "arguments" as a JSON string
 
 
 @dataclass(frozen=True)
@@ -97,6 +101,8 @@ class LLMResponse:
     raw_stop_reason: str = ""
     refusal: str = ""  # category / explanation when stop_reason == "refusal"
     provider_blocks: list[dict[str, Any]] | None = None
+    # The reply was nothing but this many (>= 2) tool calls written as text; none were parsed.
+    multiple_text_tool_calls: int = 0
 
 
 class LLMClient(Protocol):
@@ -123,6 +129,41 @@ class LLMClient(Protocol):
 # Optional provider methods, looked up with getattr by the agent:
 #   preflight() -> None        cheap check before the job starts (raise LLMError to stop it)
 #   endpoint: str | None       where requests go (recorded in the trajectory; no credentials)
+
+
+# --- tool input -------------------------------------------------------------------------------
+
+_JSON_TYPES: dict[str, type | tuple[type, ...]] = {
+    "string": str,
+    "integer": int,
+    "number": (int, float),
+    "boolean": bool,
+    "object": dict,
+    "array": list,
+}
+
+
+def validate_tool_input(schema: Mapping[str, Any], args: Any) -> str | None:
+    """Why `args` does not fit a tool's input schema, or None if it does. Covers the subset the
+    tools use: an object of typed properties with required keys; unknown keys are rejected and
+    null counts as absent."""
+    if not isinstance(args, dict):
+        return "tool input must be an object"
+    properties = schema.get("properties") or {}
+    unknown = set(args) - set(properties)
+    if unknown:
+        return f"unknown arguments: {sorted(unknown)}"
+    missing = [k for k in schema.get("required") or [] if args.get(k) is None]
+    if missing:
+        return f"missing required arguments: {missing}"
+    for key, value in args.items():
+        kind = properties[key].get("type") if isinstance(properties[key], dict) else None
+        expected = _JSON_TYPES.get(kind) if isinstance(kind, str) else None
+        if value is None or expected is None:
+            continue
+        if not isinstance(value, expected) or (isinstance(value, bool) and kind != "boolean"):
+            return f"{key} must be {kind}"
+    return None
 
 
 # --- model table ------------------------------------------------------------------------------
@@ -222,7 +263,8 @@ def get_llm(
     **options: Any,
 ) -> LLMClient:
     """Build the configured provider. Defaults: $APIFIX_PROVIDER / $APIFIX_MODEL, then
-    anthropic / claude-opus-5-5. openai-compat takes base_url, api_key_env and timeout_s."""
+    anthropic / claude-opus-5-5. openai-compat takes base_url, api_key_env, timeout_s and
+    strict_tool_calls."""
     provider = provider or os.environ.get("APIFIX_PROVIDER") or DEFAULT_PROVIDER
     if provider not in PROVIDERS:
         raise ValueError(f"unknown provider {provider!r} (available: {', '.join(PROVIDERS)})")
@@ -231,7 +273,7 @@ def get_llm(
         from apifix.engine.llm_openai_compat import OpenAICompatLLM
 
         return OpenAICompatLLM(model, models=load_model_table({}, prices), **options)
-    unsupported = set(options) & {"base_url", "api_key_env"}
+    unsupported = set(options) & {"base_url", "api_key_env", "strict_tool_calls"}
     if unsupported:
         raise ValueError(f"{', '.join(sorted(unsupported))} only apply to --provider openai-compat")
     from apifix.engine.llm_anthropic import AnthropicLLM

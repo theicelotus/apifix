@@ -3,6 +3,7 @@
 apifix scan <path> --migration openai-v1 [--json]
 apifix fix <path> --migration openai-v1 [--model M] [--max-cost USD] [--out DIR]
 apifix fix <path> --migration openai-v1 --provider openai-compat --model M [--base-url URL]
+    [--strict-tool-calls]
 apifix cleanup [--dry-run]      remove containers/temp dirs left by interrupted runs
 """
 
@@ -52,6 +53,12 @@ def main(argv: list[str] | None = None) -> int:
         help="openai-compat: env var holding the API key (default: APIFIX_LLM_API_KEY)",
     )
     p_fix.add_argument("--timeout", type=float, help="seconds per LLM request (default 600)")
+    p_fix.add_argument(
+        "--strict-tool-calls",
+        action="store_true",
+        help="openai-compat: only use the server's tool-call field; never parse a reply that "
+        "is written as one JSON tool call",
+    )
     p_fix.add_argument("--prices", help="TOML file overriding model prices ($APIFIX_PRICES)")
     cost = p_fix.add_mutually_exclusive_group()
     cost.add_argument(
@@ -108,6 +115,7 @@ def _fix(args: argparse.Namespace) -> int:
             ("base_url", args.base_url),
             ("api_key_env", args.api_key_env),
             ("timeout_s", args.timeout),
+            ("strict_tool_calls", args.strict_tool_calls or None),
         )
         if value is not None
     }

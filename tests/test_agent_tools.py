@@ -9,7 +9,7 @@ from apifix.engine.agent_tools import (
     Workspace,
     editable,
 )
-from apifix.engine.llm import ToolCall
+from apifix.engine.llm import ToolCall, validate_tool_input
 
 
 @pytest.fixture
@@ -186,3 +186,41 @@ def test_unknown_tool_and_bad_arguments(ws):
     assert "start_line must be int" in run(ws, "read_file", path="app.py", start_line="2").content
     out = run(ws, "edit_file", path="app.py", old_string=1, new_string="x")
     assert out.is_error and out.edit is None  # rejected before the edit was attempted
+
+
+# --- argument validation (shared with tool calls parsed from text) ----------------------------
+
+
+@pytest.mark.parametrize(
+    ("args", "problem"),
+    [
+        ({"path": "a.py"}, None),
+        ({"path": "a.py", "start_line": 2, "end_line": None}, None),
+        ({}, "missing required arguments: ['path']"),
+        ({"path": None}, "missing required arguments: ['path']"),
+        ({"path": "a.py", "x": 1}, "unknown arguments: ['x']"),
+        ({"path": 3}, "path must be string"),
+        ({"path": "a.py", "start_line": True}, "start_line must be integer"),
+        ({"path": "a.py", "start_line": 1.5}, "start_line must be integer"),
+        ([], "tool input must be an object"),
+    ],
+)
+def test_validate_tool_input(args, problem):
+    (read_file,) = [t for t in TOOLS if t.name == "read_file"]
+    assert validate_tool_input(read_file.input_schema, args) == problem
+
+
+def test_edit_file_booleans_are_checked():
+    (edit,) = [t for t in TOOLS if t.name == "edit_file"]
+    base = {"path": "a.py", "old_string": "a", "new_string": "b"}
+    assert validate_tool_input(edit.input_schema, base | {"replace_all": True}) is None
+    assert validate_tool_input(edit.input_schema, base | {"replace_all": 1}) == (
+        "replace_all must be boolean"
+    )
+
+
+def test_missing_required_argument_is_a_tool_error_not_a_crash(ws):
+    out = run(ws, "read_file")
+    assert out.is_error and "missing required arguments: ['path']" in out.content
+    out = run(ws, "edit_file", path="app.py", old_string="x")
+    assert out.is_error and "missing required arguments: ['new_string']" in out.content

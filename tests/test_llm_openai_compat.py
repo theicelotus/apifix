@@ -9,13 +9,17 @@ from dataclasses import dataclass, field
 
 import pytest
 
+from apifix.engine.agent_tools import TOOLS as AGENT_TOOLS
 from apifix.engine.llm import LLMError, Message, ModelInfo, ToolCall, ToolResult, ToolSpec, Usage
 from apifix.engine.llm_openai_compat import (
     MAX_RESPONSE_BYTES,
+    TEXT_CALLS_NOTE,
     ConnectFailed,
     HTTPResponse,
     OpenAICompatLLM,
+    count_text_tool_calls,
     is_local_host,
+    parse_text_tool_call,
     to_openai,
     urllib_transport,
 )
@@ -326,10 +330,27 @@ def test_preflight_fails_when_no_tool_call_is_made():
         llm.preflight()
 
 
-def test_preflight_explains_tool_calls_written_as_text():
-    llm, _ = make(reply('{"name": "ping", "arguments": {"ok": true}}'))
-    with pytest.raises(LLMError, match="wrote the call as text instead"):
+def test_preflight_explains_tool_calls_written_as_text_in_strict_mode():
+    llm, _ = make(reply('{"name": "ping", "arguments": {"ok": true}}'), strict_tool_calls=True)
+    with pytest.raises(
+        LLMError,
+        match="wrote the call as text instead.*disabled by --strict-tool-calls",
+    ):
         llm.preflight()
+
+
+def test_preflight_passes_for_tool_calls_written_as_text_and_says_so():
+    llm, http = make(reply('{"name": "ping", "arguments": {"ok": true}}'), error(404, "no"))
+    llm.preflight()
+    assert TEXT_CALLS_NOTE in llm.notes
+    assert http.requests[-1].url.endswith("/api/ps")
+
+
+def test_preflight_still_fails_on_prose():
+    llm, _ = make(reply("Sure! I would call ping now."))
+    with pytest.raises(LLMError, match="did not make a tool call") as exc:
+        llm.preflight()
+    assert "strict" not in str(exc.value)
 
 
 def test_small_context_window_fails_before_sending():
@@ -569,3 +590,146 @@ def test_docs_and_error_suggest_the_same_models():
     for doc in ("README.md", "CLAUDE.md"):
         text = (root / doc).read_text()
         assert all(f"`{m}`" in text for m in suggested), doc
+
+
+# --- tool calls written as text ---------------------------------------------------------------
+
+READ = '{"name": "read_file", "arguments": {"path": "app.py"}}'
+EDIT = (
+    '{"name": "edit_file", "arguments": {"path": "app.py", "old_string": "a", "new_string": "b"}}'
+)
+
+
+def text_call(text, **kw):
+    llm, _ = make(reply(text), **kw)
+    return llm, llm.complete(
+        system="s",
+        messages=[Message("user", text="go")],
+        tools=AGENT_TOOLS,
+        max_tokens=100,
+        temperature=None,
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        READ,
+        f"\n  {READ}  \n",
+        f"```json\n{READ}\n```",
+        f"```\n{READ}\n```",
+        f"<tool_call>\n{READ}\n</tool_call>",
+        READ.replace('{"path": "app.py"}', '"{\\"path\\": \\"app.py\\"}"'),  # string arguments
+    ],
+    ids=["bare", "whitespace", "json-fence", "plain-fence", "tool-call-tags", "string-arguments"],
+)
+def test_text_tool_call_is_parsed(text):
+    llm, r = text_call(text)
+    (c,) = r.tool_calls
+    assert (c.name, c.input, c.source) == ("read_file", {"path": "app.py"}, "parsed_from_text")
+    assert c.arguments_as_string == ("\\" in text)
+    assert c.id.startswith("call_") and c.input_error == ""
+    assert (r.stop_reason, r.text, r.multiple_text_tool_calls) == ("tool_use", "", 0)
+    assert TEXT_CALLS_NOTE in llm.notes
+    # replayed as a structured assistant tool call, not as text
+    (msg,) = to_openai([Message("assistant", tool_calls=r.tool_calls)])
+    assert msg["content"] == "" and msg["tool_calls"][0]["function"]["name"] == "read_file"
+    assert json.loads(msg["tool_calls"][0]["function"]["arguments"]) == {"path": "app.py"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"I will read the file first. {READ}",
+        f"{READ}\nThen I will edit it.",
+        f"Here you go:\n```json\n{READ}\n```",
+        READ.replace("read_file", "write_file"),  # not an offered tool
+        READ.replace("read_file", "Read_File"),
+        READ.replace('"app.py"', "42"),  # wrong type
+        READ.replace('"path"', '"file"'),  # unknown + missing required argument
+        '{"name": "read_file", "arguments": {}}',  # missing required argument
+        '{"name": "read_file", "arguments": {"path": null}}',
+        READ.replace('"app.py"}', '"app.py", "mode": "r"}'),  # unknown argument
+        READ.replace('"arguments"', '"parameters"'),
+        READ[:-1] + ', "id": "x"}',  # extra top-level key
+        '{"name": "read_file", "arguments": "path=app.py"}',  # string that is not JSON
+        '{"name": "read_file", "arguments": "[{\\"path\\": \\"a\\"}]"}',  # not one object
+        '{"name": "read_file", "arguments": "{\\"path\\": \\"a\\"} {}"}',  # two objects
+        '{"name": "read_file", "name": "edit_file", "arguments": {"path": "a"}}',  # duplicate
+        f"[{READ}]",
+        f"<tool_call>```json\n{READ}\n```</tool_call>",  # nested wrappers
+        f"```json\n{READ}\n",  # unclosed fence
+        f"```python\n{READ}\n```",
+        f"{READ}}}",
+        "",
+    ],
+)
+def test_text_that_is_not_exactly_one_valid_call_stays_text(text):
+    _, r = text_call(text)
+    assert r.tool_calls == [] and r.text == text
+    assert r.stop_reason == "end_turn" and r.multiple_text_tool_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("text", "count"),
+    [
+        (f"{READ}\n{EDIT}", 2),
+        (f"{READ}{READ}{READ}", 3),
+        (f"<tool_call>\n{READ}\n</tool_call>\n<tool_call>\n{EDIT}\n</tool_call>", 2),
+        (f"```json\n{READ}\n```\n```json\n{READ}\n```", 2),
+        (f"{READ}\n" + '{"name": "read_file", "arguments": {"path": 1}}', 2),  # not validated
+    ],
+)
+def test_several_text_calls_are_counted_not_run(text, count):
+    _, r = text_call(text)
+    assert r.tool_calls == [] and r.text == text and r.stop_reason == "end_turn"
+    assert r.multiple_text_tool_calls == count
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"First {READ} then {EDIT}",
+        f"{READ}\n" + '{"name": "nope", "arguments": {}}',
+        f"{READ}\n[1, 2]",
+        f"[{READ}, {EDIT}]",
+    ],
+)
+def test_several_objects_that_are_not_all_calls_are_plain_text(text):
+    assert count_text_tool_calls(text, AGENT_TOOLS) == 0
+
+
+def test_strict_mode_never_parses_text():
+    llm, r = text_call(READ, strict_tool_calls=True)
+    assert (r.tool_calls, r.text, r.stop_reason) == ([], READ, "end_turn")
+    _, r = text_call(f"{READ}\n{READ}", strict_tool_calls=True)
+    assert r.multiple_text_tool_calls == 0
+    assert TEXT_CALLS_NOTE not in llm.notes
+
+
+def test_structured_calls_win_over_text():
+    llm, _ = make(
+        reply(READ.replace("app.py", "other.py"), tool_calls=[tool_call()], finish="tool_calls")
+    )
+    r = complete(llm)
+    (c,) = r.tool_calls
+    assert (c.source, c.input) == ("structured", {"path": "app.py"})
+    assert r.text != "" and TEXT_CALLS_NOTE not in llm.notes
+
+
+def test_refusals_are_not_parsed():
+    llm, _ = make(reply(READ, finish="content_filter"))
+    r = llm.complete(
+        system="s",
+        messages=[Message("user", text="go")],
+        tools=AGENT_TOOLS,
+        max_tokens=9,
+        temperature=None,
+    )
+    assert (r.stop_reason, r.tool_calls) == ("refusal", [])
+
+
+def test_parser_functions_directly():
+    assert parse_text_tool_call(READ, []) is None  # nothing offered
+    assert parse_text_tool_call(READ, AGENT_TOOLS).name == "read_file"
+    assert count_text_tool_calls(READ, AGENT_TOOLS) == 0  # one call is not "several"
