@@ -63,11 +63,29 @@ apifix fix ... --provider openai-compat --base-url http://gpu-box.local:8000/v1 
   retries and `rejected` results. The verifier is the same, so a wrong fix is reported as such,
   never as verified.
 
+**Whole-file mode (recommended for small local models).** Models around 7B often cannot drive
+the tool loop, but can rewrite a file. `--edit-mode whole-file` uses no tools: each file with
+findings is sent in its own request (with the files already updated as read-only context), and
+the model returns the complete updated file in one code block. Before a file is written it must
+parse as Python (or as a dependency file), differ from the original when it has certain
+findings, and contain no placeholders such as `# ... rest unchanged`; a failing file gets its
+error back once. All files are then verified together exactly as in agent mode, and a failed
+verification starts the next attempt with the failing test output.
+
+```
+apifix fix path/to/repo --migration openai-v1 --provider openai-compat \
+    --model qwen2.5-coder:7b --edit-mode whole-file [--max-file-bytes 24000]
+```
+
+Files over the size budget (24,000 bytes by default, file plus context) are not sent and are
+listed in the report; their findings stay, so the fix is reported as incomplete. Works with any
+provider.
+
 **Hardware** (rough figures for 4-bit quantised models, Ollama's default):
 
 | Hardware | Starting model | Weights | Notes |
 |---|---|---|---|
-| 8 GB GPU, or 16 GB RAM CPU-only | `qwen2.5-coder:7b` | ~5 GB | Fast on a GPU; on CPU a job can take an hour. Tiny repos only |
+| 8 GB GPU, or 16 GB RAM CPU-only | `qwen2.5-coder:7b` | ~5 GB | Fast on a GPU; on CPU a job can take an hour. Tiny repos only; use `--edit-mode whole-file` |
 | 12-16 GB GPU, or 32 GB RAM / Apple Silicon | `qwen2.5-coder:14b` | ~9 GB | Noticeably better tool use |
 | 24 GB GPU, or 32-48 GB unified-memory Mac | `qwen2.5-coder:32b` | ~20 GB | Smallest size recommended for real repos |
 | 48 GB+ GPU, or 64 GB+ Mac | `llama3.3:70b` | ~40 GB | Best local quality, slow |

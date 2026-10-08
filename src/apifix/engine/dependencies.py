@@ -45,6 +45,41 @@ def is_dependency_file(relpath: str) -> bool:
     return False
 
 
+_STRUCTURED_FILES = {"pyproject.toml", "setup.py", "setup.cfg", "pipfile"}
+_STRICT_CLAUSE_RE = re.compile(r"^\s*(===|==|!=|~=|<=|>=|<|>)\s*[A-Za-z0-9][A-Za-z0-9.*+!_-]*\s*$")
+
+
+def dependency_file_problem(relpath: str, text: str) -> str | None:
+    """Why `text` is not a well-formed dependency file of its kind, or None. Stricter than
+    parse_dependency_file for requirements files, which it reads leniently: there every line
+    must be blank, a comment, an option (``-r``, ``-e``, ...), a URL, or a valid requirement."""
+    try:
+        parse_dependency_file(relpath, text)
+    except (ValueError, SyntaxError, configparser.Error) as exc:  # TOMLDecodeError: ValueError
+        return f"{type(exc).__name__}: {exc}"
+    if PurePosixPath(relpath).name.lower() in {
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "pipfile",
+    }:
+        return None
+    for i, line in enumerate(text.splitlines(), 1):
+        req = _strip_comment(line).split(";", 1)[0].strip()
+        if not req or req.startswith(("-", "git+", "http:", "https:", "file:")):
+            continue
+        m = _NAME_RE.match(req)
+        spec = m.group(3).strip() if m else ""
+        valid = m is not None and (
+            not spec
+            or spec.startswith("@")
+            or all(_STRICT_CLAUSE_RE.match(part) for part in spec.split(","))
+        )
+        if not valid:
+            return f"line {i} is not a valid requirement: {line.strip()!r}"
+    return None
+
+
 def parse_dependency_file(relpath: str, text: str) -> list[DeclaredDependency]:
     """Parse one dependency file. Raises ValueError/SyntaxError on malformed input."""
     name = PurePosixPath(relpath).name.lower()

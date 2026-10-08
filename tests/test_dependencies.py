@@ -7,6 +7,7 @@ import pytest
 from apifix.engine.dependencies import (
     allows,
     build_system_requires,
+    dependency_file_problem,
     entirely_below,
     is_dependency_file,
     parse_dependency_file,
@@ -237,3 +238,46 @@ def test_build_system_requires():
     ]
     assert build_system_requires(None, has_setup=True) == ["setuptools", "wheel"]
     assert build_system_requires(None, has_setup=False) == []
+
+
+# --- well-formedness (whole-file mode's check) ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "openai>=1.0,<2\npytest\n",
+        "# pinned\nopenai==1.3.0  # comment\n\n-r base.txt\n-e .\n",
+        "openai[datalib]>=1 ; python_version >= '3.8'\n",
+        "pkg @ https://example.com/pkg.whl\n",
+        "git+https://github.com/o/r.git\n",
+        "openai~=1.3\nnumpy!=1.25.0\n",
+        "",
+    ],
+)
+def test_well_formed_requirements(text):
+    assert dependency_file_problem("requirements.txt", text) is None
+
+
+@pytest.mark.parametrize(
+    ("text", "line"),
+    [
+        ("Here is the updated file:\nopenai>=1\n", 1),
+        ("openai>=1\n```\n", 2),
+        ("openai>=>1\n", 1),
+        ("openai>=1,\n", 1),
+        ("openai 1.0\n", 1),
+    ],
+)
+def test_malformed_requirements(text, line):
+    problem = dependency_file_problem("requirements.txt", text)
+    assert problem is not None and problem.startswith(f"line {line} is not a valid requirement")
+
+
+def test_structured_dependency_files_must_parse():
+    toml = '[project]\ndependencies = ["openai>=1"]\n'
+    assert dependency_file_problem("pyproject.toml", toml) is None
+    assert dependency_file_problem("pyproject.toml", "[project\n").startswith("TOMLDecodeError")
+    assert dependency_file_problem("setup.py", "setup(\n").startswith("SyntaxError")
+    problem = dependency_file_problem("setup.cfg", "install_requires = openai\n")
+    assert problem.startswith("MissingSectionHeaderError")

@@ -4,9 +4,9 @@ Opt-in: `pytest --local-llm -m local_llm -s` (add `--docker` for the full fix). 
 an Ollama server answers at $APIFIX_BASE_URL (default http://localhost:11434/v1) with the model
 $APIFIX_LOCAL_MODEL (default qwen2.5-coder:7b) installed. Free, but slow on CPU.
 
-The full-fix test only asserts that the job completes cleanly: a small local model may well not
-reach `verified`. Its verdict, attempts and token usage are printed (`-s`) and attached to the
-test report (`-rA` shows them) so results are visible.
+The full-fix tests (agent mode and whole-file mode) only assert that the job completes cleanly:
+a small local model may well not reach `verified`. Their verdict, attempts and token usage are
+printed (`-s`) and attached to the test report (`-rA` shows them) so results are visible.
 """
 
 from __future__ import annotations
@@ -53,8 +53,7 @@ def test_local_model_makes_tool_calls():
     assert client.local and client.cost(Usage(1000, 1000)) == 0.0
 
 
-@pytest.mark.docker
-def test_local_full_fix_completes(tmp_path, record_property, capsys):
+def _run_fix(tmp_path, edit_mode: str):
     _docker, why = DockerCLI().available()
     if not _docker:
         pytest.skip(why)
@@ -64,11 +63,21 @@ def test_local_full_fix_completes(tmp_path, record_property, capsys):
         "openai-v1",
         llm=llm(),
         sandbox=Sandbox(SandboxConfig(install_timeout_s=600, test_timeout_s=180, memory="1g")),
-        config=AgentConfig(max_cost_usd=0.0, max_retries=2, max_tokens_per_job=1_000_000),
+        config=AgentConfig(
+            max_cost_usd=0.0,
+            max_retries=2,
+            max_tokens_per_job=1_000_000,
+            edit_mode=edit_mode,
+        ),
     )
     (tmp_path / "trajectory.json").write_text(json.dumps(result.trajectory, indent=2))
+    return result
+
+
+def _report(result, tmp_path, record_property, capsys, **extra):
     summary = {
         "model": MODEL,
+        "edit_mode": result.trajectory["job"]["edit_mode"],
         "outcome": result.outcome,
         "verdict": result.verification.verdict if result.verification else None,
         "attempts": result.attempts,
@@ -77,6 +86,7 @@ def test_local_full_fix_completes(tmp_path, record_property, capsys):
         "output_tokens": result.usage.output_tokens,
         "reason": result.reason,
         "trajectory": str(tmp_path / "trajectory.json"),
+        **extra,
     }
     for key, value in summary.items():
         record_property(key, value)
@@ -88,6 +98,29 @@ def test_local_full_fix_completes(tmp_path, record_property, capsys):
         ("provider_error", "preflight")
     ), result.reason
     assert result.trajectory["attempts"], "no attempt was made"
-    assert any(a["tool_calls"] for a in result.trajectory["attempts"]), "no tool calls"
     if result.outcome == "verified":
         assert "chat.completions" in result.diff
+
+
+@pytest.mark.docker
+def test_local_full_fix_completes(tmp_path, record_property, capsys):
+    result = _run_fix(tmp_path, "agent")
+    _report(result, tmp_path, record_property, capsys)
+    assert any(a["tool_calls"] for a in result.trajectory["attempts"]), "no tool calls"
+
+
+@pytest.mark.docker
+def test_local_whole_file_fix_completes(tmp_path, record_property, capsys):
+    result = _run_fix(tmp_path, "whole-file")
+    attempts = result.trajectory["attempts"]
+    files = [f for a in attempts for f in a["files"]]
+    _report(
+        result,
+        tmp_path,
+        record_property,
+        capsys,
+        files=[(f["path"], [r["parse"] for r in f["replies"]], f["accepted"]) for f in files],
+        nudges=[n["kind"] for a in attempts for n in a["nudges"]],
+    )
+    assert files, "no file was sent"
+    assert all(f["replies"] and f["replies"][0]["parse"] for f in files), "no parse outcome"

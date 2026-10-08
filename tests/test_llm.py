@@ -271,3 +271,19 @@ def test_api_key_comes_from_the_host_environment_only(monkeypatch):
     AnthropicLLM("claude-opus-5-5")
     assert seen["api_key"] == "sk-from-env"
     assert llm_anthropic.API_KEY_ENV == "ANTHROPIC_API_KEY"
+
+
+def test_no_tools_key_when_no_tools_are_offered():
+    llm = AnthropicLLM("claude-opus-5-5", client=FakeClient())
+    kw = llm.request(
+        system="s", messages=[Message("user", text="hi")], tools=[], max_tokens=9, temperature=None
+    )
+    assert "tools" not in kw
+    kw = llm.request(
+        system="s",
+        messages=[Message("user", text="hi")],
+        tools=TOOLS,
+        max_tokens=9,
+        temperature=None,
+    )
+    assert [t["name"] for t in kw["tools"]] == ["read_file"]

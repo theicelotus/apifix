@@ -97,12 +97,13 @@ class AnthropicLLM:
             "max_tokens": max_tokens,
             "system": [{"type": "text", "text": system}],
             "messages": [to_anthropic(m) for m in messages],
-            "tools": [
-                {"name": t.name, "description": t.description, "input_schema": t.input_schema}
-                for t in tools
-            ],
             "cache_control": {"type": "ephemeral"},  # cache the growing conversation prefix
         }
+        if tools:  # whole-file mode offers none
+            kwargs["tools"] = [
+                {"name": t.name, "description": t.description, "input_schema": t.input_schema}
+                for t in tools
+            ]
         info = self.info
         if self.effort and info and info.effort:
             kwargs["output_config"] = {"effort": self.effort}

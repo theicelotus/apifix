@@ -55,7 +55,7 @@ TRUNCATION_RATIO = 0.7  # room for the reply when checking against the context w
 
 # Starting points by hardware (4-bit quantised, as Ollama pulls by default).
 MODEL_SUGGESTIONS = (
-    "8 GB GPU or 16 GB RAM: qwen2.5-coder:7b (tiny repos only); "
+    "8 GB GPU or 16 GB RAM: qwen2.5-coder:7b (tiny repos only; use --edit-mode whole-file); "
     "12-16 GB GPU or 32 GB RAM / Apple Silicon: qwen2.5-coder:14b; "
     "24 GB GPU or 32-48 GB Mac: qwen2.5-coder:32b (smallest for real repos); "
     "48 GB+ GPU or 64 GB+ Mac: llama3.3:70b"
@@ -306,7 +306,11 @@ class OpenAICompatLLM:
         body: dict[str, Any] = {
             "model": self.model,
             "messages": [{"role": "system", "content": system}] + to_openai(messages),
-            "tools": [
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+        if tools:  # whole-file mode offers none; some servers reject tool_choice without tools
+            body["tools"] = [
                 {
                     "type": "function",
                     "function": {
@@ -316,11 +320,8 @@ class OpenAICompatLLM:
                     },
                 }
                 for t in tools
-            ],
-            "tool_choice": "auto",
-            "max_tokens": max_tokens,
-            "stream": False,
-        }
+            ]
+            body["tool_choice"] = "auto"
         if temperature is not None:
             body["temperature"] = temperature
         return body
@@ -341,7 +342,9 @@ class OpenAICompatLLM:
             max_tokens=max_tokens,
             temperature=temperature,
         )
-        estimate = len(json.dumps(body["messages"]) + json.dumps(body["tools"])) // CHARS_PER_TOKEN
+        estimate = (
+            len(json.dumps(body["messages"]) + json.dumps(body.get("tools", []))) // CHARS_PER_TOKEN
+        )
         if self.context_window and estimate + CONTEXT_HEADROOM_TOKENS > self.context_window:
             raise LLMError(
                 f"the conversation (~{estimate:,} tokens) no longer fits the server's context "
@@ -427,8 +430,24 @@ class OpenAICompatLLM:
 
     # --- preflight --------------------------------------------------------------------------
 
-    def preflight(self) -> None:
-        """Fail fast if the model cannot make tool calls; learn Ollama's context window."""
+    def preflight(self, *, require_tools: bool = True) -> None:
+        """Fail fast if the model cannot make tool calls (unless `require_tools` is False, as in
+        whole-file mode: then one tiny plain request checks the server and loads the model);
+        learn Ollama's context window."""
+        if not require_tools:
+            body = self.request_body(
+                system="You are a connectivity check.",
+                messages=[Message("user", text="Reply with OK.")],
+                tools=[],
+                max_tokens=5,
+                temperature=0.0,
+            )
+            status, data = self._call("POST", "/chat/completions", body)
+            if status != 200:
+                raise self._error(status, data)
+            self._parse(data, body, [])
+            self._read_context_window()
+            return
         body = self.request_body(
             system="You are a connectivity check. Always answer by calling the ping tool.",
             messages=[Message("user", text="Call the ping tool with ok=true.")],
@@ -454,6 +473,9 @@ class OpenAICompatLLM:
                 f"model {self.model} did not make a tool call when asked to.{detail} Use a "
                 f"tool-capable model. {MODEL_SUGGESTIONS}"
             )
+        self._read_context_window()
+
+    def _read_context_window(self) -> None:
         self.context_window = self._ollama_context_window()
         if self.context_window:
             self.notes.append(f"server context window: {self.context_window:,} tokens")

@@ -29,7 +29,8 @@ dashboard. Do not build these until asked.
 src/apifix/
   cli.py              `apifix scan <path> --migration openai-v1 [--json]`,
                       `apifix fix <path> --migration openai-v1 [--model] [--max-cost] [--out]`,
-                      (openai-compat: `--base-url`, `--strict-tool-calls`),
+                      (openai-compat: `--base-url`, `--strict-tool-calls`;
+                      `--edit-mode agent|whole-file`, `--max-file-bytes`),
                       `apifix cleanup [--dry-run]`
   api/                FastAPI app (later)
   worker/             background jobs (later)
@@ -62,7 +63,10 @@ src/apifix/
                       tool calls written as reply text (`--strict-tool-calls` disables)
     agent_tools.py    the model's tools: read_file, list_files, search, edit_file (no shell)
     agent.py          fix loop: propose -> verify (cached baseline) -> feed reasons back ->
-                      retry; limits; JSON trajectory; diff + report
+                      retry; limits; JSON trajectory; diff + report; both edit modes
+    whole_file.py     whole-file mode (no tools, one file per request): file selection, prompts,
+                      code-block parsing, pre-apply checks (syntax, dependency file, changed,
+                      abbreviation)
 benchmark/            real repos + scoring
 docs/plans/           approved plans, one file per step (request, plan, amendments)
 tests/                pytest; fixtures/ holds realistic sample code
@@ -210,13 +214,41 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
 - The search tool runs the model's regular expression in-process (bounded file and line sizes,
   but no regex timeout).
 
+## Known limitations (whole-file mode)
+
+- Recommended for small local models (7B-14B) that cannot drive the tool loop; agent mode stays
+  the default and the better choice for capable models.
+- Only files with scanner findings are sent, one per request, each in a fresh conversation.
+  Edits the migration needs elsewhere (a helper module, a conftest) cannot be made.
+- The file plus its read-only context (the other files already changed in the working copy)
+  share one byte budget, `whole_file_max_bytes` (24,000 by default, `--max-file-bytes`). Files
+  over it are not sent (listed in the report and `job.skipped_files`), so their findings remain
+  and the verifier rejects the fix as incomplete. Context files that do not fit are left out
+  (recorded per request as `context_left_out`).
+- The reply must hold exactly one fenced code block (CommonMark fences: 3+ backticks or tildes;
+  a file containing ``` lines is sent in a longer fence). Prose around it is ignored. Zero or
+  several blocks get "Return the complete updated file in exactly one code block." (max 3 per
+  attempt); a reply that hit the output limit is not nudged (the file fails).
+- Pre-apply checks: `ast.parse` for Python; `dependency_file_problem` for dependency files
+  (strict for requirements files); "differs from the original" only for files with a [certain]
+  finding; no elision placeholders (`# ... rest unchanged`, bare `...`) absent from the
+  original, and at least half the original's lines when it has 20 or more. Placeholder
+  detection is a regex over comment lines, so an unusual phrasing passes and a genuine new
+  comment like "# rest of the payload" can be rejected (one in-file retry softens this).
+- A failing candidate gets its error back once in that file's conversation (`check_retry`);
+  a second failure ends the attempt (`check_failed`, not verified). The next attempt resends
+  that file first (with the error, not the rejected text) and then the files after it.
+- After a failed verification every file is resent with the verifier's reasons and failing test
+  output (at most 10 tests, 2,000 characters each, 8,000 in total).
+- No new, renamed or deleted files; files must be UTF-8.
+
 ## Local / OpenAI-compatible models
 
 Hardware for local models (4-bit quantised; add a few GB of KV cache for a 32k context):
 
 | Hardware | Starting model | Notes |
 |---|---|---|
-| 8 GB GPU or 16 GB RAM (CPU) | `qwen2.5-coder:7b` (~5 GB) | Tiny repos only; CPU runs take up to an hour |
+| 8 GB GPU or 16 GB RAM (CPU) | `qwen2.5-coder:7b` (~5 GB) | Tiny repos only, `--edit-mode whole-file`; CPU runs take up to an hour |
 | 12-16 GB GPU or 32 GB RAM / Apple Silicon | `qwen2.5-coder:14b` (~9 GB) | Better tool use |
 | 24 GB GPU or 32-48 GB Mac | `qwen2.5-coder:32b` (~20 GB) | Smallest for real repos |
 | 48 GB+ GPU or 64 GB+ Mac | `llama3.3:70b` (~40 GB) | Best local quality |

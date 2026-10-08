@@ -733,3 +733,42 @@ def test_parser_functions_directly():
     assert parse_text_tool_call(READ, []) is None  # nothing offered
     assert parse_text_tool_call(READ, AGENT_TOOLS).name == "read_file"
     assert count_text_tool_calls(READ, AGENT_TOOLS) == 0  # one call is not "several"
+
+
+# --- whole-file mode: no tools ----------------------------------------------------------------
+
+
+def test_no_tools_or_tool_choice_without_tools():
+    llm, http = make(reply("```python\nx = 1\n```"))
+    r = llm.complete(
+        system="s",
+        messages=[Message("user", text="go")],
+        tools=[],
+        max_tokens=50,
+        temperature=None,
+    )
+    body = http.body()
+    assert "tools" not in body and "tool_choice" not in body
+    assert (r.text, r.tool_calls, r.stop_reason) == ("```python\nx = 1\n```", [], "end_turn")
+
+
+def test_preflight_without_tools_sends_a_plain_request():
+    llm, http = make(
+        reply("OK"),
+        HTTPResponse(
+            200,
+            json.dumps({"models": [{"name": "qwen2.5-coder:7b", "context_length": 8192}]}).encode(),
+        ),
+    )
+    llm.preflight(require_tools=False)  # a plain reply is fine: no tool call needed
+    body = http.body(0)
+    assert "tools" not in body and body["max_tokens"] == 5
+    assert body["messages"][-1]["content"] == "Reply with OK."
+    assert llm.context_window == 8192
+    assert TEXT_CALLS_NOTE not in llm.notes
+
+
+def test_preflight_without_tools_still_reports_server_errors():
+    llm, _ = make(error(404, "model 'nope' not found"), error(404, "x"))
+    with pytest.raises(LLMError, match="not found"):
+        llm.preflight(require_tools=False)

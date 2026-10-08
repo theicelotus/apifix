@@ -2,6 +2,7 @@
 
 apifix scan <path> --migration openai-v1 [--json]
 apifix fix <path> --migration openai-v1 [--model M] [--max-cost USD] [--out DIR]
+    [--edit-mode agent|whole-file] [--max-file-bytes N]
 apifix fix <path> --migration openai-v1 --provider openai-compat --model M [--base-url URL]
     [--strict-tool-calls]
 apifix cleanup [--dry-run]      remove containers/temp dirs left by interrupted runs
@@ -53,6 +54,19 @@ def main(argv: list[str] | None = None) -> int:
         help="openai-compat: env var holding the API key (default: APIFIX_LLM_API_KEY)",
     )
     p_fix.add_argument("--timeout", type=float, help="seconds per LLM request (default 600)")
+    p_fix.add_argument(
+        "--edit-mode",
+        choices=["agent", "whole-file"],
+        default="agent",
+        help="agent: the model edits through tools (default). whole-file: no tools; the model "
+        "rewrites one affected file per request (recommended for small local models)",
+    )
+    p_fix.add_argument(
+        "--max-file-bytes",
+        type=int,
+        help="whole-file: byte budget for one file plus its read-only context; larger files "
+        "are not sent (default 24000)",
+    )
     p_fix.add_argument(
         "--strict-tool-calls",
         action="store_true",
@@ -109,6 +123,12 @@ def _fix(args: argparse.Namespace) -> int:
     if not Path(args.path).is_dir():
         print(f"apifix: not a directory: {args.path}", file=sys.stderr)
         return EXIT_USAGE
+    if args.max_file_bytes is not None and args.edit_mode != "whole-file":
+        print("apifix: --max-file-bytes only applies to --edit-mode whole-file", file=sys.stderr)
+        return EXIT_USAGE
+    if args.max_file_bytes is not None and args.max_file_bytes <= 0:
+        print("apifix: --max-file-bytes must be positive", file=sys.stderr)
+        return EXIT_USAGE
     options = {
         key: value
         for key, value in (
@@ -125,7 +145,13 @@ def _fix(args: argparse.Namespace) -> int:
         if notice:
             print(notice, file=sys.stderr)
         max_cost = None if args.no_cost_limit else args.max_cost
-        config = AgentConfig(max_cost_usd=max_cost, max_retries=args.max_retries)
+        whole_file = {"whole_file_max_bytes": args.max_file_bytes} if args.max_file_bytes else {}
+        config = AgentConfig(
+            max_cost_usd=max_cost,
+            max_retries=args.max_retries,
+            edit_mode=args.edit_mode,
+            **whole_file,
+        )
         result = fix(args.path, args.migration, llm=llm, sandbox=Sandbox(), config=config)
     except (LLMError, ValueError) as exc:
         print(f"apifix: {exc}", file=sys.stderr)
