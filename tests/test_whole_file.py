@@ -94,7 +94,44 @@ def test_valid_changed_python_passes():
         "dependencies": "n/a",
         "changed": "ok",
         "abbreviation": "ok",
+        "undefined_names": "ok",
+        "mock_targets": "n/a",  # not a test file
     }
+
+
+def test_undefined_names_and_mock_targets_are_checked_and_reported_together():
+    original = 'from unittest import mock\n\n@mock.patch("app.ask")\ndef test_a(m):\n    pass\n'
+    candidate = (
+        'from unittest import mock\n\n@mock.patch("app.client.create")\n'
+        "def test_a(m):\n    m.return_value = SimpleNamespace()\n"
+    )
+    repo = {"app.py": "import openai\n\ndef ask():\n    client = openai.OpenAI()\n"}
+    r = check_candidate(
+        "tests/test_app.py", original, candidate, required=False, read_module=repo.get
+    )
+    undefined = (
+        "line 5: 'SimpleNamespace' is used but never imported or defined "
+        "(add: from types import SimpleNamespace)"
+    )
+    target = (
+        "mock target 'app.client.create': app.py has no top-level name 'client' "
+        "(its top-level names: ask, openai). Patch a name that exists in app.py"
+    )
+    assert r.errors == [undefined, target]
+    assert (r.checks["undefined_names"], r.checks["mock_targets"]) == (undefined, target)
+
+
+def test_new_checks_do_not_apply_when_they_cannot():
+    # a syntax error: neither runs
+    r = check_candidate("tests/test_app.py", APP, "def f(:\n", required=True, read_module={}.get)
+    assert (r.checks["undefined_names"], r.checks["mock_targets"]) == ("n/a", "n/a")
+    # a dependency file: neither runs
+    r = check_candidate("requirements.txt", "openai==0.28\n", "openai>=1\n", required=True)
+    assert (r.checks["undefined_names"], r.checks["mock_targets"]) == ("n/a", "n/a")
+    # a test file without a module reader: mock targets are not checked
+    target = 'from unittest import mock\n\n@mock.patch("app.nope")\ndef test_a(m):\n    pass\n'
+    r = check_candidate("tests/test_app.py", APP, target, required=False)
+    assert r.ok and r.checks["mock_targets"] == "n/a" and r.checks["undefined_names"] == "ok"
 
 
 def test_syntax_error_is_reported_with_its_line():

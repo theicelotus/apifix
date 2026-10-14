@@ -17,6 +17,7 @@ import json
 import shutil
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -111,6 +112,7 @@ class Attempt:
     result: str = ""  # a verdict, "no_changes", "check_failed" (whole-file) or "aborted"
     usage: Usage = Usage()
     cost_usd: float = 0.0
+    verification_duration_s: float = 0.0  # wall clock of verify(), sandbox runs included
     # contents of every changed file at the end of the attempt, to restore the best one
     snapshot: dict[str, str] = field(default_factory=dict)
 
@@ -125,6 +127,7 @@ class Attempt:
             "files": self.files,
             "diff": self.diff,
             "verification": self.verification.to_dict() if self.verification else None,
+            "verification_duration_s": round(self.verification_duration_s, 3),
             "usage": asdict(self.usage),
             "cost_usd": round(self.cost_usd, 6),
         }
@@ -259,6 +262,10 @@ class _Job:
         self.wf_skipped: list[dict[str, object]] = []
         self.wf_pending: list[str] = []
         self.wf_feedback: dict[str, str] = {}
+        # wall-clock seconds: LLM requests, and sandbox work (baseline run, verify() calls)
+        self.llm_seconds = 0.0
+        self.sandbox_seconds = 0.0
+        self.baseline_seconds = 0.0
 
     # --- budget -----------------------------------------------------------------------------
 
@@ -311,6 +318,7 @@ class _Job:
         """One request; the reply is appended to `messages` (default: the agent conversation)."""
         messages = self.messages if messages is None else messages
         self._check_budget_before_call(messages)
+        start = time.monotonic()
         try:
             response = self.llm.complete(
                 system=self.system,
@@ -321,6 +329,9 @@ class _Job:
             )
         except LLMError as exc:
             raise _Abort("provider_error", str(exc)) from exc
+        finally:
+            duration = time.monotonic() - start
+            self.llm_seconds += duration
         cost = self.llm.cost(response.usage, response.model)
         if cost is None and self.config.max_cost_usd is not None:
             cost = 0.0
@@ -338,6 +349,7 @@ class _Job:
                 "usage": asdict(response.usage),
                 "cost_usd": round(cost or 0.0, 6),
                 "tool_calls": len(response.tool_calls),
+                "duration_s": round(duration, 3),
             }
             | ({"refusal": response.refusal} if response.refusal else {})
         )
@@ -511,7 +523,13 @@ class _Job:
                 entry["error"] = _PARSE_ERRORS[parsed.outcome]
                 break
             candidate = as_file(parsed.body, original)
-            result = check_candidate(path, original, candidate, required=required)
+            result = check_candidate(
+                path,
+                original,
+                candidate,
+                required=required,
+                read_module=self._working_copy_reader(path, candidate),
+            )
             reply["checks"] = result.checks
             if not result.ok:
                 error = "; ".join(result.errors)
@@ -537,6 +555,24 @@ class _Job:
             break
         entry["messages"] = [_message_dict(m) for m in messages]
         return entry
+
+    def _working_copy_reader(self, path: str, candidate: str) -> Callable[[str], str | None]:
+        """Repo files as they are now in the working copy (files accepted so far written),
+        with `candidate` standing in for `path`. None for files that do not exist."""
+        root = self.work.resolve()
+
+        def read(rel: str) -> str | None:
+            if rel == path:
+                return candidate
+            target = (root / rel).resolve()
+            if not target.is_relative_to(root) or not target.is_file():
+                return None
+            try:
+                return target.read_bytes().decode("utf-8")
+            except (OSError, UnicodeDecodeError):
+                return None
+
+        return read
 
     def _text_tool_calls(self) -> bool:
         """The provider has parsed tool calls from this model's reply text (openai-compat,
@@ -586,7 +622,10 @@ class _Job:
         if not self.whole_file and self._text_tool_calls():
             self.system += tool_call_example(self.findings)
             self.tool_call_example = True
+        start = time.monotonic()
         self.baseline = self.sandbox.run(self.repo)
+        self.baseline_seconds = time.monotonic() - start
+        self.sandbox_seconds += self.baseline_seconds
         if self.baseline.status == "error" and self.baseline.reason.startswith("docker not usable"):
             return "aborted", f"sandbox unavailable before any LLM call: {self.baseline.reason}"
 
@@ -618,6 +657,7 @@ class _Job:
                 continue
             changes = diff_trees(self.repo, self.work)
             attempt.diff = unified_diff(self.repo, self.work, changes)
+            start = time.monotonic()
             attempt.verification = verify(
                 self.repo,
                 self.work,
@@ -626,6 +666,8 @@ class _Job:
                 baseline=self.baseline,
                 config=self.config.verifier,
             )
+            attempt.verification_duration_s = time.monotonic() - start
+            self.sandbox_seconds += attempt.verification_duration_s
             attempt.result = attempt.verification.verdict
             attempt.snapshot = self._snapshot()
             if attempt.result in ("verified", "verified_weak"):
@@ -687,6 +729,7 @@ class _Job:
             },
             "findings": [asdict(f) for f in self.findings],
             "baseline": run_summary(self.baseline) if self.baseline else None,
+            "baseline_duration_s": round(self.baseline_seconds, 3),
             "system_prompt": self.system,
             "tools": [asdict(t) for t in self.tools],
             "messages": [_message_dict(m) for m in self.messages],
@@ -696,6 +739,10 @@ class _Job:
             "reason": reason,
             "usage": asdict(self.usage),
             "cost_usd": round(self.cost, 6),
+            "timing": {
+                "llm_s": round(self.llm_seconds, 3),
+                "sandbox_s": round(self.sandbox_seconds, 3),
+            },
         }
 
 
@@ -711,7 +758,31 @@ def _message_dict(m: Message) -> dict[str, Any]:
     return {k: v for k, v in d.items() if v not in (None, "", [])}
 
 
-def report_markdown(result_outcome: Outcome, reason: str, job: _Job, chosen: Attempt | None):
+def _seconds(s: float) -> str:
+    return f"{s:,.0f} s" if s >= 10 else f"{s:.1f} s"
+
+
+def time_line(job: _Job, total_s: float) -> str:
+    """LLM time vs sandbox time (baseline run and verifications), in one report line."""
+    responses = sum(len(a.responses) for a in job.attempts)
+    verifications = sum(a.verification is not None for a in job.attempts)
+    sandbox = "baseline" if job.baseline is not None else "no runs"
+    if verifications:
+        sandbox += f" and {verifications} verification{'s' if verifications > 1 else ''}"
+    return (
+        f"- Time: {_seconds(total_s)} total; LLM {_seconds(job.llm_seconds)} ({responses} "
+        f"response{'' if responses == 1 else 's'}); sandbox {_seconds(job.sandbox_seconds)} "
+        f"({sandbox})"
+    )
+
+
+def report_markdown(
+    result_outcome: Outcome,
+    reason: str,
+    job: _Job,
+    chosen: Attempt | None,
+    duration_s: float | None = None,
+):
     title = {
         "verified": "Verified",
         "verified_weak": "Verified, with weak evidence",
@@ -731,6 +802,8 @@ def report_markdown(result_outcome: Outcome, reason: str, job: _Job, chosen: Att
         f"- Edit mode: {job.config.edit_mode}",
         f"- Tokens: {job.usage.total:,}; cost: ${job.cost:.2f}",
     ]
+    if duration_s is not None:
+        lines.append(time_line(job, duration_s))
     answered = sorted({r["model"] for a in job.attempts for r in a.responses})
     if answered and answered != [job.llm.model]:
         lines.append(f"- Models that answered: {', '.join(f'`{m}`' for m in answered)}")
@@ -805,13 +878,14 @@ def fix(
         chosen = job.best_attempt() if outcome not in ("aborted", "no_findings") else None
         diff = unified_diff(original, work)
         trajectory = job.trajectory(outcome, reason, chosen)
-        trajectory["duration_s"] = round(time.monotonic() - start, 3)
+        duration = time.monotonic() - start
+        trajectory["duration_s"] = round(duration, 3)
         return FixResult(
             outcome=outcome,
             reason=reason,
             diff=diff,
             verification=chosen.verification if chosen else None,
-            report_markdown=report_markdown(outcome, reason, job, chosen),
+            report_markdown=report_markdown(outcome, reason, job, chosen, duration),
             trajectory=trajectory,
             attempts=len(job.attempts),
             usage=job.usage,

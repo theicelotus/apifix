@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import re
 import shutil
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -29,6 +30,8 @@ from apifix.engine.migrations import get_migration
 from apifix.engine.sandbox import SandboxResult
 from apifix.engine.scanner import scan
 from apifix.engine.test_results import FileCoverage
+from tests.integration.tiny_repo import ORIGINAL as TINY
+from tests.test_code_checks import LIVE_APP, LIVE_TARGET, LIVE_TESTS, LIVE_UNDEFINED
 from tests.test_verifier import (
     APP_NEW,
     APP_OLD,
@@ -1006,9 +1009,13 @@ def test_whole_file_migrates_each_file_in_its_own_request(repo):
                 "dependencies": "n/a",
                 "changed": "ok",
                 "abbreviation": "ok",
+                "undefined_names": "ok",
+                "mock_targets": "n/a",  # not a test file
             },
         }
     ]
+    tests_checks = attempt["files"][2]["replies"][0]["checks"]
+    assert (tests_checks["undefined_names"], tests_checks["mock_targets"]) == ("ok", "ok")
     assert app["change_required"] is True and app["bytes_sent"] == len(APP_OLD.encode())
     assert app["messages"][0]["role"] == "user" and app["messages"][1]["role"] == "assistant"
     assert attempt["files"][2]["context_files"] == ["requirements.txt", "app.py"]
@@ -1191,6 +1198,77 @@ def test_rejections_stop_at_the_attempt_limit(repo):
     result = wf(repo, llm, max_retries=1)
     assert result.outcome == "rejected" and len(result.trajectory["attempts"]) == 2
     assert llm.script == []
+
+
+def test_live_run_test_file_bugs_go_back_through_the_check_retry(tmp_path):
+    # Replays qwen2.5-coder-7b's live run on the tiny repo: app.py creates the client inside
+    # ask(), and the tests use SimpleNamespace without importing it and patch app.client.
+    tiny = write_tree(tmp_path / "tiny", TINY)
+    fixed_tests = "from types import SimpleNamespace\n" + LIVE_TESTS.replace(
+        "app.client.chat.completions.create", "app.openai.OpenAI"
+    )
+    llm = FakeLLM([block(REQS_NEW, ""), block(LIVE_APP), block(LIVE_TESTS), block(fixed_tests)])
+    passing = run(("tests.test_app::test_ask", "passed"))
+    result = wf(tiny, llm, JudgingSandbox(judge=lambda tree: passing), max_retries=0)
+    (attempt,) = result.trajectory["attempts"]
+    (nudge,) = attempt["nudges"]
+    assert (nudge["kind"], nudge["file"]) == ("check_retry", "tests/test_app.py")
+    assert nudge["error"] == f"{LIVE_UNDEFINED}; {LIVE_TARGET}"
+    assert nudge["message"] == (
+        f"The updated tests/test_app.py was rejected: {LIVE_UNDEFINED}; {LIVE_TARGET}. Return "
+        "the complete corrected file in exactly one code block."
+    )
+    convo = llm.requests[3]  # the retry continues the test file's own conversation
+    assert [m.role for m in convo] == ["user", "assistant", "user"]
+    assert convo[2].text == nudge["message"]
+    tests_entry = attempt["files"][2]
+    first, second = (r["checks"] for r in tests_entry["replies"])
+    assert (first["undefined_names"], first["mock_targets"]) == (LIVE_UNDEFINED, LIVE_TARGET)
+    assert (second["undefined_names"], second["mock_targets"]) == ("ok", "ok")
+    assert tests_entry["accepted"] and attempt["verification"] is not None
+    assert '+@mock.patch("app.openai.OpenAI")' in result.diff
+
+
+def test_a_second_failure_of_the_new_checks_fails_the_attempt(tmp_path):
+    tiny = write_tree(tmp_path / "tiny", TINY)
+    llm = FakeLLM([block(REQS_NEW, ""), block(LIVE_APP), block(LIVE_TESTS), block(LIVE_TESTS)])
+    result = wf(tiny, llm, max_retries=0)
+    (attempt,) = result.trajectory["attempts"]
+    assert attempt["result"] == "check_failed" and attempt["verification"] is None
+    assert attempt["files"][2]["error"] == f"{LIVE_UNDEFINED}; {LIVE_TARGET}"
+
+
+def test_timing_is_recorded_and_reported(repo):
+    llm, sandbox = FakeLLM(list(GOOD)), JudgingSandbox()
+    sandbox.baseline = judge(repo)
+    sandbox.baseline.duration_s = 12.5
+    result = wf(repo, llm, sandbox)
+    t = result.trajectory
+    (attempt,) = t["attempts"]
+    assert all(isinstance(r["duration_s"], float) for r in attempt["responses"])
+    assert t["baseline"]["duration_s"] == 12.5  # the sandbox's own figure for the run
+    assert set(attempt["verification"]["runs"]["fixed"]) >= {"duration_s"}
+    assert attempt["verification_duration_s"] >= 0 and t["baseline_duration_s"] >= 0
+    timing = t["timing"]
+    assert set(timing) == {"llm_s", "sandbox_s"}
+    assert timing["llm_s"] == pytest.approx(
+        sum(r["duration_s"] for r in attempt["responses"]), abs=0.01
+    )
+    assert timing["sandbox_s"] >= t["baseline_duration_s"]
+    (line,) = [x for x in result.report_markdown.splitlines() if x.startswith("- Time: ")]
+    assert re.fullmatch(
+        r"- Time: [\d.,]+ s total; LLM [\d.,]+ s \(3 responses\); sandbox [\d.,]+ s "
+        r"\(baseline and 1 verification\)",
+        line,
+    ), line
+
+
+def test_agent_mode_records_response_timing_too(repo):
+    llm = FakeLLM([tools(FIX_APP, FIX_REQS, FIX_TESTS), done()])
+    result = go(repo, llm)
+    responses = result.trajectory["attempts"][0]["responses"]
+    assert len(responses) == 2 and all("duration_s" in r for r in responses)
+    assert "(2 responses); sandbox" in result.report_markdown
 
 
 def test_files_over_the_size_limit_are_not_sent(repo):

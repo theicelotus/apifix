@@ -195,6 +195,7 @@ def run_summary(run: SandboxResult) -> dict:
         "image": run.image,
         "install_method": run.install_method,
         "lockfile_applied": run.lockfile_applied,
+        "duration_s": round(run.duration_s, 3),
     }
 
 

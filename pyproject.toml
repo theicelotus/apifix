@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Automatically fix Python code broken by API/library breaking changes, verified in a sandbox."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["pyflakes>=3.2"]
 
 [project.optional-dependencies]
 anthropic = ["anthropic>=1.11"]

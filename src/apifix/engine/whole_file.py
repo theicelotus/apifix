@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from apifix.engine.code_checks import mock_target_problems, undefined_names
 from apifix.engine.dependencies import dependency_file_problem, is_dependency_file
 from apifix.engine.migrations import Migration
 from apifix.engine.models import CERTAIN, Finding
@@ -285,10 +286,19 @@ def _placeholder(candidate: str, original: str) -> str | None:
     return None
 
 
-def check_candidate(path: str, original: str, candidate: str, *, required: bool) -> CheckResult:
+def check_candidate(
+    path: str,
+    original: str,
+    candidate: str,
+    *,
+    required: bool,
+    read_module: Callable[[str], str | None] | None = None,
+) -> CheckResult:
     """Syntax (Python files), well-formedness (dependency files), "differs from the original"
-    (only when `required`), and abbreviation (placeholders, or under half the original's lines
-    when it has at least MIN_LINES_FOR_LENGTH_CHECK)."""
+    (only when `required`), abbreviation (placeholders, or under half the original's lines
+    when it has at least MIN_LINES_FOR_LENGTH_CHECK), names used but never defined (Python
+    files), and mock targets missing from repo modules (test files; `read_module(relpath)`
+    returns the working copy's text of a repo file, or None)."""
     checks: dict[str, str] = {}
     errors: list[str] = []
 
@@ -330,4 +340,12 @@ def check_candidate(path: str, original: str, candidate: str, *, required: bool)
     elif abbreviated:
         abbreviated += "; return every line of the file"
     record("abbreviation", abbreviated)
+
+    python = path.endswith(".py") and not syntax
+    names = undefined_names(path, original, candidate) if python else []
+    record("undefined_names", "; ".join(names) or None, python)
+
+    mocks = python and read_module is not None and is_test_file(path)
+    targets = mock_target_problems(original, candidate, read_module) if mocks else []
+    record("mock_targets", "; ".join(targets) or None, mocks)
     return CheckResult(errors, checks)

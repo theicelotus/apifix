@@ -68,8 +68,9 @@ the tool loop, but can rewrite a file. `--edit-mode whole-file` uses no tools: e
 findings is sent in its own request (with the files already updated as read-only context), and
 the model returns the complete updated file in one code block. Before a file is written it must
 parse as Python (or as a dependency file), differ from the original when it has certain
-findings, and contain no placeholders such as `# ... rest unchanged`; a failing file gets its
-error back once. All files are then verified together exactly as in agent mode, and a failed
+findings, contain no placeholders such as `# ... rest unchanged`, use no name it never imports
+or defines, and (test files) patch no repo-module name that does not exist; a failing file gets
+its error back once. All files are then verified together exactly as in agent mode, and a failed
 verification starts the next attempt with the failing test output.
 
 ```

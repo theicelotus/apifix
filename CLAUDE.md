@@ -66,7 +66,9 @@ src/apifix/
                       retry; limits; JSON trajectory; diff + report; both edit modes
     whole_file.py     whole-file mode (no tools, one file per request): file selection, prompts,
                       code-block parsing, pre-apply checks (syntax, dependency file, changed,
-                      abbreviation)
+                      abbreviation, undefined names, mock targets)
+    code_checks.py    static checks on a rewritten file (not mode-specific): new undefined names
+                      (pyflakes), new mock.patch targets missing from repo modules
 benchmark/            real repos + scoring
 docs/plans/           approved plans, one file per step (request, plan, amendments)
 tests/                pytest; fixtures/ holds realistic sample code
@@ -213,6 +215,11 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   need) may be imported without a warning.
 - The search tool runs the model's regular expression in-process (bounded file and line sizes,
   but no regex timeout).
+- Timing: each response records `duration_s` (wall clock), each sandbox run summary the
+  sandbox's own `duration_s` (install plus test phase; a verification's fixed run and rerun
+  share one install, so their figures overlap). The report's `Time:` line and
+  `trajectory.timing` use wall clock: LLM requests vs the baseline run plus `verify()` calls
+  (which include the verifier's own scanning, normally well under a second).
 
 ## Known limitations (whole-file mode)
 
@@ -235,6 +242,19 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   original, and at least half the original's lines when it has 20 or more. Placeholder
   detection is a regex over comment lines, so an unusual phrasing passes and a genuine new
   comment like "# rest of the payload" can be rejected (one in-file retry softens this).
+- Undefined names (`code_checks.py`, Python files): pyflakes `UndefinedName` messages only, and
+  only names the original did not already use undefined (star imports and builtins never
+  count). One message per name, with an import suggestion for a fixed table of common stdlib
+  names. Whole-file mode only for now.
+- Mock targets (test files): string first arguments of `patch`, `mock.patch`,
+  `unittest.mock.patch`, `mocker.patch` that are new versus the original. The longest prefix
+  naming a repo module (`a/b.py` or `a/b/__init__.py`, at the root or under `src/`) decides; the
+  next part must be a top-level def/class/assignment/import (also inside module-level
+  if/try/with/for/while, or declared `global` in a function) or a submodule. Modules read from
+  the working copy (files accepted so far). Not checked: targets outside the repo, modules
+  that do not parse or have a star import or module `__getattr__`, aliased patch functions
+  (`from unittest.mock import patch as p`), `target=` keywords, and attributes deeper than
+  the first name (`app.client.missing_attr` passes if `client` exists).
 - A failing candidate gets its error back once in that file's conversation (`check_retry`);
   a second failure ends the attempt (`check_failed`, not verified). The next attempt resends
   that file first (with the error, not the rejected text) and then the files after it.
