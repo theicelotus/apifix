@@ -44,11 +44,14 @@ src/apifix/
       openai_v1/      rules.py (pure data tables, incl. guide-part selectors) + migration-
                       specific heuristics; guide.md (old -> new reference used in the prompts);
                       guide_parts.py (which parts / Resources rows a job's findings need)
-    project.py        target repo facts: Python version, test runner, install plan, lockfile
-                      pins, env vars the repo's GitHub Actions set
+    project.py        target repo facts: Python version, test files (`is_test_file`, the one
+                      definition everything uses), test plan (pytest, explicit file list,
+                      import paths), install plan, lockfile pins, env vars the repo's GitHub
+                      Actions set
     sandbox.py        two-phase Docker run (install with network, test without); sessions
                       install once and run tests repeatedly; optional coverage; one retry of
-                      an install that failed transiently; test-phase env placeholders
+                      an install that failed transiently; test-phase env placeholders; the
+                      migration's post-install smoke check (no network, no repo code)
     sandbox_driver.py runs INSIDE containers (Python 3.8+ compatible, stdlib only)
     docker.py         DockerClient protocol + `docker` CLI implementation (bounded output)
     cleanup.py        removes containers / temp workspaces left by crashed or killed runs
@@ -144,13 +147,42 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
 - No cross-function tracking of response objects: dict-style access is only flagged when the
   response is assigned and used in the same function/module scope.
 - No `getattr(openai, ...)` or other dynamic-attribute detection.
+- String references (e.g. `mock.patch` targets) are found with any module prefix
+  (`app.openai.ChatCompletion.create`, `src.x.openai.error.RateLimitError`; [likely]), unless
+  the prefix plus `openai` names one of the repo's own modules (`app/openai.py`). Not found:
+  `patch.object(app.openai.ChatCompletion, "create")` (repo-module attributes are not resolved).
 - `.ipynb` notebooks are not scanned yet.
-- openai-v1, test files only: dict literals shaped like a 0.x response (`"choices"` holding a
+- openai-v1, test files only (`project.is_test_file`): dict literals shaped like a 0.x response (`"choices"` holding a
   dict with `"message"` or `"text"`) are a [likely] `response_access` finding, without
   requiring an openai import. `dict(choices=...)` calls and dicts built step by step are
   missed; the same literal in a non-test file (fixtures modules, sample data) is not flagged.
 
 ## Known limitations (sandbox)
+
+- Test files (`project.is_test_file`, also used by the scanner, the verifier's tampering
+  checks and whole-file mode): by name `test*.py` (unittest's discovery default, so also
+  `testing_utils.py`), `*_test.py`, `conftest.py`, anything under a `tests/`, `test/` or
+  `testing/` dir; otherwise by content: imports unittest or pytest and defines at the top level
+  a `Test*` class (or a `*TestCase` subclass) or a `test_*` function.
+- Tests always run with pytest (it runs unittest TestCases too), given an explicit list of the
+  test files (name or content; not conftest.py or helpers that only sit in a tests dir), so
+  names pytest would not collect (`testapp.py`) still run. A repo whose pytest config sets
+  `testpaths` or `python_files` keeps its own collection instead. unittest is never picked by
+  detection; its runner and output parser remain for callers that pass a plan.
+- Import paths: when a test file imports a module by bare name (`from app import ...`) that is
+  not at the root or under `src/` but in the test's own dir or a dir above it, and pytest would
+  not put that dir on `sys.path` itself (it is a package), the dir goes on `PYTHONPATH` in the
+  test phase (`import_paths`, stated in notes and the report). A repo's pytest `pythonpath`
+  config replaces the guess. The cwd stays the repo root, so tests that open files relative to
+  another dir fail. A file imported both by bare name and by package name loads twice (a mock
+  on one copy does not affect the other); not detected.
+- Smoke check (`Migration.smoke_check`): runs once per install of the fixed code (verify only,
+  not the baseline), with the deps venv, no network and no repo code. openai-v1: import openai
+  and build `OpenAI(api_key=<dummy>)`. A failure rejects as `smoke_check_failed`, a dependency
+  problem (whole-file mode resends dependency files), with the installed version, the
+  library's requirements as installed, and the repo's exact pins on any of them (pins that
+  *can* hold it back; pip's actual resolution is not analysed). A smoke run that cannot start
+  is recorded, not a rejection.
 
 - Dependencies come from static parsing. Requirements computed dynamically in `setup.py`, `-r`
   includes outside the repo root / `requirements/`, and nested packages in monorepos are missed;
@@ -206,6 +238,9 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
 - References into the migrated library (`openai.*`) may change freely in tests. Swapping one
   specific class for another is not flagged, except catching the library's base exceptions
   (`OpenAIError`, `APIError`, `APIStatusError`), which counts as broadening.
+- Which changed files get tampering checks follows `project.is_test_file`, judged by the
+  original file's content (an edit that removes a file's tests or its unittest import does not
+  stop it counting as a test file).
 - Tests needing a network service or credentials are recognised by failure-message markers.
 - Flakiness: newly failing tests are rerun once (whole test phase); a regression that fails
   intermittently can pass the rerun and be reported as flaky.
@@ -309,7 +344,8 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   Calls with no known shape keep a `<the test's mock response>` placeholder.
 - Mock targets (test files): string first arguments of `patch`, `mock.patch`,
   `unittest.mock.patch`, `mocker.patch` that are new versus the original. The longest prefix
-  naming a repo module (`a/b.py` or `a/b/__init__.py`, at the root or under `src/`) decides; the
+  naming a repo module (`a/b.py` or `a/b/__init__.py`, looked up in the test file's own dir, the
+  test plan's import paths, the root, then `src/`; `code_checks.module_roots`) decides; the
   next part must be a top-level def/class/assignment/import (also inside module-level
   if/try/with/for/while, or declared `global` in a function) or a submodule. Modules read from
   the working copy (files accepted so far). Not checked: targets outside the repo, modules

@@ -141,6 +141,71 @@ def test_exit_code_is_propagated_and_recorded(env):
 
 def test_usage_error():
     assert driver.main(["bogus"]) == 2
+    assert driver.main(["test", "--path"]) == 2
+    assert driver.main(["test", "--bogus", "--", "x"]) == 2
+
+
+SIBLING = ["{python}", "-c", "import server; assert server.VALUE == 7"]
+
+
+@pytest.mark.parametrize("pyproject", [None, PYPROJECT_OK])
+def test_import_paths_go_on_pythonpath(env, pyproject):
+    work, results = env
+    if pyproject:
+        (work / "pyproject.toml").write_text(pyproject)
+        (work / "backend.py").write_text(textwrap.dedent(BACKEND))
+    (work / "svc").mkdir()
+    (work / "svc" / "__init__.py").write_text("")
+    (work / "svc" / "server.py").write_text("VALUE = 7\n")
+    assert driver.test(SIBLING) != 0  # not importable by bare name without the path
+    assert driver.test(SIBLING, paths=["svc"]) == 0
+    report = _report(results)
+    assert report["import_paths"] == ["svc"]
+    assert report["install_method"] == ("editable" if pyproject else "pythonpath")
+
+
+def test_main_passes_paths(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        driver, "test", lambda cmd, coverage=False, paths=(): seen.update(p=paths, c=cmd) or 0
+    )
+    assert driver.main(["test", "--path", "a", "--coverage", "--path", "b/c", "--", "x"]) == 0
+    assert seen == {"p": ["a", "b/c"], "c": ["x"]}
+
+
+def _smoke(tmp_path, monkeypatch, capsys, code: str, distribution: str = "pip") -> dict:
+    check = tmp_path / "smoke_check.py"
+    check.write_text(code)
+    monkeypatch.setattr(driver, "SMOKE_CHECK", str(check))
+    assert driver.main(["smoke", distribution]) == 0
+    (line,) = [
+        ln for ln in capsys.readouterr().out.splitlines() if ln.startswith(driver.SMOKE_MARKER)
+    ]
+    return json.loads(line[len(driver.SMOKE_MARKER) :])
+
+
+def test_smoke_check_passes(env, tmp_path, monkeypatch, capsys):
+    result = _smoke(tmp_path, monkeypatch, capsys, "import pip\n")
+    assert result["ok"] is True
+    assert result["installed"]["distribution"] == "pip"
+    assert result["installed"]["version"]  # read from the deps venv's metadata
+
+
+def test_smoke_check_failure_keeps_the_traceback(env, tmp_path, monkeypatch, capsys):
+    code = "raise TypeError(\"Client.__init__() got an unexpected keyword argument 'proxies'\")\n"
+    result = _smoke(tmp_path, monkeypatch, capsys, code)
+    assert result["ok"] is False
+    assert "unexpected keyword argument 'proxies'" in result["output"]
+
+
+def test_smoke_check_missing_distribution(env, tmp_path, monkeypatch, capsys):
+    result = _smoke(tmp_path, monkeypatch, capsys, "import nothing_here\n", "not-installed-dist")
+    assert result["ok"] is False
+    assert result["installed"] == {
+        "distribution": "not-installed-dist",
+        "version": None,
+        "requires": {},
+    }
 
 
 @pytest.fixture(scope="module")
@@ -175,6 +240,8 @@ def test_coverage_wraps_the_test_command(env, deps_with_coverage, monkeypatch):
 
 def test_coverage_flag_in_main(env, monkeypatch):
     seen = {}
-    monkeypatch.setattr(driver, "test", lambda cmd, coverage=False: seen.update(c=coverage) or 0)
+    monkeypatch.setattr(
+        driver, "test", lambda cmd, coverage=False, paths=(): seen.update(c=coverage) or 0
+    )
     assert driver.main(["test", "--coverage", "--", "x"]) == 0
     assert seen == {"c": True}

@@ -154,3 +154,55 @@ def test_parse_unittest_without_summary_counts_lines():
 def test_parse_unittest_no_tests():
     counts, cases = parse_unittest_output("\nRan 0 tests in 0.000s\n\nNO TESTS RAN\n")
     assert counts == TestCounts() and cases == []
+
+
+# Synthetic -v output: a test logs to stderr between "... " and its status, and tests with
+# docstrings get the docstring's first line after their name (also in ERROR/FAIL blocks).
+UNITTEST_INTERLEAVED = """\
+test_ping (testserver.ServerTest.test_ping)
+Ping answers. ... ok
+test_reply (testserver.ServerTest.test_reply)
+Reply comes back. ... 2026-01-01 10:00:00,000 - INFO - replied
+ok
+test_upload (testserver.ServerTest.test_upload)
+Upload reads a data file. ... ERROR
+test_quiet (testserver.ServerTest.test_quiet) ... FAIL
+
+======================================================================
+ERROR: test_upload (testserver.ServerTest.test_upload)
+Upload reads a data file.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/work/svc/testserver.py", line 9, in test_upload
+FileNotFoundError: [Errno 2] No such file or directory: 'data/sample.bin'
+
+======================================================================
+FAIL: test_quiet (testserver.ServerTest.test_quiet)
+----------------------------------------------------------------------
+AssertionError: 1 != 2
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.010s
+
+FAILED (failures=1, errors=1)
+"""
+
+
+def test_parse_unittest_log_line_between_dots_and_status():
+    counts, cases = parse_unittest_output(UNITTEST_INTERLEAVED)
+    assert counts == TestCounts(total=4, passed=2, failed=1, errors=1)
+    outcomes = {c.id: c.outcome for c in cases}
+    assert outcomes == {
+        "testserver.ServerTest.test_ping": "passed",
+        "testserver.ServerTest.test_reply": "passed",
+        "testserver.ServerTest.test_upload": "error",
+        "testserver.ServerTest.test_quiet": "failed",
+    }
+
+
+def test_parse_unittest_messages_for_tests_with_docstrings():
+    _, cases = parse_unittest_output(UNITTEST_INTERLEAVED)
+    messages = {c.id: c.message for c in cases}
+    assert "FileNotFoundError" in messages["testserver.ServerTest.test_upload"]
+    assert "Upload reads" not in messages["testserver.ServerTest.test_upload"]
+    assert messages["testserver.ServerTest.test_quiet"].startswith("AssertionError: 1 != 2")

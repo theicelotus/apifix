@@ -21,11 +21,8 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Literal
 
-from apifix.engine.project import TEST_FILE_RE
-
 Severity = Literal["reject", "warn", "info"]
 
-TEST_DIRS = {"tests", "test", "testing"}
 SKIP_NAMES = {"skip", "skipif", "xfail", "skipIf", "skipUnless", "expectedFailure"}
 SKIP_CALLS = {"pytest.skip", "pytest.xfail", "pytest.importorskip", "self.skipTest"}
 CONDITIONAL_SKIPS = {"skipif", "xfail", "skipIf", "skipUnless"}
@@ -87,15 +84,6 @@ class TestEdit:
     severity: Severity
     detail: str
     test: str | None = None  # qualified name in the file, e.g. "TestChat.test_answer"
-
-
-def is_test_file(relpath: str) -> bool:
-    p = PurePosixPath(relpath)
-    if p.suffix != ".py":
-        return False
-    return bool(
-        TEST_FILE_RE.match(p.name) or p.name == "conftest.py" or TEST_DIRS & set(p.parts[:-1])
-    )
 
 
 # --- helpers --------------------------------------------------------------------------------

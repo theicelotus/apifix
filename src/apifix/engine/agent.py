@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from apifix.engine.agent_tools import TOOLS, EditRecord, Workspace
-from apifix.engine.code_checks import STDLIB_IMPORTS, import_table
+from apifix.engine.code_checks import STDLIB_IMPORTS, import_table, module_roots
 from apifix.engine.dependencies import is_dependency_file
 from apifix.engine.diffing import diff_trees, read_text, unified_diff
 from apifix.engine.llm import LLMClient, LLMError, LLMResponse, Message, ToolResult, Usage
@@ -503,7 +503,7 @@ class _Job:
         required = must_change(path, self.findings)
         updated = [
             (p, self._read(self.work, p))
-            for p in context_candidates(path, self.wf_files)
+            for p in context_candidates(path, self.wf_files, self.repo)
             if self._read(self.work, p) != self._read(self.repo, p)
         ]
         own_bytes = len(original.encode("utf-8"))
@@ -575,6 +575,9 @@ class _Job:
                 library_modules=self.migration.api_modules,
                 known_imports=self.known_imports,
                 mock_responses=self.migration.mock_responses,
+                module_roots=module_roots(
+                    path, self.baseline.import_paths if self.baseline else ()
+                ),
             )
             reply["checks"] = result.checks
             reply["auto_imports"] = result.auto_imports
@@ -670,7 +673,7 @@ class _Job:
             if not self.wf_files:
                 return "aborted", "no_files: no affected file can be sent (see skipped files)"
             sent = [f for f in self.findings if f.file in self.wf_files]
-            guide, self.guide_sections = self.migration.job_guide(sent)
+            guide, self.guide_sections = self.migration.job_guide(sent, self.repo)
             self.system = whole_file_system_prompt(self.migration, guide)
         preflight = getattr(self.llm, "preflight", None)
         if callable(preflight):
@@ -807,11 +810,12 @@ class _Job:
 
 
 def _dependency_problem(path: str, v: Verification) -> bool:
-    """Did the verification implicate this dependency file: the install failed, or a reason
-    or a remaining finding points at it?"""
+    """Did the verification implicate this dependency file: the install failed, the smoke check
+    failed, or a reason or a remaining finding points at it?"""
     install_failed = v.fixed.status in ("error", "timeout") and "install" in v.fixed.reason
     return (
         install_failed
+        or any(r.code == "smoke_check_failed" for r in v.reasons)
         or any(r.file == path for r in v.reasons)
         or any(f.file == path for f in v.remaining_findings)
     )

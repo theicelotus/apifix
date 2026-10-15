@@ -18,6 +18,7 @@ from typing import Literal
 
 from apifix.engine.code_checks import (
     DEFAULT_IMPORTS,
+    MODULE_ROOTS,
     ImportTable,
     add_missing_imports,
     mock_target_problems,
@@ -26,7 +27,7 @@ from apifix.engine.code_checks import (
 from apifix.engine.dependencies import dependency_file_problem, is_dependency_file
 from apifix.engine.migrations import Migration
 from apifix.engine.models import CERTAIN, Finding
-from apifix.engine.tampering import is_test_file
+from apifix.engine.project import is_test_file
 from apifix.engine.verifier import Verification, feedback_lines
 
 DEFAULT_MAX_BYTES = 24_000
@@ -54,10 +55,10 @@ class FileSelection:
     skipped: list[dict[str, object]]  # {"path", "bytes", "reason"}
 
 
-def _group(path: str) -> int:
+def _group(path: str, repo: Path) -> int:
     if is_dependency_file(path):
         return 0
-    return 2 if is_test_file(path) else 1
+    return 2 if is_test_file(path, root=repo) else 1
 
 
 def select_files(repo: Path, findings: list[Finding], max_bytes: int) -> FileSelection:
@@ -79,7 +80,7 @@ def select_files(repo: Path, findings: list[Finding], max_bytes: int) -> FileSel
             skipped.append({"path": path, "bytes": len(data), "reason": reason})
         else:
             files.append(path)
-    files.sort(key=lambda p: (_group(p), p))
+    files.sort(key=lambda p: (_group(p, repo), p))
     return FileSelection(files, skipped)
 
 
@@ -88,12 +89,13 @@ def must_change(path: str, findings: list[Finding]) -> bool:
     return any(f.file == path and f.confidence == CERTAIN for f in findings)
 
 
-def context_candidates(path: str, files: list[str]) -> list[str]:
+def context_candidates(path: str, files: list[str], root: Path | None = None) -> list[str]:
     """Which of the job's other files a request for `path` may show as read-only context: only
-    test files get context, namely the non-test Python files (the code they test and mock)."""
-    if not is_test_file(path):
+    test files get context, namely the non-test Python files (the code they test and mock).
+    `root`: the repo, for recognising test files by content."""
+    if not is_test_file(path, root=root):
         return []
-    return [p for p in files if p != path and p.endswith(".py") and not is_test_file(p)]
+    return [p for p in files if p != path and p.endswith(".py") and not is_test_file(p, root=root)]
 
 
 def select_context(
@@ -393,6 +395,7 @@ def check_candidate(
     library_modules: frozenset[str] = frozenset(),
     known_imports: ImportTable = DEFAULT_IMPORTS,
     mock_responses: Mapping[str, str] | None = None,
+    module_roots: Sequence[str] = MODULE_ROOTS,
 ) -> CheckResult:
     """Syntax (Python files), well-formedness (dependency files), "differs from the original"
     (only when `required`), abbreviation (placeholders, or under half the original's lines
@@ -452,7 +455,7 @@ def check_candidate(
     names = undefined_names(path, original, candidate, known_imports) if python else []
     record("undefined_names", "; ".join(names) or None, python)
 
-    mocks = python and read_module is not None and is_test_file(path)
+    mocks = python and read_module is not None and is_test_file(path, original)
     targets = (
         mock_target_problems(
             original,
@@ -460,6 +463,7 @@ def check_candidate(
             read_module,
             library_modules=library_modules,
             mock_responses=mock_responses,
+            roots=module_roots,
         )
         if mocks and read_module is not None
         else []

@@ -17,6 +17,7 @@ from apifix.engine.code_checks import (
     import_table,
     mock_target_problems,
     mock_targets,
+    module_roots,
     top_level_names,
     undefined_names,
 )
@@ -825,3 +826,58 @@ def test_example_responses_follow_the_call_and_the_helpers():
     unknown = app.replace("embeddings.create", "batches.create")
     (problem,) = _wf_problems(no_helpers, unknown)
     assert "= <the test's mock response>" in problem and "Mock responses" not in problem
+
+
+# --- module roots: the test's own directory and the test plan's import paths -----------------
+
+SVC_SERVER = """\
+import openai
+
+
+def reply(text):
+    client = openai.OpenAI()
+    r = client.chat.completions.create(model="m", messages=[{"role": "user", "content": text}])
+    return r.choices[0].message.content
+"""
+SVC_TEST_OLD = """\
+import unittest
+from unittest.mock import patch
+
+from server import reply
+
+
+class ServerTest(unittest.TestCase):
+    @patch("server.openai.ChatCompletion.create")
+    def test_reply(self, create):
+        create.return_value = {"choices": [{"message": {"content": "hi"}}]}
+        self.assertEqual(reply("q"), "hi")
+"""
+
+
+def test_module_roots():
+    assert module_roots("svc/testserver.py", ("svc",)) == ("svc/", "", "src/")
+    assert module_roots("tests/unit/test_a.py", ("lib",)) == ("tests/unit/", "lib/", "", "src/")
+    assert module_roots("test_a.py") == ("", "src/")
+
+
+def test_mock_targets_resolve_through_the_tests_directory():
+    files = reader({"svc/server.py": SVC_SERVER})
+    missing = SVC_TEST_OLD.replace("server.openai.ChatCompletion.create", "server.client.create")
+    roots = module_roots("svc/testserver.py", ("svc",))
+    (problem,) = mock_target_problems(
+        SVC_TEST_OLD, missing, files, roots=roots, library_modules=frozenset({"openai"})
+    )
+    assert "svc/server.py has no top-level name 'client'" in problem
+    assert "server.openai.OpenAI" in problem  # the suggestion found the module's client
+    # without the roots, `server` is not a repo module and nothing is checked
+    assert mock_target_problems(SVC_TEST_OLD, missing, files) == []
+    good = SVC_TEST_OLD.replace("server.openai.ChatCompletion.create", "server.openai.OpenAI")
+    assert mock_target_problems(SVC_TEST_OLD, good, files, roots=roots) == []
+
+
+def test_code_under_test_is_found_through_an_import_path():
+    files = reader({"svc/server.py": SVC_SERVER})
+    patched_reply = SVC_TEST_OLD.replace("server.openai.ChatCompletion.create", "server.reply")
+    roots = module_roots("tests/test_server.py", ("svc",))
+    (problem,) = mock_target_problems(SVC_TEST_OLD, patched_reply, files, roots=roots)
+    assert "server.reply" in problem

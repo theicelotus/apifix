@@ -29,7 +29,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from apifix.engine.dependencies import normalize_name
 from apifix.engine.docker import DockerCLI, DockerClient
+from apifix.engine.models import SmokeCheck
 from apifix.engine.project import (
     DEFAULT_PYTHON,
     InstallPlan,
@@ -37,6 +39,7 @@ from apifix.engine.project import (
     build_install_plan,
     detect_python_version,
     detect_tests,
+    exact_pins,
 )
 from apifix.engine.test_results import (
     FileCoverage,
@@ -54,6 +57,8 @@ PhaseStatus = Literal["ok", "failed", "timeout", "error", "skipped"]
 InstallMethod = Literal["editable", "pythonpath"]
 
 DRIVER = Path(__file__).with_name("sandbox_driver.py")
+SMOKE_MARKER = "APIFIX_SMOKE_RESULT "  # sandbox_driver.SMOKE_MARKER
+NO_PROJECT = "no pyproject.toml or setup.py"  # sandbox_driver.NO_PROJECT
 CONTAINER_LABEL = "apifix=1"
 WORKSPACE_LABEL = "apifix.workspace"  # container label: the host workspace it mounts
 WORKSPACE_PREFIX = "apifix-sandbox-"
@@ -142,7 +147,7 @@ class SandboxConfig:
 
 @dataclass
 class PhaseResult:
-    name: Literal["install", "test"]
+    name: Literal["install", "test", "smoke"]
     status: PhaseStatus
     image: str
     network: str
@@ -152,6 +157,19 @@ class PhaseResult:
     stderr: str = ""
     duration_s: float = 0.0
     constraints_applied: bool | None = None  # install phase only
+
+
+@dataclass
+class SmokeResult:
+    """Outcome of a migration's smoke check (see SmokeCheck) after the install."""
+
+    status: Literal["ok", "failed", "error"]
+    description: str
+    output: str = ""  # the check's output (the traceback when it failed)
+    distribution: str = ""
+    version: str | None = None  # installed version of the migrated library
+    requires: dict[str, str | None] = field(default_factory=dict)  # its requirements, installed
+    pins: list[str] = field(default_factory=list)  # exact pins on any of those, from the repo
 
 
 @dataclass
@@ -179,6 +197,9 @@ class SandboxResult:
     install_retried: bool = False
     # Test-phase environment variables set to placeholders (names only; see Sandbox.session).
     env_placeholders: list[str] = field(default_factory=list)
+    # Repo dirs put on PYTHONPATH in the test phase (TestPlan.import_paths).
+    import_paths: list[str] = field(default_factory=list)
+    smoke: SmokeResult | None = None
 
 
 @dataclass(frozen=True)
@@ -327,11 +348,15 @@ class Sandbox:
         *,
         coverage: bool = False,
         env: Mapping[str, str] | None = None,
+        smoke: SmokeCheck | None = None,
+        tests: TestPlan | None = None,
     ) -> SandboxSession:
         """Install once, run the test phase as often as needed. Use as a context manager.
         `env` adds test-phase variables: literal placeholders chosen by apifix (e.g. a fake
-        API key the repo's CI also sets), never values from the host environment."""
-        return SandboxSession(self, repo_path, coverage=coverage, env=env)
+        API key the repo's CI also sets), never values from the host environment. `smoke`
+        runs once after the install (SmokeResult in every result). `tests` replaces the
+        detected test plan."""
+        return SandboxSession(self, repo_path, coverage=coverage, env=env, smoke=smoke, tests=tests)
 
     def run(
         self,
@@ -339,8 +364,12 @@ class Sandbox:
         *,
         coverage: bool = False,
         env: Mapping[str, str] | None = None,
+        smoke: SmokeCheck | None = None,
+        tests: TestPlan | None = None,
     ) -> SandboxResult:
-        with self.session(repo_path, coverage=coverage, env=env) as session:
+        with self.session(
+            repo_path, coverage=coverage, env=env, smoke=smoke, tests=tests
+        ) as session:
             return session.run_tests()
 
     # phases
@@ -407,7 +436,11 @@ class Sandbox:
         env: Mapping[str, str] | None = None,
     ) -> None:
         command = ["python", "/apifix/driver.py", "test"]
-        command += ["--coverage", "--", *tests.command] if coverage else ["--", *tests.command]
+        if coverage:
+            command.append("--coverage")
+        for path in tests.import_paths:
+            command += ["--path", path]
+        command += ["--", *tests.command]
         mounts = [
             Mount(ws.deps, "/deps", writable=False),
             Mount(ws.work, "/work", writable=True),
@@ -421,7 +454,11 @@ class Sandbox:
         if driver.get("install_method") in ("editable", "pythonpath"):
             result.install_method = driver["install_method"]
             if driver["install_method"] == "pythonpath":
-                result.notes.append("offline editable install failed; used PYTHONPATH instead")
+                result.notes.append(
+                    "no pyproject.toml or setup.py: repo put on PYTHONPATH"
+                    if driver.get("install_log") == NO_PROJECT
+                    else "offline editable install failed; used PYTHONPATH instead"
+                )
 
         if phase.status == "timeout":
             result.status = "timeout"
@@ -484,9 +521,48 @@ class Sandbox:
             result.notes.append(f"coverage report unusable: {exc}")
             return None
 
+    def _smoke(
+        self, ws: _Workspace, image: str, check: SmokeCheck, plan: InstallPlan
+    ) -> SmokeResult:
+        """Run the migration's smoke check against the installed dependencies: no network, and
+        no repo code mounted."""
+        (ws.tooling / "smoke_check.py").write_text(check.code)
+        mounts = [
+            Mount(ws.deps, "/deps", writable=False),
+            Mount(ws.tooling, "/apifix", writable=False),
+        ]
+        command = ["python", "/apifix/driver.py", "smoke", check.distribution]
+        phase = self._phase("smoke", image, "none", command, mounts, None, ws.root)
+        line = next(
+            (ln for ln in reversed(phase.stdout.splitlines()) if ln.startswith(SMOKE_MARKER)), None
+        )
+        try:
+            data = json.loads(line[len(SMOKE_MARKER) :]) if line else None
+        except ValueError:
+            data = None
+        if phase.status != "ok" or not isinstance(data, dict):
+            tail = (phase.stdout + phase.stderr)[-2000:]
+            return SmokeResult("error", check.description, tail, check.distribution)
+        installed = data.get("installed") or {}
+        requires = {
+            str(k): (str(v) if v is not None else None)
+            for k, v in (installed.get("requires") or {}).items()
+        }
+        names = {normalize_name(check.distribution), *map(normalize_name, requires)}
+        pins = exact_pins(plan)
+        return SmokeResult(
+            "ok" if data.get("ok") else "failed",
+            check.description,
+            str(data.get("output", "")),
+            check.distribution,
+            installed.get("version"),
+            requires,
+            sorted(line for name, line in pins.items() if name in names),
+        )
+
     def _phase(
         self,
-        name: Literal["install", "test"],
+        name: Literal["install", "test", "smoke"],
         image: str,
         network: Literal["bridge", "none"],
         command: list[str],
@@ -564,6 +640,8 @@ class SandboxSession:
         *,
         coverage: bool,
         env: Mapping[str, str] | None = None,
+        smoke: SmokeCheck | None = None,
+        tests: TestPlan | None = None,
     ) -> None:
         self.sandbox = sandbox
         self.env = dict(env or {})
@@ -575,7 +653,8 @@ class SandboxSession:
             raise NotADirectoryError(f"not a directory: {self.repo}")
         self.coverage = coverage
         python = detect_python_version(self.repo, sandbox.config.default_python)
-        self.tests = detect_tests(self.repo)
+        self.smoke = smoke
+        self.tests = tests or detect_tests(self.repo)
         self.base = SandboxResult(
             status="error",
             reason="",
@@ -584,6 +663,8 @@ class SandboxSession:
             runner=self.tests.runner,
             test_command=list(self.tests.command),
             env_placeholders=sorted(self.env),
+            import_paths=list(self.tests.import_paths),
+            notes=list(self.tests.notes),
         )
         self._workspace: _Workspace | None = None
         self._image: str | None = None
@@ -614,7 +695,7 @@ class SandboxSession:
             plan = dataclasses.replace(plan, requirements=(*plan.requirements, "coverage"))
         base.dependency_sources = list(plan.sources)
         base.lockfile = plan.lockfile
-        base.notes = list(plan.notes)
+        base.notes += plan.notes
 
         usable, why = self.sandbox.docker.available()
         if not usable:
@@ -622,6 +703,8 @@ class SandboxSession:
             return
         self._workspace = _Workspace(self.repo, plan)
         self._image = self.sandbox._install(self._workspace, plan, base)
+        if self._image is not None and self.smoke is not None:
+            base.smoke = self.sandbox._smoke(self._workspace, self._image, self.smoke, plan)
 
     def run_tests(self, *, coverage: bool | None = None) -> SandboxResult:
         """Run the test phase. `coverage` defaults to the session setting (it can only be

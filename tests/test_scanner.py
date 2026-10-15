@@ -415,6 +415,39 @@ def test_mock_patch_string_targets(scan_code):
     assert "mock.patch" in at(findings, 4).suggestion
 
 
+def test_string_targets_through_a_module_prefix(scan_code):
+    findings = scan_code(
+        """
+        from unittest import mock
+
+        @mock.patch("server.openai.Completion.create")
+        @mock.patch("src.svc.core.openai.ChatCompletion.acreate")
+        @mock.patch("svc.server.openai.error.RateLimitError")
+        def test_x(m1, m2, m3):
+            mock.patch("server.openai.api_key")  # config, not an API call: as without a prefix
+            mock.patch("server.openai_helpers.Completion.create")  # not the openai module
+            mock.patch("server.openai")
+            "server.openai.Completion.create is mentioned in prose"
+        """
+    )
+    assert summary(findings) == [(4, "api_call"), (5, "api_call"), (6, "error_class")]
+    assert all(f.confidence == "likely" for f in findings)
+    first = at(findings, 4).suggestion
+    assert "through module server" in first and "server.openai.OpenAI" in first
+    assert "client.completions.create" in first
+
+
+def test_prefixed_string_naming_the_repos_own_openai_module_is_ignored(tmp_path):
+    (tmp_path / "server").mkdir()
+    (tmp_path / "server" / "__init__.py").write_text("")
+    (tmp_path / "server" / "openai.py").write_text("class Completion:\n    pass\n")
+    (tmp_path / "test_server.py").write_text(
+        'from unittest import mock\n\n@mock.patch("server.openai.Completion.create")\n'
+        "def test_x(m):\n    pass\n"
+    )
+    assert [f for f in scan(tmp_path, "openai-v1").findings if f.file == "test_server.py"] == []
+
+
 def test_shadowed_names_without_openai_import(scan_code):
     findings = scan_code(
         """
@@ -450,6 +483,26 @@ MOCK_DICT = (
     "1.x responses are objects: build mock responses with attribute access "
     "(e.g. SimpleNamespace), not dicts."
 )
+
+
+@pytest.mark.parametrize(
+    ("rel", "header"),
+    [
+        ("svc/testserver.py", ""),  # unittest's test*.py, not pytest's test_*.py
+        ("svc/checks.py", "import unittest\n\nclass ServerChecks(unittest.TestCase):\n    pass\n"),
+    ],
+)
+def test_dict_response_in_test_files_by_new_name_or_content(tmp_path, rel, header):
+    (f,) = _scan_file(
+        tmp_path,
+        rel,
+        header + 'REPLY = {"choices": [{"message": {"content": "hi"}}]}\n',
+    )
+    assert (f.category, f.suggestion) == ("response_access", MOCK_DICT)
+
+
+def test_dict_response_in_a_non_test_module_is_not_flagged(tmp_path):
+    assert _scan_file(tmp_path, "svc/fixtures.py", 'REPLY = {"choices": [{"text": "hi"}]}\n') == []
 
 
 def test_dict_response_in_a_test_helper_is_likely(tmp_path):

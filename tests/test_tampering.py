@@ -4,7 +4,7 @@ import textwrap
 
 import pytest
 
-from apifix.engine.tampering import check_test_config, check_test_file, is_test_file
+from apifix.engine.tampering import check_test_config, check_test_file
 
 
 def edits(old: str, new: str | None, file: str = "tests/test_chat.py"):
@@ -41,22 +41,6 @@ BASE = """
         with pytest.raises(openai.error.RateLimitError):
             raise openai.error.RateLimitError("x")
 """
-
-
-@pytest.mark.parametrize(
-    ("path", "expected"),
-    [
-        ("tests/test_a.py", True),
-        ("test_a.py", True),
-        ("pkg/a_test.py", True),
-        ("tests/helpers.py", True),
-        ("conftest.py", True),
-        ("src/app.py", False),
-        ("tests/data.json", False),
-    ],
-)
-def test_is_test_file(path, expected):
-    assert is_test_file(path) is expected
 
 
 # --- allowed edits --------------------------------------------------------------------------

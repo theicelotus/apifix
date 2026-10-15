@@ -10,8 +10,11 @@ from apifix.engine.project import (
     PYTEST_COMMAND,
     build_install_plan,
     ci_env_vars,
+    defines_tests,
     detect_python_version,
     detect_tests,
+    is_test_file,
+    pytest_config,
 )
 
 
@@ -156,7 +159,7 @@ def test_pytest_signals(tmp_path, files, reason):
     write(tmp_path, {"tests/test_a.py": "import unittest\n", **files})
     plan = detect_tests(tmp_path)
     assert plan.runner == "pytest" and plan.reason == reason
-    assert plan.command == PYTEST_COMMAND
+    assert plan.command == (*PYTEST_COMMAND, "tests/test_a.py")
 
 
 def test_plain_test_functions_use_pytest(tmp_path):
@@ -164,26 +167,184 @@ def test_plain_test_functions_use_pytest(tmp_path):
     assert detect_tests(tmp_path).runner == "pytest"
 
 
-def test_unittest_only(tmp_path):
+def test_unittest_only_runs_with_pytest_and_explicit_files(tmp_path):
     write(
         tmp_path,
         {
             "pkg/__init__.py": "",
             "pkg/tests.py": "import unittest\n",
             "pkg/test_b.py": "from unittest import TestCase\n",
+            "pkg/conftest.py": "",
+            "tests/helpers.py": "def make():\n    return 1\n",
         },
     )
     plan = detect_tests(tmp_path)
-    assert plan.runner == "unittest"
+    assert plan.runner == "pytest"
+    # conftest.py and helpers under tests/ are test files, but not given to pytest to collect
     assert plan.test_files == ("pkg/test_b.py", "pkg/tests.py")
-    assert plan.command == ("{python}", "-m", "unittest", "discover", "-v")
+    assert plan.command == (*PYTEST_COMMAND, "pkg/test_b.py", "pkg/tests.py")
 
 
-def test_unittest_plain_tests_dir_gets_start_dir(tmp_path):
-    write(tmp_path, {"tests/test_a.py": "import unittest\n"})
-    assert detect_tests(tmp_path).command == (
-        "{python}", "-m", "unittest", "discover", "-s", "tests", "-v",
-    )  # fmt: skip
+def test_names_pytest_would_not_collect_are_passed_explicitly(tmp_path):
+    write(
+        tmp_path,
+        {
+            "svc/testserver.py": "import unittest\n",
+            "checks.py": "import unittest\n\nclass ServerChecks(unittest.TestCase):\n    pass\n",
+            "app.py": "def test_mode():\n    return False\n",  # no unittest/pytest import
+        },
+    )
+    plan = detect_tests(tmp_path)
+    assert plan.test_files == ("checks.py", "svc/testserver.py")
+
+
+def test_configured_collection_is_kept(tmp_path):
+    write(
+        tmp_path,
+        {
+            "pytest.ini": "[pytest]\ntestpaths = tests\n",
+            "tests/test_a.py": "",
+            "examples/test_live.py": "",
+        },
+    )
+    plan = detect_tests(tmp_path)
+    assert plan.command == PYTEST_COMMAND
+    assert plan.reason == "pytest.ini; collection as configured in pytest.ini"
+
+
+# --- test files -------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("tests/test_a.py", True),
+        ("test_a.py", True),
+        ("pkg/a_test.py", True),
+        ("tests/helpers.py", True),
+        ("conftest.py", True),
+        ("backend/testapp.py", True),  # unittest's discovery default: test*.py
+        ("tests.py", True),
+        ("test/helpers.py", True),
+        ("src/app.py", False),
+        ("contest.py", False),
+        ("pkg/latest.py", False),
+        ("tests/data.json", False),
+    ],
+)
+def test_is_test_file_by_name(path, expected):
+    assert is_test_file(path) is expected
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("import unittest\n\nclass Checks(unittest.TestCase):\n    pass\n", True),
+        ("from unittest import TestCase\n\nclass Checks(TestCase):\n    pass\n", True),
+        ("import pytest\n\ndef test_x():\n    pass\n", True),
+        ("import pytest\n\nasync def test_x():\n    pass\n", True),
+        ("from unittest import mock\n\nclass TestServer:\n    pass\n", True),
+        ("def test_x():\n    pass\n", False),  # imports neither unittest nor pytest
+        ("import pytest\n\ndef helper():\n    pass\n", False),
+        ("import unittest\n\ndef run():\n    def test_inner():\n        pass\n", False),
+        ("import pytest\ndef test_(:\n", False),  # does not parse
+    ],
+)
+def test_defines_tests(source, expected):
+    assert defines_tests(source) is expected
+    assert is_test_file("svc/checks.py", source) is expected
+
+
+def test_is_test_file_reads_content_from_root(tmp_path):
+    write(tmp_path, {"svc/checks.py": "import pytest\n\ndef test_x():\n    pass\n"})
+    assert is_test_file("svc/checks.py", root=tmp_path)
+    assert not is_test_file("svc/checks.py")
+    assert not is_test_file("svc/missing.py", root=tmp_path)
+
+
+# --- import paths -----------------------------------------------------------------------------
+
+FLAT_SERVICE = {
+    "requirements.txt": "openai==0.28.1\n",
+    "svc/__init__.py": "",
+    "svc/server.py": "def reply():\n    return 1\n",
+    "svc/testserver.py": "import unittest\nfrom server import reply\n",
+}
+
+
+def test_sibling_import_in_a_package_gets_an_import_path(tmp_path):
+    plan = detect_tests(write(tmp_path, FLAT_SERVICE))
+    assert plan.import_paths == ("svc",)
+    assert plan.notes == (
+        "added svc/ to the import path: svc/testserver.py imports server from it",
+    )
+    assert plan.command == (*PYTEST_COMMAND, "svc/testserver.py")
+
+
+def test_module_in_a_parent_dir_is_found(tmp_path):
+    files = {
+        **FLAT_SERVICE,
+        "svc/checks/__init__.py": "",
+        "svc/checks/test_x.py": "import server\n",
+    }
+    del files["svc/testserver.py"]
+    assert detect_tests(write(tmp_path, files)).import_paths == ("svc",)
+
+
+def test_no_import_path_when_pytest_already_has_it(tmp_path):
+    # no __init__.py: pytest puts svc/ itself on sys.path
+    files = {k: v for k, v in FLAT_SERVICE.items() if k != "svc/__init__.py"}
+    assert detect_tests(write(tmp_path, files)).import_paths == ()
+
+
+@pytest.mark.parametrize("where", ["server.py", "src/server.py", "src/server/__init__.py"])
+def test_no_import_path_when_importable_from_the_root(tmp_path, where):
+    write(tmp_path, {**FLAT_SERVICE, where: ""})
+    assert detect_tests(tmp_path).import_paths == ()
+
+
+def test_stdlib_and_third_party_imports_add_nothing(tmp_path):
+    files = {**FLAT_SERVICE, "svc/testserver.py": "import json\nimport flask\nimport unittest\n"}
+    assert detect_tests(write(tmp_path, files)).import_paths == ()
+
+
+def test_repo_pythonpath_config_replaces_the_guess(tmp_path):
+    files = {**FLAT_SERVICE, "pyproject.toml": '[tool.pytest.ini_options]\npythonpath = ["lib"]\n'}
+    plan = detect_tests(write(tmp_path, files))
+    assert plan.import_paths == ("lib",)
+    assert plan.notes == ("import path from pyproject.toml pythonpath: lib",)
+    assert plan.command == (*PYTEST_COMMAND, "svc/testserver.py")  # no testpaths: explicit
+
+
+@pytest.mark.parametrize(
+    ("files", "expected"),
+    [
+        ({}, (None, {})),
+        (
+            {"pytest.ini": "[pytest]\npythonpath = a b\n"},
+            ("pytest.ini", {"pythonpath": ["a", "b"]}),
+        ),
+        (
+            {"setup.cfg": "[tool:pytest]\ntestpaths = tests\npython_files = check_*.py\n"},
+            ("setup.cfg", {"testpaths": ["tests"], "python_files": ["check_*.py"]}),
+        ),
+        ({"tox.ini": "[pytest]\naddopts = -q\n"}, ("tox.ini", {})),
+        (
+            {"pyproject.toml": '[tool.pytest.ini_options]\ntestpaths = "tests"\n'},
+            ("pyproject.toml", {"testpaths": ["tests"]}),
+        ),
+        # pytest.ini wins over pyproject.toml
+        (
+            {
+                "pytest.ini": "[pytest]\n",
+                "pyproject.toml": '[tool.pytest.ini_options]\ntestpaths = ["x"]\n',
+            },
+            ("pytest.ini", {}),
+        ),
+    ],
+)
+def test_pytest_config(tmp_path, files, expected):
+    assert pytest_config(write(tmp_path, files)) == expected
 
 
 # --- install plan ---------------------------------------------------------------------------

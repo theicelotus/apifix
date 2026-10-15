@@ -12,7 +12,7 @@ import re
 import tomllib
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal
 
 from apifix.engine.dependencies import (
@@ -205,18 +205,27 @@ class TestPlan:
     __test__ = False  # not a pytest test class
 
     runner: Runner | None
-    test_files: tuple[str, ...]
+    test_files: tuple[str, ...]  # the files the runner is given (or would collect)
     command: tuple[str, ...]  # "{python}" is replaced by the interpreter inside the sandbox
     reason: str
+    # Repo-relative dirs the test phase puts on PYTHONPATH (tests that import sibling modules by
+    # bare name, e.g. backend/testapp.py doing `from app import ...`), and why.
+    import_paths: tuple[str, ...] = ()
+    notes: tuple[str, ...] = ()
 
 
-TEST_FILE_RE = re.compile(r"^(test_.*|.*_test|tests)\.py$")
+# One definition of "test file", used by the scanner, the sandbox, the verifier (tampering
+# checks) and whole-file mode. By name: unittest's discovery default `test*.py`, pytest's
+# `*_test.py`, `conftest.py`, anything under a tests directory. By content: see defines_tests.
+TEST_FILE_RE = re.compile(r"^(test.*|.*_test)\.py$")
+TEST_DIRS = frozenset({"tests", "test", "testing"})
+_TEST_MODULES = frozenset({"unittest", "pytest"})
+MAX_TEST_SOURCE_BYTES = 1_000_000
 _PYTEST_CONFIG_SECTIONS = {
     "pyproject.toml": re.compile(r"^\[tool\.pytest(\.ini_options)?\]", re.M),
     "setup.cfg": re.compile(r"^\[tool:pytest\]", re.M),
     "tox.ini": re.compile(r"^\[pytest\]", re.M),
 }
-_UNITTEST_IMPORT = re.compile(r"^\s*(import unittest|from unittest\b)", re.M)
 _PYTEST_IMPORT = re.compile(r"^\s*(import pytest|from pytest\b)", re.M)
 
 PYTEST_COMMAND = (
@@ -228,6 +237,70 @@ PYTEST_COMMAND = (
     "--junitxml=/results/junit.xml",
     "-rfE",
 )
+
+
+def _base_name(node: ast.expr) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return ""
+
+
+def defines_tests(source: str) -> bool:
+    """Imports unittest or pytest, and defines at the top level a class named Test* (or a
+    *TestCase subclass) or a function named test_*."""
+    if "unittest" not in source and "pytest" not in source:
+        return False
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return False
+    imports = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports = imports or any(a.name.split(".")[0] in _TEST_MODULES for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            imports = imports or node.module.split(".")[0] in _TEST_MODULES
+    if not imports:
+        return False
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and (
+            node.name.startswith("Test")
+            or any(_base_name(b).endswith("TestCase") for b in node.bases)
+        ):
+            return True
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name.startswith(
+            "test_"
+        ):
+            return True
+    return False
+
+
+def _test_name(path: PurePosixPath) -> bool:
+    return bool(TEST_FILE_RE.match(path.name)) or path.name == "conftest.py"
+
+
+def is_test_file(relpath: str, source: str | None = None, *, root: Path | None = None) -> bool:
+    """Is `relpath` a test file: by name or directory, else by content (`source`, or the file
+    read from `root` when no source is given)."""
+    p = PurePosixPath(relpath)
+    if p.suffix != ".py":
+        return False
+    if _test_name(p) or TEST_DIRS & set(p.parts[:-1]):
+        return True
+    if source is None and root is not None:
+        source = _read_source(root / relpath)
+    return source is not None and defines_tests(source)
+
+
+def _read_source(path: Path) -> str | None:
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_TEST_SOURCE_BYTES:
+            return None
+    except OSError:
+        return None
+    return _read(path)
 
 
 def _pytest_signal(repo: Path, rel_files: list[str]) -> str | None:
@@ -244,26 +317,144 @@ def _pytest_signal(repo: Path, rel_files: list[str]) -> str | None:
     return None
 
 
+def pytest_config(repo: Path) -> tuple[str | None, dict[str, list[str]]]:
+    """The repo's pytest config file (in pytest's order) and its `testpaths`, `python_files`
+    and `pythonpath` options, as lists of strings."""
+    keys = ("testpaths", "python_files", "pythonpath")
+    if (repo / "pytest.ini").is_file():
+        return "pytest.ini", _ini_options(repo / "pytest.ini", "pytest", keys)
+    pyproject = _read(repo / "pyproject.toml")
+    if pyproject is not None and _PYTEST_CONFIG_SECTIONS["pyproject.toml"].search(pyproject):
+        try:
+            table = tomllib.loads(pyproject).get("tool", {}).get("pytest", {})
+        except tomllib.TOMLDecodeError:
+            table = {}
+        options = table.get("ini_options", {}) if isinstance(table, dict) else {}
+        found = {}
+        for key in keys:
+            value = options.get(key) if isinstance(options, dict) else None
+            if isinstance(value, str):
+                found[key] = value.split()
+            elif isinstance(value, list):
+                found[key] = [str(v) for v in value]
+        return "pyproject.toml", found
+    for name, section in (("tox.ini", "pytest"), ("setup.cfg", "tool:pytest")):
+        text = _read(repo / name)
+        if text is not None and _PYTEST_CONFIG_SECTIONS[name].search(text):
+            return name, _ini_options(repo / name, section, keys)
+    return None, {}
+
+
+def _ini_options(path: Path, section: str, keys: tuple[str, ...]) -> dict[str, list[str]]:
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        parser.read_string(_read(path) or "")
+    except configparser.Error:
+        return {}
+    if not parser.has_section(section):
+        return {}
+    return {k: parser.get(section, k).split() for k in keys if parser.has_option(section, k)}
+
+
+def _top_level_imports(source: str) -> set[str]:
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return set()
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names |= {a.name.split(".")[0] for a in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names.add(node.module.split(".")[0])
+    return names
+
+
+def _has_module(repo: Path, directory: PurePosixPath, name: str) -> bool:
+    base = repo / directory
+    return (base / f"{name}.py").is_file() or (base / name / "__init__.py").is_file()
+
+
+def _pytest_basedir(repo: Path, directory: PurePosixPath) -> PurePosixPath:
+    """The dir pytest's default import mode puts on sys.path for a test file in `directory`:
+    the first one upwards that is not a package."""
+    while directory != PurePosixPath(".") and (repo / directory / "__init__.py").is_file():
+        directory = directory.parent
+    return directory
+
+
+def guess_import_paths(
+    repo: Path, files: Iterable[tuple[str, str]]
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Dirs to put on PYTHONPATH so test files can import sibling modules by bare name, and a
+    note for each. For every absolute import in a test file whose first name is not a module
+    at the repo root or under src/, the nearest dir from the file's own dir upwards that has
+    it, unless that is the dir pytest puts on sys.path anyway."""
+    paths: dict[str, str] = {}
+    root = PurePosixPath(".")
+    for rel, source in files:
+        directory = PurePosixPath(rel).parent
+        if directory == root:
+            continue
+        base = _pytest_basedir(repo, directory)
+        for name in sorted(_top_level_imports(source)):
+            if _has_module(repo, root, name) or _has_module(repo, PurePosixPath("src"), name):
+                continue
+            for candidate in (directory, *directory.parents):
+                if candidate == root:
+                    break
+                if _has_module(repo, candidate, name):
+                    key = candidate.as_posix()
+                    if candidate != base and key not in paths:
+                        paths[key] = (
+                            f"added {key}/ to the import path: {rel} imports {name} from it"
+                        )
+                    break
+    return tuple(paths), tuple(paths.values())
+
+
 def detect_tests(repo: Path) -> TestPlan:
+    """Every test is run with pytest (it runs unittest TestCases too and reports JUnit XML),
+    given an explicit list of test files so that names pytest would not collect
+    (`testapp.py`) still run. A repo whose pytest config sets `testpaths` or `python_files`
+    keeps its own collection; its `pythonpath` replaces the import-path guess."""
     rel_files = [f.relative_to(repo).as_posix() for f in iter_files(repo)]
-    test_files = tuple(f for f in rel_files if TEST_FILE_RE.match(Path(f).name))
-    if not test_files:
+    runnable: list[tuple[str, str]] = []
+    for rel in rel_files:
+        p = PurePosixPath(rel)
+        if p.suffix != ".py" or p.name == "conftest.py":
+            continue
+        if TEST_FILE_RE.match(p.name):
+            runnable.append((rel, _read_source(repo / rel) or ""))
+        elif (source := _read_source(repo / rel)) is not None and defines_tests(source):
+            runnable.append((rel, source))
+    if not runnable:
         return TestPlan(None, (), (), "no test files found")
+    test_files = tuple(rel for rel, _ in runnable)
 
     signal = _pytest_signal(repo, rel_files)
-    sources = [_read(repo / f) or "" for f in test_files]
-    if signal is None and any(_PYTEST_IMPORT.search(s) for s in sources):
+    if signal is None and any(_PYTEST_IMPORT.search(s) for _, s in runnable):
         signal = "test files import pytest"
-    if signal is None and all(_UNITTEST_IMPORT.search(s) for s in sources):
-        command = ["{python}", "-m", "unittest", "discover", "-v"]
-        # Discovery only recurses into packages; point it at a plain tests/ dir directly.
-        for d in ("tests", "test"):
-            if (repo / d).is_dir() and not (repo / d / "__init__.py").exists():
-                command[4:4] = ["-s", d]
-                break
-        return TestPlan("unittest", test_files, tuple(command), "all test files use unittest")
-    # pytest also runs unittest-style tests, and reports per-test results as JUnit XML.
-    return TestPlan("pytest", test_files, PYTEST_COMMAND, signal or "default for plain tests")
+    reason = signal or "default: pytest also runs unittest tests"
+    config, options = pytest_config(repo)
+    if options.get("pythonpath"):
+        # repo-relative dirs only: the config is untrusted
+        import_paths = tuple(
+            p.rstrip("/")
+            for p in options["pythonpath"]
+            if not PurePosixPath(p).is_absolute() and ".." not in PurePosixPath(p).parts
+        )
+        notes: tuple[str, ...] = (
+            f"import path from {config} pythonpath: {', '.join(import_paths)}",
+        )
+    else:
+        import_paths, notes = guess_import_paths(repo, runnable)
+    if options.get("testpaths") or options.get("python_files"):
+        reason += f"; collection as configured in {config}"
+        command = PYTEST_COMMAND
+    else:
+        command = (*PYTEST_COMMAND, *test_files)
+    return TestPlan("pytest", test_files, command, reason, import_paths, notes)
 
 
 # --- dependencies ---------------------------------------------------------------------------
@@ -290,6 +481,17 @@ def _req_name(req: str) -> str | None:
         return normalize_name(m.group(1)) if m else None
     m = _REQ_NAME_RE.match(req)
     return normalize_name(m.group(1)) if m else None
+
+
+def exact_pins(plan: InstallPlan) -> dict[str, str]:
+    """Normalised name -> the `name==version` line, for every exact pin the install uses
+    (requirements and lockfile constraints; a requirement wins over a constraint)."""
+    pins: dict[str, str] = {}
+    for req in (*plan.requirements, *plan.constraints):
+        name = _req_name(req)
+        if name and name not in pins and _PINNED_RE.match(req.strip()):
+            pins[name] = req.split(";", 1)[0].strip()
+    return pins
 
 
 def _req_clauses(req: str) -> tuple[tuple[str, str], ...]:

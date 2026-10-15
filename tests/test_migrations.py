@@ -184,3 +184,39 @@ def test_guide_advice_on_keys_and_mock_data():
         "return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))])"
         in tests
     )
+
+
+def test_tests_part_for_a_test_file_recognised_by_content(tmp_path):
+    from apifix.engine.migrations.openai_v1.guide_parts import selected_parts
+
+    (tmp_path / "svc").mkdir()
+    (tmp_path / "svc" / "checks.py").write_text(
+        "import unittest\n\n\nclass ServerChecks(unittest.TestCase):\n    pass\n"
+    )
+    finding = _finding("api_call", file="svc/checks.py")
+    assert "tests" not in selected_parts([finding])  # by name alone it is not a test file
+    assert "tests" in selected_parts([finding], tmp_path)
+    _, parts = get_migration("openai-v1").job_guide([finding], tmp_path)
+    assert "tests" in parts
+
+
+def test_openai_smoke_check():
+    smoke = get_migration("openai-v1").smoke_check
+    assert smoke.distribution == "openai"
+    compile(smoke.code, "smoke_check.py", "exec")
+    assert "openai.OpenAI(api_key=" in smoke.code and "sk-apifix" in smoke.code
+
+
+def test_httpx_proxies_hint():
+    hints = dict(get_migration("openai-v1").failure_hints)
+    hint = hints["unexpected keyword argument 'proxies'"]
+    assert "openai>=1.55.3" in hint and "httpx<0.28" in hint and "typing_extensions" in hint
+
+
+def test_guide_prefers_creating_the_client_where_it_is_used():
+    guide = get_migration("openai-v1").guide
+    client = guide.split("## Client")[1].split("##")[0]
+    assert "Prefer creating the client where it is used" in client
+    assert "def ask(msgs):\n    client = OpenAI(" in client
+    deps = guide.split("## Dependencies")[1]
+    assert "typing_extensions==4.5.0" in deps and "httpx>=0.28" in deps

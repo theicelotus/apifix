@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 from apifix.engine.migrations.openai_v1 import rules
 from apifix.engine.models import CERTAIN, LIKELY, Category, Confidence, Finding
-from apifix.engine.tampering import is_test_file
+from apifix.engine.project import is_test_file
 
 _MAX_PATTERN = 120
 
@@ -27,9 +27,13 @@ class _Rule:
     name_changes: bool = True
 
 
-def check_python(file: str, tree: ast.Module, source: str) -> list[Finding]:
+def check_python(
+    file: str, tree: ast.Module, source: str, repo_modules: frozenset[str] = frozenset()
+) -> list[Finding]:
+    """`repo_modules`: dotted names of the repo's own modules (``pkg.mod``), so a string such as
+    ``"app.openai.X"`` is not taken for the library when the repo has its own ``openai``."""
     aliases = _collect_aliases(tree)
-    visitor = _Visitor(file, source, aliases, azure=_targets_azure(tree, aliases))
+    visitor = _Visitor(file, source, aliases, _targets_azure(tree, aliases), repo_modules)
     visitor.visit(tree)
     return visitor.findings
 
@@ -155,12 +159,20 @@ def _unwrap_chain(node: ast.AST) -> tuple[ast.AST, list[ast.Subscript], bool]:
 
 
 class _Visitor(ast.NodeVisitor):
-    def __init__(self, file: str, source: str, aliases: dict[str, str], azure: bool) -> None:
+    def __init__(
+        self,
+        file: str,
+        source: str,
+        aliases: dict[str, str],
+        azure: bool,
+        repo_modules: frozenset[str] = frozenset(),
+    ) -> None:
         self.file = file
+        self.repo_modules = repo_modules
         self.source = source
         self.aliases = aliases
         self.azure = azure
-        self.test_file = is_test_file(file)
+        self.test_file = is_test_file(file, source)
         self.findings: list[Finding] = []
         # One dict per function/class scope: name -> True if it holds a stream, else False.
         self.scopes: list[dict[str, bool]] = [{}]
@@ -237,22 +249,33 @@ class _Visitor(ast.NodeVisitor):
         if canonical and (rule := _classify(canonical, self.azure)) and rule.name_changes:
             self._report_rule(node, rule)
 
-    # string references, e.g. mock.patch("openai.ChatCompletion.create")
+    # string references, e.g. mock.patch("openai.ChatCompletion.create"), also through the module
+    # that uses the library: mock.patch("app.openai.ChatCompletion.create")
+
+    def _local_module(self, dotted: str) -> bool:
+        return any(m == dotted or m.endswith("." + dotted) for m in self.repo_modules)
 
     def visit_Constant(self, node: ast.Constant) -> None:
         value = node.value
-        if not (isinstance(value, str) and value.startswith("openai.")):
+        if not (isinstance(value, str) and "openai." in value):
             return
-        if not all(p.isidentifier() for p in value.split(".")):
+        parts = value.split(".")
+        if "openai" not in parts or not all(p.isidentifier() for p in parts):
             return  # prose, not a dotted path
-        rule = _classify(value, self.azure)
+        i = parts.index("openai")
+        prefix = ".".join(parts[:i])
+        if prefix and self._local_module(f"{prefix}.openai"):
+            return  # the repo's own module called openai
+        rule = _classify(".".join(parts[i:]), self.azure)
         if rule and rule.category in {"api_call", "error_class"}:
-            self._report(
-                node,
-                rule.category,
-                f"String reference (e.g. a mock.patch target): {rule.suggestion}",
-                LIKELY,
+            where = (
+                f"String reference (e.g. a mock.patch target) to openai through module "
+                f"{prefix}; in 1.x patch what {prefix} uses instead (its client, or "
+                f"{prefix}.openai.OpenAI): "
+                if prefix
+                else "String reference (e.g. a mock.patch target): "
             )
+            self._report(node, rule.category, where + rule.suggestion, LIKELY)
 
     # calls: kwargs, response tracking
 

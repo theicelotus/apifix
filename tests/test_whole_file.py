@@ -425,6 +425,24 @@ def test_context_only_for_test_files_and_only_the_code_they_test():
     assert context_candidates("requirements.txt", files) == []
 
 
+def test_test_files_by_content_get_context_and_are_sent_last(tmp_path):
+    (tmp_path / "svc").mkdir()
+    (tmp_path / "svc" / "checks.py").write_text("import pytest\n\n\ndef test_x():\n    pass\n")
+    (tmp_path / "svc" / "server.py").write_text("x = 1\n")
+    (tmp_path / "svc" / "testserver.py").write_text("x = 1\n")
+    files = ["svc/checks.py", "svc/server.py", "svc/testserver.py"]
+    assert context_candidates("svc/checks.py", files, tmp_path) == ["svc/server.py"]
+    assert context_candidates("svc/testserver.py", files, tmp_path) == ["svc/server.py"]
+    # without the repo, checks.py is not recognised as a test file and is offered as context
+    assert context_candidates("svc/testserver.py", files) == ["svc/checks.py", "svc/server.py"]
+    findings = [Finding(f, 1, 0, 1, 1, "api_call", "x", "y", "certain") for f in files]
+    assert select_files(tmp_path, findings, 10_000).files == [
+        "svc/server.py",
+        "svc/checks.py",
+        "svc/testserver.py",
+    ]
+
+
 def test_previous_version_note_shows_a_short_diff():
     note = previous_version_note("app.py", APP, NEW, "")
     assert note.startswith(

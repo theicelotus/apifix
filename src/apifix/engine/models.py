@@ -20,6 +20,17 @@ CERTAIN: Confidence = "certain"
 LIKELY: Confidence = "likely"
 
 
+@dataclass(frozen=True)
+class SmokeCheck:
+    """A migration's post-install check: `code` runs in the sandbox with the installed
+    dependencies (no network, no repo code) and must exit 0. `distribution` is the migrated
+    library, whose installed version and requirements are reported when it fails."""
+
+    distribution: str
+    code: str
+    description: str
+
+
 @dataclass(frozen=True, order=True)
 class Finding:
     """One place in a repo that must change.

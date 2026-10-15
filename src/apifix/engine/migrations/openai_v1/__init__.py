@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import ast
+from pathlib import Path
 
 from apifix.engine.dependencies import DeclaredDependency, entirely_below
 from apifix.engine.migrations.guide import full_guide
 from apifix.engine.migrations.openai_v1 import guide_parts, rules
 from apifix.engine.migrations.openai_v1.python_checks import check_python
-from apifix.engine.models import CERTAIN, Finding
+from apifix.engine.models import CERTAIN, Finding, SmokeCheck
 
 
 class OpenAIV1Migration:
@@ -32,16 +33,35 @@ class OpenAIV1Migration:
             "client or get_client(), or build the client lazily instead of at import. Never "
             "add a real key.",
         ),
+        (
+            "unexpected keyword argument 'proxies'",
+            "openai releases before 1.55.3 do not work with httpx 0.28 or later. Pin "
+            "openai>=1.55.3 (it needs typing_extensions>=4.11, so raise an older pin of that "
+            "too), or keep the old openai and pin httpx<0.28.",
+        ),
+    )
+    # A client must be constructible with the installed versions (a dummy key; nothing is sent:
+    # the network is off and constructing a client makes no request).
+    smoke_check = SmokeCheck(
+        distribution="openai",
+        code=('import openai\nopenai.OpenAI(api_key="sk-apifix-smoke-check-not-a-real-key")\n'),
+        description='import openai; openai.OpenAI(api_key="<dummy key>")',
     )
 
     known_imports = rules.KNOWN_IMPORTS
     mock_responses = rules.MOCK_RESPONSES
 
-    def job_guide(self, findings: list[Finding]) -> tuple[str, list[str]]:
-        return guide_parts.job_guide(findings)
+    def job_guide(self, findings: list[Finding], root: Path | None = None) -> tuple[str, list[str]]:
+        return guide_parts.job_guide(findings, root)
 
-    def check_python(self, file: str, tree: ast.Module, source: str) -> list[Finding]:
-        return check_python(file, tree, source)
+    def check_python(
+        self,
+        file: str,
+        tree: ast.Module,
+        source: str,
+        repo_modules: frozenset[str] = frozenset(),
+    ) -> list[Finding]:
+        return check_python(file, tree, source, repo_modules)
 
     def check_dependency(self, file: str, dep: DeclaredDependency) -> Finding | None:
         if dep.name != rules.PACKAGE or not entirely_below(dep.clauses, rules.FIRST_V1):

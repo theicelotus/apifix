@@ -97,11 +97,14 @@ def parse_junit(xml_text: str) -> tuple[TestCounts, list[TestCaseResult]]:
     return counts_from(cases), cases
 
 
-_UNITTEST_LINE = re.compile(
-    r"^(?P<name>\w+) \((?P<where>[\w.]+)\)(?:\n[^\n]*?)? \.\.\. "
-    r"(?P<status>ok|FAIL|ERROR|skipped\b.*|expected failure|unexpected success)$",
-    re.M,
+# A test's line under -v: `name (where)`, the first docstring line if it has one, ` ... `, then
+# the status, either on the same line or (when the test logged to stderr in between) as the
+# first line that is exactly a status, before the next test starts.
+_UNITTEST_START = re.compile(r"^(?P<name>\w+) \((?P<where>[\w.]+)\)(?:\n[^\n]*?)? \.\.\. ", re.M)
+_UNITTEST_STATUS_RE = re.compile(
+    r"(?P<status>ok|FAIL|ERROR|skipped\b.*|expected failure|unexpected success)"
 )
+_UNITTEST_END = re.compile(r"^(?:={20,}|-{20,})$", re.M)
 _UNITTEST_STATUS: dict[str, Outcome] = {
     "ok": "passed",
     "FAIL": "failed",
@@ -110,12 +113,31 @@ _UNITTEST_STATUS: dict[str, Outcome] = {
     "unexpected success": "failed",
 }
 _UNITTEST_BLOCK = re.compile(
-    r"^(?:ERROR|FAIL): (?P<name>\w+) \((?P<where>[\w.]+)\)[^\n]*\n-{20,}\n(?P<body>.*?)"
+    # an optional docstring line (-v prints the first one) before the dashes
+    r"^(?:ERROR|FAIL): (?P<name>\w+) \((?P<where>[\w.]+)\)[^\n]*\n(?:[^\n]*\n)?-{20,}\n"
+    r"(?P<body>.*?)"
     r"(?=^={20,}$|^-{20,}\nRan |\Z)",
     re.M | re.S,
 )
 _RAN = re.compile(r"^Ran (\d+) tests? in ", re.M)
 _SUMMARY = re.compile(r"^(OK|FAILED)(?: \((.*)\))?\s*$", re.M)
+
+
+def _unittest_lines(text: str) -> list[tuple[str, str, str]]:
+    """(name, where, status) for each test line of -v output."""
+    starts = list(_UNITTEST_START.finditer(text))
+    out = []
+    for i, m in enumerate(starts):
+        bound = starts[i + 1].start() if i + 1 < len(starts) else len(text)
+        end = _UNITTEST_END.search(text, m.end(), bound)
+        lines = text[m.end() : end.start() if end else bound].split("\n")
+        # the rest of the start line, then whole lines of interleaved output
+        for line in lines:
+            status = _UNITTEST_STATUS_RE.fullmatch(line.rstrip("\r"))
+            if status:
+                out.append((m.group("name"), m.group("where"), status.group("status")))
+                break
+    return out
 
 
 def parse_unittest_output(text: str) -> tuple[TestCounts, list[TestCaseResult]]:
@@ -126,8 +148,7 @@ def parse_unittest_output(text: str) -> tuple[TestCounts, list[TestCaseResult]]:
         for m in _UNITTEST_BLOCK.finditer(text)
     }
     cases = []
-    for m in _UNITTEST_LINE.finditer(text):
-        name, where, status = m.group("name"), m.group("where"), m.group("status")
+    for name, where, status in _unittest_lines(text):
         test_id = _unittest_id(name, where)
         outcome = "skipped" if status.startswith("skipped") else _UNITTEST_STATUS[status]
         message = messages.get(test_id, "") if outcome in ("failed", "error") else ""

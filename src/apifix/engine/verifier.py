@@ -17,6 +17,7 @@ from apifix.engine.dependencies import is_dependency_file
 from apifix.engine.diffing import FileChange, diff_trees, read_text
 from apifix.engine.migrations import Migration, get_migration
 from apifix.engine.models import Finding
+from apifix.engine.project import is_test_file
 from apifix.engine.sandbox import PhaseResult, Sandbox, SandboxResult
 from apifix.engine.scanner import scan
 from apifix.engine.scope import tooling_change
@@ -26,7 +27,6 @@ from apifix.engine.tampering import (
     TestEdit,
     check_test_config,
     check_test_file,
-    is_test_file,
 )
 from apifix.engine.test_results import TestCaseResult
 
@@ -254,6 +254,8 @@ def run_summary(run: SandboxResult) -> dict:
         ],
         "env_placeholders": list(run.env_placeholders),
         "notes": list(run.notes),
+        "import_paths": list(run.import_paths),
+        **({"smoke": asdict(run.smoke)} if run.smoke else {}),
         "duration_s": round(run.duration_s, 3),
     }
 
@@ -371,7 +373,8 @@ def _test_edits(
     for ch in changes:
         old = read_text(original / ch.path) if ch.kind != "added" else None
         new = read_text(fixed / ch.path) if ch.kind != "deleted" else None
-        if is_test_file(ch.path):
+        # Judged by the original when there is one, so an edit cannot stop it counting.
+        if is_test_file(ch.path, old if old is not None else new):
             edits += check_test_file(
                 ch.path, old, new, migration.api_modules, migration.broad_exceptions
             )
@@ -380,14 +383,16 @@ def _test_edits(
     return edits
 
 
-def changed_line_coverage(changes: list[FileChange], fixed_run: SandboxResult, fixed: Path):
+def changed_line_coverage(
+    changes: list[FileChange], fixed_run: SandboxResult, fixed: Path, original: Path | None = None
+):
     cov = ChangedLineCoverage(available=fixed_run.coverage is not None)
     for ch in changes:
         if (
             not ch.is_python
             or ch.kind == "deleted"
             or not ch.changed_lines
-            or is_test_file(ch.path)
+            or is_test_file(ch.path, root=original if ch.kind != "added" else fixed)
             or PurePosixPath(ch.path).name in NON_SOURCE_FILES
         ):
             continue
@@ -692,6 +697,30 @@ def _suspicious_reasons(
     return reasons
 
 
+def smoke_reasons(fixed: SandboxResult) -> list[Reason]:
+    """A failed post-install smoke check: a dependency problem, with what got installed."""
+    smoke = fixed.smoke
+    if smoke is None or smoke.status != "failed":
+        return []
+    error = next((line.strip() for line in reversed(smoke.output.splitlines()) if line.strip()), "")
+    lib = smoke.distribution
+    installed = f"{lib} {smoke.version}" if smoke.version else f"{lib} not installed"
+    deps = ", ".join(f"{name} {v}" for name, v in sorted(smoke.requires.items()) if v)
+    message = (
+        f"after installing the fixed code's dependencies, the smoke check `{smoke.description}` "
+        f"failed: {error or '(no output)'}. Installed: {installed}"
+        + (f"; its dependencies: {deps}" if deps else "")
+        + "."
+    )
+    if smoke.pins:
+        message += (
+            f" Exact pins in the dependency files on {lib} or its dependencies, which can hold "
+            f"{lib} back to an old release: {', '.join(smoke.pins)}."
+        )
+    message += " Fix the dependency file(s): raise or drop the pins that conflict."
+    return [Reason("smoke_check_failed", "reject", message)]
+
+
 def _evidence_reasons(
     fixed: SandboxResult, coverage: ChangedLineCoverage, config: VerifierConfig
 ) -> list[Reason]:
@@ -776,13 +805,14 @@ def verify(
     if baseline is None:
         baseline = sandbox.run(original, env=env)
     rerun = None
-    with sandbox.session(fixed, coverage=True, env=env) as session:
+    smoke = getattr(mig, "smoke_check", None)
+    with sandbox.session(fixed, coverage=True, env=env, smoke=smoke) as session:
         fixed_run = session.run_tests()
         delta = compare_runs(baseline, fixed_run)
         if config.rerun_new_failures and (delta.newly_failing or delta.newly_erroring):
             rerun = session.run_tests(coverage=False)
             delta = compare_runs(baseline, fixed_run, rerun)
-    coverage = changed_line_coverage(changes, fixed_run, fixed)
+    coverage = changed_line_coverage(changes, fixed_run, fixed, original)
 
     old_errors = {e.file for e in before_scan.parse_errors}
     new_errors = sorted(e.file for e in after_scan.parse_errors if e.file not in old_errors)
@@ -793,6 +823,7 @@ def verify(
         + _scan_reasons(after_scan.findings, new_errors)
         + _scope_reasons(original, fixed, changes, {f.file for f in before_scan.findings})
         + _suspicious_reasons(original, fixed, changes, mig)
+        + smoke_reasons(fixed_run)
         + _evidence_reasons(fixed_run, coverage, config)
     )
     return Verification(
@@ -867,6 +898,18 @@ def _report(v: Verification) -> str:
         out.append("**Changed-line coverage:** not measured.")
     else:
         out.append("**Changed-line coverage:** no executable source lines changed.")
+    if v.fixed.smoke is not None:
+        verdict = {"ok": "passed", "failed": "failed", "error": "could not run"}
+        out.append(
+            f"**Dependency smoke check** (`{v.fixed.smoke.description}`): "
+            f"{verdict[v.fixed.smoke.status]}."
+        )
+    if v.fixed.import_paths:
+        paths = ", ".join(f"`{p}/`" for p in v.fixed.import_paths)
+        out.append(
+            f"**Import paths:** {paths} on PYTHONPATH in the test phase (test files import "
+            "modules from there by bare name)."
+        )
     resolved = v.findings_before - len(v.remaining_findings)
     out += [
         f"**Migration findings:** {resolved} of {v.findings_before} resolved, "

@@ -23,6 +23,15 @@ apifix cleanup [--dry-run]                              # recover after a crash
 or a usage error. Model prices used for `--max-cost` can be overridden with `--prices FILE`
 (TOML); check them against Anthropic's pricing page.
 
+Tests run with pytest in the sandbox, which also runs unittest tests. Test files are found by
+name (`test*.py`, `*_test.py`, anything under `tests/`) or by content (imports unittest or
+pytest and defines `Test*` classes or `test_*` functions) and passed to pytest explicitly. When
+a test imports a neighbouring module by bare name (`backend/testapp.py`: `from app import ...`),
+that directory goes on `PYTHONPATH`. After the fixed code's dependencies are installed, a
+smoke check makes sure the new library actually works with them (openai: create a client). If
+it fails, the fix is rejected with the installed versions and the pins that can hold the
+library back (e.g. `typing_extensions==4.5.0` forcing an old openai).
+
 ## Free local models (Ollama, LM Studio, vLLM)
 
 `--provider openai-compat` talks to any OpenAI-compatible chat-completions endpoint that

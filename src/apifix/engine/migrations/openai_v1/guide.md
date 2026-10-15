@@ -12,21 +12,25 @@ openai.api_base = "https://example.test/v1"
 openai.organization = "org-x"
 resp = openai.ChatCompletion.create(model="gpt-4o-mini", messages=msgs)
 
-# 1.x
+# 1.x: create the client where it is used, not at import time
 from openai import OpenAI
 
-client = OpenAI(base_url="https://example.test/v1", organization="org-x")  # reads OPENAI_API_KEY
-resp = client.chat.completions.create(model="gpt-4o-mini", messages=msgs)
+
+def ask(msgs):
+    client = OpenAI(
+        base_url="https://example.test/v1", organization="org-x"
+    )  # reads OPENAI_API_KEY
+    resp = client.chat.completions.create(model="gpt-4o-mini", messages=msgs)
 ```
 
 - `OpenAI()` reads `OPENAI_API_KEY` from the environment itself: do not add
   `api_key=os.getenv("OPENAI_API_KEY")` or `import os` for it. Pass `api_key=` only where
   0.x code set a key from somewhere else.
-- `OpenAI()` raises at construction when no API key is available (argument or
-  `OPENAI_API_KEY`). Tests run without keys, so a client built at import time breaks every
-  test that imports the module. Build it lazily (e.g. a small `functools.lru_cache` function
-  `get_client()`), or where 0.x code read the key at import time, keep that behaviour but do
-  not fail when it is missing. Never hardcode a real key.
+- Prefer creating the client where it is used: inside the function that calls the API, or
+  lazily through a small cached function (`functools.lru_cache` on `get_client()`). Avoid a
+  module-level `client = OpenAI()`: `OpenAI()` raises at construction when no API key is
+  available (argument or `OPENAI_API_KEY`), and tests run without keys, so a client built at
+  import time breaks every test that imports the module. Never hardcode a real key.
 <!-- part: client.async -->
 - Async code: `AsyncOpenAI` and `await client.chat.completions.create(...)` (0.x `acreate`).
 <!-- part: client.azure -->
@@ -192,4 +196,7 @@ def test_answer(get_client):
 ## Dependencies
 
 Pin `openai>=1.0,<2` wherever openai is declared (requirements files, pyproject.toml, setup.py,
-setup.cfg, Pipfile). Leave other dependencies alone.
+setup.cfg, Pipfile). Leave other dependencies alone, except exact pins that hold openai back:
+current openai releases need `typing_extensions>=4.11`, and releases before 1.55.3 do not work
+with `httpx>=0.28`. In a fully pinned file, raise such pins (e.g. `typing_extensions==4.5.0`)
+rather than let pip fall back to an old openai.

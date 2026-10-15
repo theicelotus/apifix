@@ -11,6 +11,7 @@ import configparser
 import io
 import os
 import tokenize
+from collections.abc import Iterable
 from pathlib import Path
 
 from apifix.engine.dependencies import is_dependency_file, parse_dependency_file
@@ -28,8 +29,10 @@ def scan(path: str | os.PathLike[str], migration: str | Migration) -> ScanResult
         raise FileNotFoundError(f"no such file or directory: {root}")
     base = root.parent if root.is_file() else root
     result = ScanResult(migration=migration.name, root=str(root))
+    files = list(iter_files(root))
+    modules = repo_modules(f.relative_to(base).as_posix() for f in files)
 
-    for file in iter_files(root):
+    for file in files:
         rel = file.relative_to(base).as_posix()
         is_python = file.suffix == ".py"
         is_deps = is_dependency_file(rel)
@@ -42,7 +45,7 @@ def scan(path: str | os.PathLike[str], migration: str | Migration) -> ScanResult
             result.parse_errors.append(ParseError(rel, f"{type(exc).__name__}: {exc}"))
             continue
         if is_python:
-            _scan_python(rel, data, migration, result)
+            _scan_python(rel, data, migration, result, modules)
         if is_deps:
             _scan_dependencies(rel, data, migration, result)
 
@@ -50,7 +53,28 @@ def scan(path: str | os.PathLike[str], migration: str | Migration) -> ScanResult
     return result
 
 
-def _scan_python(rel: str, data: bytes, migration: Migration, result: ScanResult) -> None:
+def repo_modules(paths: Iterable[str]) -> frozenset[str]:
+    """Dotted module names for the repo's Python files (`a/b.py` -> `a.b`, `a/__init__.py` ->
+    `a`), as seen from the root."""
+    out = set()
+    for rel in paths:
+        if not rel.endswith(".py"):
+            continue
+        parts = rel[:-3].split("/")
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        if parts:
+            out.add(".".join(parts))
+    return frozenset(out)
+
+
+def _scan_python(
+    rel: str,
+    data: bytes,
+    migration: Migration,
+    result: ScanResult,
+    modules: frozenset[str] = frozenset(),
+) -> None:
     try:
         encoding, _ = tokenize.detect_encoding(io.BytesIO(data).readline)
         source = data.decode(encoding)
@@ -58,7 +82,7 @@ def _scan_python(rel: str, data: bytes, migration: Migration, result: ScanResult
     except (SyntaxError, UnicodeDecodeError, ValueError) as exc:
         result.parse_errors.append(ParseError(rel, f"{type(exc).__name__}: {exc}"))
         return
-    result.findings.extend(migration.check_python(rel, tree, source))
+    result.findings.extend(migration.check_python(rel, tree, source, modules))
 
 
 def _scan_dependencies(rel: str, data: bytes, migration: Migration, result: ScanResult) -> None:

@@ -2,8 +2,11 @@
 and stdlib-only. The host never imports this module; it is copied into the container.
 
     driver.py install [--constraints]   network on;  sees /manifest and /deps only
-    driver.py test [--coverage] -- <cmd...>
-                                        network off; /deps read-only, /work = repo copy
+    driver.py test [--coverage] [--path DIR]... -- <cmd...>
+                                        network off; /deps read-only, /work = repo copy;
+                                        each DIR (repo-relative) goes on PYTHONPATH
+    driver.py smoke <distribution>      network off; /deps read-only, no repo: runs the
+                                        migration's /apifix/smoke_check.py with the deps venv
 
 Test phase layout: /deps is read-only, so an overlay venv in /tmp sees the dependencies via a
 .pth file that calls site.addsitedir(); the repo is installed into the overlay (editable, no
@@ -23,6 +26,9 @@ WORK = "/work"
 RESULTS = "/results"
 OVERLAY = "/tmp/venv"
 MAX_LOG = 8000
+NO_PROJECT = "no pyproject.toml or setup.py"
+SMOKE_CHECK = "/apifix/smoke_check.py"
+SMOKE_MARKER = "APIFIX_SMOKE_RESULT "
 
 
 def _site_dirs(python):
@@ -57,7 +63,7 @@ def _write_results(data):
         json.dump(data, f)
 
 
-def test(command, coverage=False):
+def test(command, coverage=False, paths=()):
     deps_venv = os.path.join(DEPS, "venv")
     subprocess.check_call([sys.executable, "-m", "venv", "--without-pip", OVERLAY])
     overlay_python = _venv_python(OVERLAY)
@@ -69,7 +75,7 @@ def test(command, coverage=False):
     env["PATH"] = os.pathsep.join(
         [os.path.join(OVERLAY, "bin"), os.path.join(deps_venv, "bin"), env.get("PATH", "")]
     )
-    method, log = "pythonpath", "no pyproject.toml or setup.py"
+    method, log = "pythonpath", NO_PROJECT
     if any(os.path.exists(os.path.join(WORK, f)) for f in ("pyproject.toml", "setup.py")):
         pip = [overlay_python, "-m", "pip", "install", "--no-deps", "--no-build-isolation"]
         pip += ["--no-index", "-e", WORK]
@@ -79,9 +85,14 @@ def test(command, coverage=False):
         log = proc.stdout.decode("utf-8", "replace")[-MAX_LOG:]
         if proc.returncode == 0:
             method = "editable"
+    # Import paths the test plan chose (dirs whose sibling modules tests import by bare name),
+    # then, without an editable install, the repo itself.
+    entries = [os.path.join(WORK, p) for p in paths]
     if method == "pythonpath":
-        paths = [os.path.join(WORK, "src"), WORK]
-        env["PYTHONPATH"] = os.pathsep.join(p for p in paths if os.path.isdir(p))
+        entries += [os.path.join(WORK, "src"), WORK]
+    entries = [p for p in entries if os.path.isdir(p)]
+    if entries:
+        env["PYTHONPATH"] = os.pathsep.join(entries)
     print("[apifix] repo install method: " + method, file=sys.stderr, flush=True)
 
     command = [overlay_python if part == "{python}" else part for part in command]
@@ -90,6 +101,7 @@ def test(command, coverage=False):
         env["COVERAGE_FILE"] = os.path.join(RESULTS, ".coverage")
         command = [command[0], "-m", "coverage", "run", "--source", WORK, "-m"] + command[2:]
     data = {"install_method": method, "install_log": log, "command": command}
+    data["import_paths"] = list(paths)
     _write_results(data)  # written before the tests run, in case they time out
     rc = subprocess.call(command, env=env, cwd=WORK)
     data["exit_code"] = rc
@@ -103,15 +115,71 @@ def test(command, coverage=False):
     return rc
 
 
+_SMOKE_VERSIONS = """
+import json, re, sys
+from importlib import metadata
+
+def version(name):
+    try:
+        return metadata.version(name)
+    except metadata.PackageNotFoundError:
+        return None
+
+dist = sys.argv[1]
+out = {"distribution": dist, "version": version(dist), "requires": {}}
+if out["version"] is not None:
+    for req in metadata.requires(dist) or []:
+        if "extra ==" in req:
+            continue
+        name = re.match(r"[A-Za-z0-9][A-Za-z0-9._-]*", req)
+        if name:
+            out["requires"][name.group(0)] = version(name.group(0))
+print(json.dumps(out))
+"""
+
+
+def smoke(distribution):
+    """Run the migration's smoke check against the installed dependencies; print one marker
+    line with its outcome and the installed versions of `distribution` and what it requires."""
+    python = _venv_python(os.path.join(DEPS, "venv"))
+    proc = subprocess.run([python, SMOKE_CHECK], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    output = proc.stdout.decode("utf-8", "replace")[-MAX_LOG:]
+    versions = subprocess.run(
+        [python, "-c", _SMOKE_VERSIONS, distribution], stdout=subprocess.PIPE
+    ).stdout.decode("utf-8", "replace")
+    try:
+        installed = json.loads(versions.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        installed = {}
+    result = {"ok": proc.returncode == 0, "output": output, "installed": installed}
+    print(SMOKE_MARKER + json.dumps(result), flush=True)
+    return 0
+
+
 def main(argv):
     if argv[:1] == ["install"]:
         return install("--constraints" in argv[1:])
-    if argv[:2] == ["test", "--"]:
-        return test(argv[2:])
-    if argv[:3] == ["test", "--coverage", "--"]:
-        return test(argv[3:], coverage=True)
+    if len(argv) == 2 and argv[0] == "smoke":
+        return smoke(argv[1])
+    if argv[:1] == ["test"] and "--" in argv:
+        split = argv.index("--")
+        options, command = argv[1:split], argv[split + 1 :]
+        coverage, paths, ok = False, [], True
+        i = 0
+        while i < len(options):
+            if options[i] == "--coverage":
+                coverage = True
+            elif options[i] == "--path" and i + 1 < len(options):
+                i += 1
+                paths.append(options[i])
+            else:
+                ok = False
+            i += 1
+        if ok and command:
+            return test(command, coverage=coverage, paths=paths)
     print(
-        "usage: driver.py install [--constraints] | test [--coverage] -- <cmd...>",
+        "usage: driver.py install [--constraints] | smoke <distribution>"
+        " | test [--coverage] [--path DIR]... -- <cmd...>",
         file=sys.stderr,
     )
     return 2

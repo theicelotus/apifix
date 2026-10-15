@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from apifix.engine.sandbox import PhaseResult, SandboxResult
+from apifix.engine.sandbox import PhaseResult, SandboxResult, SmokeResult
 from apifix.engine.test_results import FileCoverage, TestCaseResult, counts_from
 from apifix.engine.verifier import (
     INSTALL_OUTPUT_CHARS,
@@ -85,14 +85,16 @@ class FakeSandbox:
     session_coverage: bool | None = None
     last_session: FakeSession | None = None
     envs: list[dict | None] = field(default_factory=list)
+    smokes: list[object] = field(default_factory=list)
 
     def run(self, repo, *, coverage=False, env=None):
         self.baseline_runs += 1
         self.envs.append(env)
         return self.baseline
 
-    def session(self, repo, *, coverage=False, env=None):
+    def session(self, repo, *, coverage=False, env=None, smoke=None):
         self.envs.append(env)
+        self.smokes.append(smoke)
         self.session_coverage = coverage
         self.last_session = FakeSession(list(self.fixed))
         return self.last_session
@@ -715,3 +717,93 @@ def test_decide_precedence():
     assert decide([r("weak")]) == "verified_weak"
     assert decide([r("weak"), r("unverified")]) == "unverified"
     assert decide([r("unverified"), r("reject")]) == "rejected"
+
+
+# --- test files by the shared definition (name or content) -------------------------------------
+
+
+@pytest.mark.parametrize("test_path", ["svc/testserver.py", "svc/checks.py"])
+def test_tampering_checks_cover_test_files_by_new_name_or_content(tmp_path, test_path):
+    # svc/checks.py counts by content: it imports unittest (mock) and defines test_* functions
+    original = write_tree(
+        tmp_path / "original", {"app.py": APP_OLD, "requirements.txt": "", test_path: TESTS_OLD}
+    )
+    weak = TESTS_NEW.replace('assert ask("q") == "x"', 'assert ask("q")')
+    fixed = write_tree(
+        tmp_path / "fixed", {"app.py": APP_NEW, "requirements.txt": "", test_path: weak}
+    )
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(PASSING, [PASSING]))
+    assert reason(v, "tampering.assert_weakened").file == test_path
+    assert v.verdict == "rejected"
+
+
+def test_a_test_file_is_judged_by_its_original_content(tmp_path):
+    # The edit drops the unittest import and the tests; the original still decides.
+    original = write_tree(
+        tmp_path / "original", {"app.py": APP_OLD, "requirements.txt": "", "checks.py": TESTS_OLD}
+    )
+    fixed = write_tree(
+        tmp_path / "fixed",
+        {"app.py": APP_NEW, "requirements.txt": "", "checks.py": "def helper():\n    pass\n"},
+    )
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(PASSING, [PASSING]))
+    assert any(r.code.startswith("tampering.") and r.file == "checks.py" for r in v.reasons)
+
+
+# --- smoke check ------------------------------------------------------------------------------
+
+
+def smoke_failed() -> SmokeResult:
+    return SmokeResult(
+        status="failed",
+        description='import openai; openai.OpenAI(api_key="<dummy key>")',
+        output="Traceback (most recent call last):\n  ...\nTypeError: Client.__init__() got an "
+        "unexpected keyword argument 'proxies'\n",
+        distribution="openai",
+        version="1.5.0",
+        requires={"httpx": "0.28.1", "pydantic": "1.10.26", "typing-extensions": "4.5.0"},
+        pins=["typing_extensions==4.5.0"],
+    )
+
+
+def test_verify_runs_the_migrations_smoke_check_on_the_fixed_code(trees):
+    original, fixed = trees({})
+    sandbox = FakeSandbox(baseline=PASSING, fixed=[PASSING])
+    verify(original, fixed, "openai-v1", sandbox=sandbox)
+    (smoke,) = sandbox.smokes
+    assert smoke.distribution == "openai" and "OpenAI(" in smoke.code
+
+
+def test_failed_smoke_check_rejects_as_a_dependency_problem(trees):
+    original, fixed = trees({})
+    fixed_run = run((T_ASK, "passed"), (T_STRIP, "passed"), coverage=FULL_COVERAGE)
+    fixed_run.smoke = smoke_failed()
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(PASSING, [fixed_run]))
+    assert v.verdict == "rejected"
+    r = reason(v, "smoke_check_failed")
+    assert r.severity == "reject"
+    assert "unexpected keyword argument 'proxies'" in r.message
+    assert "Installed: openai 1.5.0" in r.message
+    assert "httpx 0.28.1" in r.message
+    assert "typing_extensions==4.5.0" in r.message
+    md = v.report_markdown()
+    assert "**Dependency smoke check**" in md and "failed." in md
+    assert v.to_dict()["runs"]["fixed"]["smoke"]["version"] == "1.5.0"
+
+
+@pytest.mark.parametrize("status", ["ok", "error"])
+def test_smoke_check_that_passed_or_could_not_run_does_not_reject(trees, status):
+    original, fixed = trees({})
+    fixed_run = run((T_ASK, "passed"), (T_STRIP, "passed"), coverage=FULL_COVERAGE)
+    fixed_run.smoke = SmokeResult(status, "make a client")
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(PASSING, [fixed_run]))
+    assert "smoke_check_failed" not in codes(v)
+    assert v.verdict == "verified"
+
+
+def test_import_paths_are_in_the_report(trees):
+    original, fixed = trees({})
+    fixed_run = run((T_ASK, "passed"), (T_STRIP, "passed"), coverage=FULL_COVERAGE)
+    fixed_run.import_paths = ["svc"]
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(PASSING, [fixed_run]))
+    assert "**Import paths:** `svc/` on PYTHONPATH" in v.report_markdown()

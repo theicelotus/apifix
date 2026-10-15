@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Protocol
 
 from apifix.engine.dependencies import DeclaredDependency
-from apifix.engine.models import Finding
+from apifix.engine.models import Finding, SmokeCheck
 
 
 class Migration(Protocol):
@@ -34,13 +35,24 @@ class Migration(Protocol):
     known_imports: Mapping[str, str]
     # call path (e.g. "chat.completions.create") -> an object-shaped example response for mocks
     mock_responses: Mapping[str, str]
+    # Runs in the sandbox after the fixed code's dependencies are installed (no network, no repo
+    # code); a failure is reported to the model as a dependency problem. None: no check.
+    smoke_check: SmokeCheck | None
 
-    def job_guide(self, findings: list[Finding]) -> tuple[str, list[str]]:
-        """The parts of `guide` these findings need, and the ids of those parts."""
+    def job_guide(self, findings: list[Finding], root: Path | None = None) -> tuple[str, list[str]]:
+        """The parts of `guide` these findings need, and the ids of those parts. `root`: the
+        repo, for recognising test files by content."""
         ...
 
-    def check_python(self, file: str, tree: ast.Module, source: str) -> list[Finding]:
-        """Return findings for one parsed Python file."""
+    def check_python(
+        self,
+        file: str,
+        tree: ast.Module,
+        source: str,
+        repo_modules: frozenset[str] = frozenset(),
+    ) -> list[Finding]:
+        """Return findings for one parsed Python file. `repo_modules`: dotted names of the
+        scanned repo's own modules."""
         ...
 
     def check_dependency(self, file: str, dep: DeclaredDependency) -> Finding | None:

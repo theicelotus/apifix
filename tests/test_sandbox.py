@@ -12,6 +12,8 @@ import pytest
 
 from apifix.engine import sandbox as sandbox_mod
 from apifix.engine.docker import ProcResult
+from apifix.engine.models import SmokeCheck
+from apifix.engine.project import TestPlan
 from apifix.engine.sandbox import (
     CONTAINER_ENV,
     TEST_PHASE_ENV,
@@ -23,6 +25,7 @@ from apifix.engine.sandbox import (
 from apifix.engine.test_results import TestCounts
 
 CANARY = "s3cr3t-canary-value"
+UNITTEST_COMMAND = ("{python}", "-m", "unittest", "discover", "-v")
 
 
 # --- fake docker ----------------------------------------------------------------------------
@@ -54,11 +57,8 @@ class Call:
 
     @property
     def phase(self) -> str:
-        return (
-            "install"
-            if "install" in self.args[self.args.index("/apifix/driver.py") :][:2]
-            else "test"
-        )
+        sub = self.args[self.args.index("/apifix/driver.py") + 1]
+        return sub if sub in ("install", "smoke") else "test"
 
     @property
     def image(self) -> str:
@@ -76,10 +76,18 @@ def exited(code: int, stdout: str = "", stderr: str = "") -> ProcResult:
 TIMED_OUT = ProcResult(None, "partial", "", True, 5.0)
 
 
+def smoke_output(ok: bool = True, output: str = "", version="1.0.0", requires=None) -> ProcResult:
+    """What `driver.py smoke` prints."""
+    installed = {"distribution": "openai", "version": version, "requires": requires or {}}
+    result = {"ok": ok, "output": output, "installed": installed}
+    return ProcResult(0, "APIFIX_SMOKE_RESULT " + json.dumps(result) + "\n", "", False, 0.1)
+
+
 @dataclass
 class FakeDocker:
     install: list[ProcResult] = field(default_factory=lambda: [ok()])
     test: Callable[[Call], ProcResult] | None = None
+    smoke: Callable[[Call], ProcResult] = lambda call: smoke_output()
     usable: bool = True
     calls: list[Call] = field(default_factory=list)
     removed: list[str] = field(default_factory=list)
@@ -103,6 +111,8 @@ class FakeDocker:
             manifest = call.mounts["/manifest"][0]
             self.requirements.append((manifest / "requirements.txt").read_text())
             return self.install.pop(0)
+        if call.phase == "smoke":
+            return self.smoke(call)
         assert self.test is not None, "unexpected test phase"
         return self.test(call)
 
@@ -524,7 +534,9 @@ def test_unittest_runner(tmp_path):
             "Ran 2 tests in 0.01s\n\nFAILED (failures=1)\n",
         )
 
-    result = run_sandbox(tmp_path, docker=FakeDocker(test=behave))
+    # Detection always picks pytest; unittest only runs when a caller passes such a plan.
+    plan = TestPlan("unittest", ("tests/test_a.py",), UNITTEST_COMMAND, "explicit")
+    result = Sandbox(docker=FakeDocker(test=behave)).run(tmp_path, tests=plan)
     assert result.runner == "unittest"
     assert result.status == "failed"
     assert result.counts == TestCounts(total=2, passed=1, failed=1)
@@ -608,3 +620,111 @@ def test_session_without_tests_never_touches_docker(tmp_path):
         assert session.run_tests().status == "unverified"
         assert session.run_tests().status == "unverified"
     assert docker.calls == []
+
+
+# --- test layouts: explicit test files, import paths ------------------------------------------
+
+
+@pytest.fixture
+def flat_service(tmp_path) -> Path:
+    """Synthetic layout: requirements at the root, code and a unittest file side by side in a
+    package dir, the test importing the code by bare name."""
+    root = tmp_path / "flat"
+    files = {
+        "requirements.txt": "openai==0.28.1\ntyping_extensions==4.5.0\nflask==2.2.3\n",
+        "svc/__init__.py": "",
+        "svc/server.py": "def reply():\n    return 1\n",
+        "svc/testserver.py": "import unittest\nfrom server import reply\n",
+    }
+    for rel, text in files.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(text)
+    return root
+
+
+def test_import_paths_and_explicit_files_reach_the_driver(flat_service):
+    docker = FakeDocker(test=pytest_run(passed=1))
+    result = run_sandbox(flat_service, docker=docker)
+    (test_call,) = [c for c in docker.calls if c.phase == "test"]
+    driver_args = test_call.args[test_call.args.index("/apifix/driver.py") + 1 :]
+    assert driver_args[:4] == ["test", "--path", "svc", "--"]
+    assert driver_args[-1] == "svc/testserver.py"
+    assert result.import_paths == ["svc"]
+    assert result.test_command[-1] == "svc/testserver.py"
+    assert "added svc/ to the import path: svc/testserver.py imports server from it" in result.notes
+
+
+def test_note_when_there_is_nothing_to_install(flat_service):
+    def behave(call):
+        results = call.mounts["/results"][0]
+        driver = {"install_method": "pythonpath", "install_log": "no pyproject.toml or setup.py"}
+        (results / "driver.json").write_text(json.dumps(driver))
+        (results / "junit.xml").write_text(junit(passed=1))
+        return ok()
+
+    result = run_sandbox(flat_service, docker=FakeDocker(test=behave))
+    assert "no pyproject.toml or setup.py: repo put on PYTHONPATH" in result.notes
+    assert not any("editable install failed" in n for n in result.notes)
+
+
+# --- smoke check ------------------------------------------------------------------------------
+
+SMOKE = SmokeCheck("openai", "import openai\nopenai.OpenAI(api_key='x')\n", "make a client")
+
+
+def test_smoke_check_runs_once_without_network_or_repo(flat_service):
+    docker = FakeDocker(test=pytest_run(passed=1))
+    with Sandbox(docker=docker).session(flat_service, smoke=SMOKE) as session:
+        first, second = session.run_tests(), session.run_tests()
+    smoke_calls = [c for c in docker.calls if c.phase == "smoke"]
+    assert len(smoke_calls) == 1
+    (call,) = smoke_calls
+    assert call.network == "none"
+    assert {k: mode for k, (_, mode) in call.mounts.items()} == {
+        "/deps": "ro,z",
+        "/apifix": "ro,z",
+    }
+    assert "smoke_check.py" in docker.snapshots[call.name]["/apifix"]
+    assert call.args[-2:] == ["smoke", "openai"]
+    assert first.smoke == second.smoke and first.smoke.status == "ok"
+    assert first.smoke.description == "make a client"
+
+
+def test_smoke_failure_records_versions_and_limiting_pins(flat_service):
+    out = smoke_output(
+        ok=False,
+        output="Traceback ...\nTypeError: Client.__init__() got an unexpected keyword argument "
+        "'proxies'\n",
+        version="1.5.0",
+        requires={"httpx": "0.28.1", "typing-extensions": "4.5.0", "pydantic": "1.10.26"},
+    )
+    docker = FakeDocker(test=pytest_run(passed=1), smoke=lambda call: out)
+    smoke = Sandbox(docker=docker).run(flat_service, smoke=SMOKE).smoke
+    assert smoke.status == "failed"
+    assert (smoke.distribution, smoke.version) == ("openai", "1.5.0")
+    assert smoke.requires["httpx"] == "0.28.1"
+    # flask==2.2.3 is pinned too, but is not openai or one of its requirements
+    assert smoke.pins == ["openai==0.28.1", "typing_extensions==4.5.0"]
+    assert "proxies" in smoke.output
+
+
+@pytest.mark.parametrize(
+    "proc", [exited(125, stderr="docker: error"), ok(stdout="no marker here\n")]
+)
+def test_smoke_check_that_could_not_run_is_an_error(flat_service, proc):
+    docker = FakeDocker(test=pytest_run(passed=1), smoke=lambda call: proc)
+    result = Sandbox(docker=docker).run(flat_service, smoke=SMOKE)
+    assert result.smoke.status == "error"
+    assert result.status == "passed"  # the tests still ran
+
+
+def test_no_smoke_phase_without_a_check(flat_service):
+    docker = FakeDocker(test=pytest_run(passed=1))
+    assert run_sandbox(flat_service, docker=docker).smoke is None
+    assert all(c.phase != "smoke" for c in docker.calls)
+
+
+def test_no_smoke_phase_when_the_install_failed(flat_service):
+    docker = FakeDocker(install=[exited(1, stderr="ResolutionImpossible")] * 4)
+    result = Sandbox(docker=docker).run(flat_service, smoke=SMOKE)
+    assert result.smoke is None and all(c.phase != "smoke" for c in docker.calls)

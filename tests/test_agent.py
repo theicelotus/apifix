@@ -99,7 +99,7 @@ class JudgingSandbox:
         self.envs.append(env)
         return self.baseline or self.judge(Path(repo))
 
-    def session(self, repo, *, coverage=False, env=None):
+    def session(self, repo, *, coverage=False, env=None, smoke=None):
         sandbox = self
         self.envs.append(env)
 
@@ -1680,3 +1680,19 @@ def test_retry_messages_list_earlier_problems_to_keep_fixed(repo):
         "- 'Missing2' is used but never imported or defined\n"
         "Return the complete corrected file in exactly one code block."
     )
+
+
+def test_failed_smoke_check_implicates_dependency_files():
+    from types import SimpleNamespace
+
+    from apifix.engine.agent import _dependency_problem
+    from apifix.engine.verifier import Reason
+
+    def verification(*reasons):
+        fixed = SimpleNamespace(status="passed", reason="2 passed, 0 skipped")
+        return SimpleNamespace(fixed=fixed, reasons=list(reasons), remaining_findings=[])
+
+    smoke = Reason("smoke_check_failed", "reject", "TypeError: ... 'proxies'")
+    assert _dependency_problem("requirements.txt", verification(smoke))
+    other = Reason("newly_failing", "reject", "1 test fails now")
+    assert not _dependency_problem("requirements.txt", verification(other))

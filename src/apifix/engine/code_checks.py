@@ -12,6 +12,7 @@ from __future__ import annotations
 import ast
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 
 from pyflakes import checker, messages
 
@@ -51,7 +52,8 @@ STDLIB_IMPORTS = {
 
 PATCH_FUNCTIONS = frozenset({"patch", "mock.patch", "unittest.mock.patch", "mocker.patch"})
 MAX_LISTED_NAMES = 20
-# Where repo modules are looked up, relative to the repo root.
+# Where repo modules are looked up, relative to the repo root; per test file, its own directory
+# and the test plan's import paths come first (module_roots()).
 MODULE_ROOTS = ("", "src/")
 
 ReadModule = Callable[[str], str | None]
@@ -194,10 +196,24 @@ def mock_targets(source: str) -> list[tuple[int, str]]:
     return sorted(found)
 
 
-def _module_file(parts: list[str], read_module: ReadModule) -> tuple[str, str] | None:
+def module_roots(test_file: str, import_paths: Sequence[str] = ()) -> tuple[str, ...]:
+    """Where a test file's bare imports and mock targets find repo modules: its own directory
+    (pytest puts the test's directory, or the first non-package one above it, on sys.path),
+    the test plan's import paths, the repo root and src/."""
+    roots = []
+    own = PurePosixPath(test_file).parent.as_posix()
+    for d in (own, *import_paths):
+        if d not in ("", "."):
+            roots.append(d.rstrip("/") + "/")
+    return tuple(dict.fromkeys((*roots, *MODULE_ROOTS)))
+
+
+def _module_file(
+    parts: list[str], read_module: ReadModule, roots: Sequence[str] = MODULE_ROOTS
+) -> tuple[str, str] | None:
     """(relpath, text) of the repo module `parts` names, if any."""
     base = "/".join(parts)
-    for root in MODULE_ROOTS:
+    for root in roots:
         for rel in (f"{root}{base}.py", f"{root}{base}/__init__.py"):
             text = read_module(rel)
             if text is not None:
@@ -466,6 +482,7 @@ class _Options:
     library_modules: frozenset[str]
     mock_responses: Mapping[str, str]  # call path -> object-shaped example response
     dict_helpers: tuple[str, ...]  # the candidate's top-level functions returning a dict literal
+    roots: tuple[str, ...] = MODULE_ROOTS  # where repo modules are looked up
 
 
 MAX_EXAMPLE_LINE = 88
@@ -538,13 +555,17 @@ def _missing_name_problem(
 ) -> str | None:
     parts = site.target.split(".")
     for n in range(len(parts) - 1, 0, -1):
-        found = _module_file(parts[:n], read_module)
+        found = _module_file(parts[:n], read_module, options.roots)
         if found is None:
             continue
         rel, text = found
         name = parts[n]
         names = top_level_names(text)
-        if names is None or name in names or _module_file(parts[: n + 1], read_module):
+        if (
+            names is None
+            or name in names
+            or _module_file(parts[: n + 1], read_module, options.roots)
+        ):
             return None
         listed = sorted(names)
         shown = ", ".join(listed[:MAX_LISTED_NAMES]) + (
@@ -613,12 +634,12 @@ def _code_under_test_problem(
     parts = site.target.split(".")
     if len(parts) < 2 or not site.tests:
         return None
-    found = _module_file(parts[:-1], read_module)
+    found = _module_file(parts[:-1], read_module, options.roots)
     if found is None:
         return None
     rel, text = found
     names = top_level_names(text)
-    if names is None or parts[-1] not in names or _module_file(parts, read_module):
+    if names is None or parts[-1] not in names or _module_file(parts, read_module, options.roots):
         return None
     imported, modules = _test_imports(tree)
     for test in site.tests:
@@ -645,6 +666,7 @@ def mock_target_problems(
     *,
     library_modules: frozenset[str] = frozenset(),
     mock_responses: Mapping[str, str] | None = None,
+    roots: Sequence[str] = MODULE_ROOTS,
 ) -> list[str]:
     """Mock targets new in the candidate that are wrong for a repo module (`read_module(relpath)`
     gives its current text, or None if there is no such file): a name the module does not
@@ -657,7 +679,7 @@ def mock_target_problems(
         tree = ast.parse(candidate)
     except (SyntaxError, ValueError):
         return []
-    options = _Options(library_modules, mock_responses or {}, _dict_helpers(tree))
+    options = _Options(library_modules, mock_responses or {}, _dict_helpers(tree), tuple(roots))
     known = {target for _, target in mock_targets(original)}
     problems, seen = [], set()
     for site in _patch_sites(tree):
