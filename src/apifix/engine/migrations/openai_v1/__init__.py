@@ -34,6 +34,9 @@ class OpenAIV1Migration:
         ),
     )
 
+    known_imports = rules.KNOWN_IMPORTS
+    mock_responses = rules.MOCK_RESPONSES
+
     def job_guide(self, findings: list[Finding]) -> tuple[str, list[str]]:
         return guide_parts.job_guide(findings)
 

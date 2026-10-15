@@ -11,12 +11,18 @@ from __future__ import annotations
 import ast
 import difflib
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from apifix.engine.code_checks import mock_target_problems, undefined_names
+from apifix.engine.code_checks import (
+    DEFAULT_IMPORTS,
+    ImportTable,
+    add_missing_imports,
+    mock_target_problems,
+    undefined_names,
+)
 from apifix.engine.dependencies import dependency_file_problem, is_dependency_file
 from apifix.engine.migrations import Migration
 from apifix.engine.models import CERTAIN, Finding
@@ -262,13 +268,29 @@ def join_errors(errors: list[str]) -> str:
     return "; ".join(errors)
 
 
-def check_retry_message(path: str, error: str) -> str:
-    """Sent in the file's conversation when a candidate fails a check (one retry)."""
-    if "\n" in error:  # join_errors' bullet list (a message with an example)
-        return (
-            f"The updated {path} was rejected:\n{error}\nReturn the complete corrected file in "
-            "exactly one code block."
+_LINE_PREFIX = re.compile(r"^line \d+: ")
+
+
+def error_key(error: str) -> str:
+    """An error's identity across replies: its first line without the `line N: ` prefix."""
+    return _LINE_PREFIX.sub("", error.split("\n", 1)[0])
+
+
+def check_retry_message(path: str, error: str, keep_fixed: Sequence[str] = ()) -> str:
+    """Sent in the file's conversation when a candidate fails a check (one retry). `keep_fixed`:
+    problems of earlier replies for this file that this one does not have (error_key form),
+    listed so that fixing one problem does not bring another back."""
+    keep = ""
+    if keep_fixed:
+        keep = "Keep these fixed (problems in your earlier replies for this file):\n" + "\n".join(
+            f"- {k}" for k in keep_fixed
         )
+    if "\n" in error or keep:  # a bullet list, a message with an example, or keep_fixed
+        lines = [f"The updated {path} was rejected:", error]
+        if keep:
+            lines.append(keep)
+        lines.append("Return the complete corrected file in exactly one code block.")
+        return "\n".join(lines)
     return (
         f"The updated {path} was rejected: {error}. Return the complete corrected file in "
         "exactly one code block."
@@ -342,6 +364,8 @@ _ELISION_COMMENT = re.compile(
 class CheckResult:
     errors: list[str] = field(default_factory=list)
     checks: dict[str, str] = field(default_factory=dict)  # name -> "ok" / "n/a" / problem
+    text: str = ""  # what is written if the checks pass: the candidate plus added imports
+    auto_imports: list[str] = field(default_factory=list)  # import lines apifix added
 
     @property
     def ok(self) -> bool:
@@ -367,13 +391,18 @@ def check_candidate(
     required: bool,
     read_module: Callable[[str], str | None] | None = None,
     library_modules: frozenset[str] = frozenset(),
+    known_imports: ImportTable = DEFAULT_IMPORTS,
+    mock_responses: Mapping[str, str] | None = None,
 ) -> CheckResult:
     """Syntax (Python files), well-formedness (dependency files), "differs from the original"
     (only when `required`), abbreviation (placeholders, or under half the original's lines
     when it has at least MIN_LINES_FOR_LENGTH_CHECK), names used but never defined (Python
     files), and mock targets that are missing from repo modules or patch the code under test
     (test files; `read_module(relpath)` returns the working copy's text of a repo file, or
-    None; `library_modules`, the migrated library, lets messages name the target to patch)."""
+    None; `library_modules`, the migrated library, lets messages name the target to patch,
+    and `mock_responses` gives its example a response shape). Python files that parse first get
+    an import for each new undefined name with exactly one `known_imports` entry, so every
+    check sees the completed file (`text`, `auto_imports`)."""
     checks: dict[str, str] = {}
     errors: list[str] = []
 
@@ -391,6 +420,9 @@ def check_candidate(
             text = f": {exc.text.strip()!r}" if exc.text and exc.text.strip() else ""
             syntax = f"SyntaxError: {exc.msg}{where}{text}"
     record("syntax", syntax, path.endswith(".py"))
+    added: list[str] = []
+    if path.endswith(".py") and not syntax:
+        candidate, added = add_missing_imports(path, original, candidate, known_imports)
 
     dep = is_dependency_file(path) and not syntax  # setup.py with a syntax error: not re-checked
     problem = dependency_file_problem(path, candidate) if dep else None
@@ -417,14 +449,20 @@ def check_candidate(
     record("abbreviation", abbreviated)
 
     python = path.endswith(".py") and not syntax
-    names = undefined_names(path, original, candidate) if python else []
+    names = undefined_names(path, original, candidate, known_imports) if python else []
     record("undefined_names", "; ".join(names) or None, python)
 
     mocks = python and read_module is not None and is_test_file(path)
     targets = (
-        mock_target_problems(original, candidate, read_module, library_modules=library_modules)
+        mock_target_problems(
+            original,
+            candidate,
+            read_module,
+            library_modules=library_modules,
+            mock_responses=mock_responses,
+        )
         if mocks and read_module is not None
         else []
     )
     record("mock_targets", "; ".join(targets) or None, mocks)
-    return CheckResult(errors, checks)
+    return CheckResult(errors, checks, candidate, added)

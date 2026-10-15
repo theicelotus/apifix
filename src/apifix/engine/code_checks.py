@@ -10,7 +10,7 @@ Pure functions (source text in, messages out); repo modules are read through a c
 from __future__ import annotations
 
 import ast
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 
 from pyflakes import checker, messages
@@ -73,21 +73,93 @@ def _undefined(path: str, source: str) -> dict[str, int] | None:
     return found
 
 
-def undefined_names(path: str, original: str, candidate: str) -> list[str]:
-    """Names the candidate uses without defining them that the original did not already use
-    that way (star imports and builtins are pyflakes' business: neither is reported)."""
+ImportTable = Mapping[str, Sequence[str]]  # name -> the import lines that would define it
+
+
+def import_table(*tables: Mapping[str, str]) -> dict[str, tuple[str, ...]]:
+    """name -> the distinct imports the tables offer for it (more than one: ambiguous)."""
+    merged: dict[str, list[str]] = {}
+    for table in tables:
+        for name, line in table.items():
+            if line not in merged.setdefault(name, []):
+                merged[name].append(line)
+    return {name: tuple(lines) for name, lines in merged.items()}
+
+
+DEFAULT_IMPORTS = import_table(STDLIB_IMPORTS)
+
+
+def _new_undefined(path: str, original: str, candidate: str) -> list[tuple[str, int]]:
+    """(name, first line) of names undefined in the candidate but not in the original, in
+    line order; [] when either version does not parse."""
     before, after = _undefined(path, original), _undefined(path, candidate)
     if before is None or after is None:
         return []
+    return sorted(
+        ((n, line) for n, line in after.items() if n not in before),
+        key=lambda item: (item[1], item[0]),
+    )
+
+
+def undefined_names(
+    path: str, original: str, candidate: str, known: ImportTable = DEFAULT_IMPORTS
+) -> list[str]:
+    """Names the candidate uses without defining them that the original did not already use
+    that way (star imports and builtins are pyflakes' business: neither is reported). `known`
+    imports are suggested in the message."""
     problems = []
-    for name, line in sorted(after.items(), key=lambda item: (item[1], item[0])):
-        if name in before:
-            continue
+    for name, line in _new_undefined(path, original, candidate):
         text = f"line {line}: {name!r} is used but never imported or defined"
-        if name in STDLIB_IMPORTS:
-            text += f" (add: {STDLIB_IMPORTS[name]})"
+        offered = known.get(name, ())
+        if len(offered) == 1:
+            text += f" (add: {offered[0]})"
+        elif offered:
+            text += f" (add one of: {'; '.join(offered)})"
         problems.append(text)
     return problems
+
+
+def _import_insert_line(tree: ast.Module) -> int:
+    """The 0-based line index after the module's docstring and its leading imports."""
+    after = 0
+    body = tree.body
+    first = body[0] if body else None
+    if (
+        isinstance(first, ast.Expr)
+        and isinstance(first.value, ast.Constant)
+        and isinstance(first.value.value, str)
+    ):
+        after = first.end_lineno or first.lineno
+        body = body[1:]
+    for stmt in body:
+        if not isinstance(stmt, ast.Import | ast.ImportFrom):
+            break
+        after = stmt.end_lineno or stmt.lineno
+    return after
+
+
+def add_missing_imports(
+    path: str, original: str, candidate: str, known: ImportTable
+) -> tuple[str, list[str]]:
+    """The candidate with an import added for each new undefined name that has exactly one
+    `known` import, after the module's leading imports; and the import lines added. Names
+    with none or several known imports are left alone (the undefined-name check reports
+    them)."""
+    added = []
+    for name, _ in _new_undefined(path, original, candidate):
+        offered = known.get(name, ())
+        if len(offered) == 1 and offered[0] not in added:
+            added.append(offered[0])
+    if not added:
+        return candidate, []
+    tree = ast.parse(candidate, filename=path)  # parses: _new_undefined found names
+    newline = "\r\n" if "\r\n" in candidate else "\n"
+    lines = candidate.splitlines(keepends=True)
+    at = _import_insert_line(tree)
+    if at and not lines[at - 1].endswith(("\n", "\r")):
+        lines[at - 1] += newline
+    lines[at:at] = [line + newline for line in added]
+    return "".join(lines), added
 
 
 # --- mock targets -----------------------------------------------------------------------------
@@ -250,6 +322,7 @@ class _Suggestion:
     # what the test sets, e.g. "OpenAI.return_value.chat.completions.create.return_value"
     chain: str
     origin: str  # e.g. "ask() creates it with client = openai.OpenAI()"
+    path: str  # the call the response comes from, e.g. "chat.completions.create"
 
     @property
     def var(self) -> str:
@@ -316,7 +389,7 @@ class _ModuleIndex:
         kind, what = made
         var = what.split(".")[-1]
         chain = f"{var}.return_value" + (f".{rest}.return_value" if rest else "")
-        return _Suggestion(f"{self.dotted}.{what}", chain, origin)
+        return _Suggestion(f"{self.dotted}.{what}", chain, origin, rest)
 
     def where_created(self, name: str, rest: str) -> _Suggestion | None:
         """Where a function assigns `name` (missing at top level) from a library call."""
@@ -379,34 +452,89 @@ class _ModuleIndex:
             dotted = f"{root}.{rest}" if rest else root
             if root in self.assigned and rest and self.factory(self.assigned[root]):
                 origin = f"{function}() calls the module-level {root}"
-                return _Suggestion(f"{self.dotted}.{dotted}", f"{attrs[-1]}.return_value", origin)
+                chain = f"{attrs[-1]}.return_value"
+                return _Suggestion(f"{self.dotted}.{dotted}", chain, origin, dotted)
             if rest and self._from_library(dotted):
                 origin = f"{function}() calls {dotted}()"
-                return _Suggestion(f"{self.dotted}.{dotted}", f"{attrs[-1]}.return_value", origin)
+                chain = f"{attrs[-1]}.return_value"
+                return _Suggestion(f"{self.dotted}.{dotted}", chain, origin, dotted)
         return None
 
 
-def _example(s: _Suggestion, site: _PatchSite) -> str:
-    """A 3-line example of the suggested patch, in the form the test used."""
+@dataclass(frozen=True)
+class _Options:
+    library_modules: frozenset[str]
+    mock_responses: Mapping[str, str]  # call path -> object-shaped example response
+    dict_helpers: tuple[str, ...]  # the candidate's top-level functions returning a dict literal
+
+
+MAX_EXAMPLE_LINE = 88
+
+
+def _response_for(path: str, responses: Mapping[str, str]) -> str | None:
+    """The example response for the longest key that `path` is or ends with."""
+    keys = [k for k in responses if path == k or path.endswith(f".{k}")]
+    return responses[max(keys, key=len)] if keys else None
+
+
+def _dict_helpers(tree: ast.Module) -> tuple[str, ...]:
+    return tuple(
+        stmt.name
+        for stmt in tree.body
+        if isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef)
+        and any(isinstance(n, ast.Return) and isinstance(n.value, ast.Dict) for n in ast.walk(stmt))
+    )
+
+
+def _assignment(chain: str, value: str) -> list[str]:
+    """`chain = value`, split as `chain = Head(` / inner / `)` when too long."""
+    line = f"{chain} = {value}"
+    if len(line) <= MAX_EXAMPLE_LINE or "(" not in value or not value.endswith(")"):
+        return [line]
+    head, _, inner = value.partition("(")
+    return [f"{chain} = {head}(", f"    {inner[:-1]}", ")"]
+
+
+def _example(s: _Suggestion, site: _PatchSite, response: str | None) -> str:
+    """A short example of the suggested patch, in the form the test used, with an
+    object-shaped response when the migration knows the call's response shape."""
     test = site.tests[0].name if site.tests else "test_example"
-    value = "<the test's mock response>"
+    value = response or "<the test's mock response>"
     if site.function == "mocker.patch":
-        lines = [f'{s.var} = mocker.patch("{s.target}")', f"{s.chain} = {value}"]
+        lines = [f'{s.var} = mocker.patch("{s.target}")', *_assignment(s.chain, value)]
     else:
         lines = [f'@{site.function}("{s.target}")', f"def {test}({s.var}):"]
-        lines.append(f"    {s.chain} = {value}")
+        lines += [f"    {line}" for line in _assignment(s.chain, value)]
     return "For example:\n" + "\n".join(f"    {line}" for line in lines)
 
 
-def _patch_text(s: _Suggestion) -> str:
-    return f'patch("{s.target}") and set {s.chain}'
+def _fix_text(s: _Suggestion, site: _PatchSite, options: _Options) -> str:
+    """`patch(...) and set <chain>.`, the objects-not-dicts note, and the example."""
+    response = _response_for(s.path, options.mock_responses)
+    text = f'patch("{s.target}") and set {s.chain}.'
+    if response:
+        helpers = options.dict_helpers
+        if len(helpers) == 1:
+            text += (
+                f" Mock responses must be objects, not dicts: {helpers[0]}() returns a dict; "
+                "make it return an object, e.g. with SimpleNamespace."
+            )
+        elif helpers:
+            names = ", ".join(f"{h}()" for h in helpers)
+            text += (
+                f" Mock responses must be objects, not dicts: {names} return dicts; make them "
+                "return objects, e.g. with SimpleNamespace."
+            )
+        else:
+            text += " Mock responses must be objects, not dicts (1.x code uses attribute access)."
+    return f"{text}\n{_example(s, site, response)}"
 
 
 # --- the checks -------------------------------------------------------------------------------
 
 
 def _missing_name_problem(
-    site: _PatchSite, read_module: ReadModule, library_modules: frozenset[str]
+    site: _PatchSite, read_module: ReadModule, options: _Options
 ) -> str | None:
     parts = site.target.split(".")
     for n in range(len(parts) - 1, 0, -1):
@@ -426,15 +554,13 @@ def _missing_name_problem(
             f"mock target {site.target!r}: {rel} has no top-level name {name!r} "
             f"(its top-level names: {shown or 'none'})"
         )
-        index = _ModuleIndex(".".join(parts[:n]), ast.parse(text), library_modules)
+        index = _ModuleIndex(".".join(parts[:n]), ast.parse(text), options.library_modules)
         suggestion = index.where_created(name, ".".join(parts[n + 1 :]))
         if suggestion is None:
             return f"{head}. Patch a name that exists in {rel}"
         verb = "the constructor" if "creates" in suggestion.origin else "that"
-        return (
-            f"{head}; {suggestion.origin}. Patch {verb} instead: {_patch_text(suggestion)}.\n"
-            + _example(suggestion, site)
-        )
+        fix = _fix_text(suggestion, site, options)
+        return f"{head}; {suggestion.origin}. Patch {verb} instead: {fix}"
     return None  # not a repo module: outside the repo, not checked
 
 
@@ -481,7 +607,7 @@ def _code_under_test_problem(
     site: _PatchSite,
     tree: ast.Module,
     read_module: ReadModule,
-    library_modules: frozenset[str],
+    options: _Options,
 ) -> str | None:
     """A patch of a repo function or class that the test it applies to calls directly."""
     parts = site.target.split(".")
@@ -504,13 +630,11 @@ def _code_under_test_problem(
             "directly, so patching it replaces the function being tested; patch what it calls "
             "instead"
         )
-        index = _ModuleIndex(".".join(parts[:-1]), ast.parse(text), library_modules)
+        index = _ModuleIndex(".".join(parts[:-1]), ast.parse(text), options.library_modules)
         suggestion = index.what_it_calls(parts[-1])
         if suggestion is None:
             return head
-        return f"{head}: {suggestion.origin}, so {_patch_text(suggestion)}.\n" + _example(
-            suggestion, site
-        )
+        return f"{head}: {suggestion.origin}, so {_fix_text(suggestion, site, options)}"
     return None
 
 
@@ -520,25 +644,28 @@ def mock_target_problems(
     read_module: ReadModule,
     *,
     library_modules: frozenset[str] = frozenset(),
+    mock_responses: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Mock targets new in the candidate that are wrong for a repo module (`read_module(relpath)`
     gives its current text, or None if there is no such file): a name the module does not
     have at top level, or the function or class the test the patch applies to calls directly
     (the code under test). With `library_modules` (the migrated library's top-level modules),
     a message names the concrete target to patch instead when the module's code reaches the
-    library in a recognisable way."""
+    library in a recognisable way; its example sets an object-shaped response from
+    `mock_responses` (call path -> example) when one matches the call."""
     try:
         tree = ast.parse(candidate)
     except (SyntaxError, ValueError):
         return []
+    options = _Options(library_modules, mock_responses or {}, _dict_helpers(tree))
     known = {target for _, target in mock_targets(original)}
     problems, seen = [], set()
     for site in _patch_sites(tree):
         if site.target in known or site.target in seen:
             continue
-        problem = _missing_name_problem(site, read_module, library_modules)
+        problem = _missing_name_problem(site, read_module, options)
         if problem is None:
-            problem = _code_under_test_problem(site, tree, read_module, library_modules)
+            problem = _code_under_test_problem(site, tree, read_module, options)
         if problem:
             seen.add(site.target)
             problems.append(problem)

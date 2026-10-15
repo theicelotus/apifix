@@ -202,3 +202,36 @@ GUIDE_SELECTORS: dict[str, tuple[tuple[frozenset[str], tuple[str, ...]], ...]] =
     ),
     "dependencies": ((frozenset({"dependency"}), ()),),
 }
+
+# Names a rewrite may use without importing them, and the one import that defines each
+# (apifix adds it; see code_checks.add_missing_imports).
+_CLIENT_CLASSES = ("OpenAI", "AsyncOpenAI", "AzureOpenAI", "AsyncAzureOpenAI")
+_V1_ERRORS = sorted(
+    {new for new, _, _ in ERROR_CLASSES.values() if new}
+    | {"APIStatusError", "NotFoundError", "UnprocessableEntityError", "ConflictError"}
+)
+KNOWN_IMPORTS: dict[str, str] = {
+    **{name: f"from openai import {name}" for name in (*_CLIENT_CLASSES, *_V1_ERRORS)},
+    "openai": "import openai",
+    "httpx": "import httpx",
+}
+
+# Object-shaped example responses for mocks, by the 1.x call they stand in for.
+MOCK_RESPONSES: dict[str, str] = {
+    "chat.completions.create": (
+        'SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="hello"))])'
+    ),
+    "completions.create": 'SimpleNamespace(choices=[SimpleNamespace(text="hello")])',
+    "embeddings.create": "SimpleNamespace(data=[SimpleNamespace(embedding=[0.1, 0.2])])",
+    "moderations.create": "SimpleNamespace(results=[SimpleNamespace(flagged=False)])",
+    "images.generate": 'SimpleNamespace(data=[SimpleNamespace(url="https://example.test/a.png")])',
+    "audio.transcriptions.create": 'SimpleNamespace(text="hello")',
+}
+
+# Test files: dict literals shaped like a 0.x response ({"choices": [{"message"/"text": ...}]}).
+MOCK_DICT_RESPONSE = (
+    "1.x responses are objects: build mock responses with attribute access "
+    "(e.g. SimpleNamespace), not dicts."
+)
+RESPONSE_DICT_KEY = "choices"
+RESPONSE_CHOICE_KEYS = frozenset({"message", "text"})

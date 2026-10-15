@@ -33,12 +33,14 @@ from apifix.engine.scanner import scan
 from apifix.engine.test_results import FileCoverage
 from tests.integration.tiny_repo import ORIGINAL as TINY
 from tests.test_code_checks import (
-    LIVE2_CODE_UNDER_TEST,
+    LIVE2_CODE_UNDER_TEST_WF,
     LIVE2_TESTS,
     LIVE_APP,
-    LIVE_TARGET_SUGGESTED,
+    LIVE_TARGET_WF,
     LIVE_TESTS,
-    LIVE_UNDEFINED,
+    RUN3_APP_REPLIES,
+    RUN3_FIXED_TESTS,
+    RUN3_TESTS_1,
     SUGGESTED_FIX,
 )
 from tests.test_verifier import (
@@ -54,6 +56,7 @@ from tests.test_verifier import (
 )
 
 INJECTED = Path(__file__).parent / "fixtures" / "injected_repo"
+T_LIVE3 = "tests.test_app::test_ask"
 _ids = itertools.count(1)
 
 
@@ -1024,6 +1027,7 @@ def test_whole_file_migrates_each_file_in_its_own_request(repo):
                 "undefined_names": "ok",
                 "mock_targets": "n/a",  # not a test file
             },
+            "auto_imports": [],
         }
     ]
     tests_checks = attempt["files"][2]["replies"][0]["checks"]
@@ -1239,6 +1243,7 @@ def test_rejections_stop_at_the_attempt_limit(repo):
 def test_live_run_test_file_bugs_go_back_through_the_check_retry(tmp_path):
     # Replays qwen2.5-coder-7b's live run on the tiny repo: app.py creates the client inside
     # ask(), and the tests use SimpleNamespace without importing it and patch app.client.
+    # apifix now adds the SimpleNamespace import itself; the mock target goes back.
     tiny = write_tree(tmp_path / "tiny", TINY)
     fixed_tests = "from types import SimpleNamespace\n" + LIVE_TESTS.replace(
         "app.client.chat.completions.create", "app.openai.OpenAI"
@@ -1249,20 +1254,18 @@ def test_live_run_test_file_bugs_go_back_through_the_check_retry(tmp_path):
     (attempt,) = result.trajectory["attempts"]
     (nudge,) = attempt["nudges"]
     assert (nudge["kind"], nudge["file"]) == ("check_retry", "tests/test_app.py")
-    assert nudge["error"] == f"- {LIVE_UNDEFINED}\n- {LIVE_TARGET_SUGGESTED}"
+    assert nudge["error"] == LIVE_TARGET_WF and nudge["keep_fixed"] == []
     assert nudge["message"] == (
-        f"The updated tests/test_app.py was rejected:\n- {LIVE_UNDEFINED}\n"
-        f"- {LIVE_TARGET_SUGGESTED}\nReturn the complete corrected file in exactly one code block."
+        f"The updated tests/test_app.py was rejected:\n{LIVE_TARGET_WF}\n"
+        "Return the complete corrected file in exactly one code block."
     )
     convo = llm.requests[3]  # the retry continues the test file's own conversation
     assert [m.role for m in convo] == ["user", "assistant", "user"]
     assert convo[2].text == nudge["message"]
     tests_entry = attempt["files"][2]
     first, second = (r["checks"] for r in tests_entry["replies"])
-    assert (first["undefined_names"], first["mock_targets"]) == (
-        LIVE_UNDEFINED,
-        LIVE_TARGET_SUGGESTED,
-    )
+    assert (first["undefined_names"], first["mock_targets"]) == ("ok", LIVE_TARGET_WF)
+    assert tests_entry["replies"][0]["auto_imports"] == ["from types import SimpleNamespace"]
     assert (second["undefined_names"], second["mock_targets"]) == ("ok", "ok")
     assert tests_entry["accepted"] and attempt["verification"] is not None
     assert '+@mock.patch("app.openai.OpenAI")' in result.diff
@@ -1274,8 +1277,9 @@ def test_a_second_failure_of_the_new_checks_fails_the_attempt(tmp_path):
     result = wf(tiny, llm, max_retries=0)
     (attempt,) = result.trajectory["attempts"]
     assert attempt["result"] == "check_failed" and attempt["verification"] is None
-    assert attempt["files"][2]["error"] == f"- {LIVE_UNDEFINED}\n- {LIVE_TARGET_SUGGESTED}"
-    assert "failed: line 12: 'SimpleNamespace' is used" in result.report_markdown  # one line
+    assert attempt["files"][2]["error"] == LIVE_TARGET_WF
+    assert "failed: mock target 'app.client.chat.completions.create'" in result.report_markdown
+    assert "For example:" not in result.report_markdown  # one line
 
 
 def test_timing_is_recorded_and_reported(repo):
@@ -1460,12 +1464,12 @@ def test_second_live_run_replay(tmp_path):
     first, second = result.trajectory["attempts"]
     assert first["result"] == "check_failed"
     (retry,) = first["nudges"]
-    assert retry["error"] == f"- {LIVE_UNDEFINED}\n- {LIVE_TARGET_SUGGESTED}"
+    assert retry["error"] == LIVE_TARGET_WF
     tests_entry = first["files"][2]
-    assert tests_entry["error"] == LIVE2_CODE_UNDER_TEST
+    assert tests_entry["error"] == LIVE2_CODE_UNDER_TEST_WF
     assert [r["checks"]["mock_targets"] for r in tests_entry["replies"]] == [
-        LIVE_TARGET_SUGGESTED,
-        LIVE2_CODE_UNDER_TEST,
+        LIVE_TARGET_WF,
+        LIVE2_CODE_UNDER_TEST_WF,
     ]
     # attempt 2: only the test file, from the original, with the rejected version as a diff
     assert [f["path"] for f in second["files"]] == ["tests/test_app.py"]
@@ -1478,7 +1482,7 @@ def test_second_live_run_replay(tmp_path):
         in prompt
     )
     assert (
-        f"Your previous version of tests/test_app.py was rejected:\n{LIVE2_CODE_UNDER_TEST}\n"
+        f"Your previous version of tests/test_app.py was rejected:\n{LIVE2_CODE_UNDER_TEST_WF}\n"
         "Its changes from the original" in prompt
     )
     assert '+@mock.patch("app.ask")' in prompt
@@ -1594,3 +1598,85 @@ def test_retried_installs_are_reported(repo):
     )
     runs = result.trajectory["attempts"][0]["verification"]["runs"]
     assert runs["fixed"]["install_retried"] is True
+
+
+# --- live run 3: automatic imports, object-shaped mock data, errors kept fixed ------------------
+
+
+@pytest.mark.parametrize("reply", RUN3_APP_REPLIES[:4])
+def test_run3_oscillating_app_replies_are_accepted_first_time(tmp_path, reply):
+    tiny = write_tree(tmp_path / "tiny", TINY)
+    llm = FakeLLM([block(REQS_NEW, ""), block(reply), block(RUN3_FIXED_TESTS)])
+    result = wf(
+        tiny, llm, JudgingSandbox(judge=lambda tree: run((T_LIVE3, "passed"))), max_retries=0
+    )
+    (attempt,) = result.trajectory["attempts"]
+    app = attempt["files"][1]
+    assert app["accepted"] and len(app["replies"]) == 1 and attempt["nudges"] == []
+    (added,) = app["auto_imports"]
+    assert added in ("import os", "from openai import OpenAI")
+    assert f"- apifix added: {added} (app.py, attempt 1)" in result.report_markdown
+    assert f"+{added}\n" in result.diff
+
+
+def test_run3_replay(tmp_path):
+    # Run 3: app.py oscillated between a missing `import os` and a missing OpenAI import, and
+    # the final test file kept a dict-returning completion() helper. Now the import is added,
+    # the test file's prompt lists the dict, and the retry example shows an object response.
+    tiny = write_tree(tmp_path / "tiny", TINY)
+    llm = FakeLLM(
+        [block(REQS_NEW, ""), block(RUN3_APP_REPLIES[0]), block(RUN3_TESTS_1)]
+        + [block(RUN3_FIXED_TESTS)]
+    )
+    sandbox = JudgingSandbox(judge=lambda tree: run((T_LIVE3, "passed")))
+    result = wf(tiny, llm, sandbox, max_retries=0)
+    (attempt,) = result.trajectory["attempts"]
+    app, tests = attempt["files"][1:]
+    assert (
+        app["auto_imports"] == ["import os"]
+        and app["replies"][0]["checks"]["undefined_names"] == "ok"
+    )
+    prompt = llm.requests[2][0].text
+    assert (
+        "- 7: response_access [likely]\n"
+        '    old: {"choices": [{"message": {"content": text}}]}\n'
+        "    fix: 1.x responses are objects: build mock responses with attribute access "
+        "(e.g. SimpleNamespace), not dicts." in prompt
+    )
+    (nudge,) = attempt["nudges"]
+    assert nudge["file"] == "tests/test_app.py"
+    assert "completion() returns a dict; make it return an object" in nudge["error"]
+    assert (
+        "        OpenAI.return_value.chat.completions.create.return_value = SimpleNamespace(\n"
+        '            choices=[SimpleNamespace(message=SimpleNamespace(content="hello"))]\n'
+        "        )" in nudge["message"]
+    )
+    assert tests["accepted"] and tests["replies"][1]["checks"]["mock_targets"] == "ok"
+    assert "- apifix added: import os (app.py, attempt 1)" in result.report_markdown
+    assert "+    return SimpleNamespace(choices=" in result.diff
+
+
+def test_retry_messages_list_earlier_problems_to_keep_fixed(repo):
+    def broken(name):
+        return block(APP_NEW + f"\nX = {name}()\n")
+
+    llm = FakeLLM(
+        [block(REQS_NEW, ""), broken("Missing1"), broken("Missing2")]  # attempt 1 fails
+        + [broken("Missing3"), broken("Missing1")]  # attempt 2: app.py first, fails again
+    )
+    result = wf(repo, llm, max_retries=1)
+    first, second = result.trajectory["attempts"]
+    assert first["nudges"][0]["keep_fixed"] == []  # nothing earlier yet
+    (retry,) = second["nudges"]
+    assert retry["keep_fixed"] == [
+        "'Missing1' is used but never imported or defined",
+        "'Missing2' is used but never imported or defined",
+    ]
+    assert retry["message"] == (
+        "The updated app.py was rejected:\n"
+        f"line {APP_NEW.count(chr(10)) + 2}: 'Missing3' is used but never imported or defined\n"
+        "Keep these fixed (problems in your earlier replies for this file):\n"
+        "- 'Missing1' is used but never imported or defined\n"
+        "- 'Missing2' is used but never imported or defined\n"
+        "Return the complete corrected file in exactly one code block."
+    )

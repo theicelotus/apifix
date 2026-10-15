@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import textwrap
 
 import pytest
 
@@ -433,3 +434,85 @@ def test_long_patterns_are_truncated(scan_code):
     code = "import openai\nr = openai.Completion.create(prompt='x')\nr" + '["choices"]' * 20 + "\n"
     f = at(scan_code(code), 3)
     assert len(f.old_pattern) <= 120 and f.old_pattern.endswith("...")
+
+
+# --- test files: dict-shaped mock responses --------------------------------------------------
+
+
+def _scan_file(tmp_path, rel: str, code: str) -> list:
+    path = tmp_path / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(textwrap.dedent(code))
+    return [f for f in scan(tmp_path, "openai-v1").findings if f.file == rel]
+
+
+MOCK_DICT = (
+    "1.x responses are objects: build mock responses with attribute access "
+    "(e.g. SimpleNamespace), not dicts."
+)
+
+
+def test_dict_response_in_a_test_helper_is_likely(tmp_path):
+    (f,) = _scan_file(
+        tmp_path,
+        "tests/test_app.py",
+        """
+        def completion(text):
+            return {"choices": [{"message": {"content": text}}]}
+        """,
+    )
+    assert (f.line, f.category, f.confidence) == (3, "response_access", "likely")
+    assert f.old_pattern == '{"choices": [{"message": {"content": text}}]}'
+    assert f.suggestion == MOCK_DICT
+
+
+def test_inline_and_completion_shaped_dicts_are_flagged(tmp_path):
+    findings = _scan_file(
+        tmp_path,
+        "test_bot.py",
+        """
+        from unittest import mock
+
+        @mock.patch("bot.client.completions.create")
+        def test_complete(create):
+            create.return_value = {"choices": ({"text": "hi"},), "usage": {}}
+            data = {"model": "m", "choices": [{"index": 0, "message": {"content": "x"}}]}
+        """,
+    )
+    assert [(f.line, f.suggestion) for f in findings] == [(6, MOCK_DICT), (7, MOCK_DICT)]
+
+
+def test_other_dicts_and_non_test_files_are_not_flagged(tmp_path):
+    assert (
+        _scan_file(
+            tmp_path,
+            "tests/test_misc.py",
+            """
+        a = {"choices": ["red", "green"]}
+        b = {"choices": [{"label": "x"}]}
+        c = {"message": {"content": "x"}}
+        d = dict(choices=[{"message": {}}])
+        """,
+        )
+        == []
+    )
+    assert (
+        _scan_file(
+            tmp_path, "app/fixtures.py", 'SAMPLE = {"choices": [{"message": {"content": "x"}}]}\n'
+        )
+        == []
+    )
+
+
+def test_tiny_repo_test_file_gets_the_new_finding(tmp_path):
+    from tests.integration.tiny_repo import ORIGINAL as TINY
+
+    for rel, text in TINY.items():
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text(textwrap.dedent(text))
+    tests = [f for f in scan(tmp_path, "openai-v1").findings if f.file == "tests/test_app.py"]
+    assert [(f.line, f.category) for f in tests] == [
+        (7, "response_access"),
+        (10, "api_call"),
+        (16, "api_call"),
+    ]

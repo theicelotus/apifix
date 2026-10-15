@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
+import ast
 import os
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 
 import pytest
 
 from apifix.engine.code_checks import (
+    STDLIB_IMPORTS,
+    add_missing_imports,
+    import_table,
     mock_target_problems,
     mock_targets,
     top_level_names,
     undefined_names,
 )
+from apifix.engine.migrations import get_migration
 from tests.integration.tiny_repo import ORIGINAL as TINY
 
 TINY_APP = textwrap.dedent(TINY["app.py"])
@@ -117,6 +123,30 @@ LIVE2_CODE_UNDER_TEST = (
     "it replaces the function being tested; patch what it calls instead: ask() creates "
     'client = openai.OpenAI(), so patch("app.openai.OpenAI") and set '
     "OpenAI.return_value.chat.completions.create.return_value.\n" + EXAMPLE
+)
+
+# Whole-file mode passes the migration's response shapes: the example sets an object, and the
+# message names the dict-returning helper.
+WF_FIX = (
+    'patch("app.openai.OpenAI") and set OpenAI.return_value.chat.completions.create'
+    ".return_value. Mock responses must be objects, not dicts: completion() returns a dict; "
+    "make it return an object, e.g. with SimpleNamespace.\n"
+    "For example:\n"
+    '    @mock.patch("app.openai.OpenAI")\n'
+    "    def test_ask(OpenAI):\n"
+    "        OpenAI.return_value.chat.completions.create.return_value = SimpleNamespace(\n"
+    '            choices=[SimpleNamespace(message=SimpleNamespace(content="hello"))]\n'
+    "        )"
+)
+LIVE_TARGET_WF = (
+    "mock target 'app.client.chat.completions.create': app.py has no top-level name 'client' "
+    "(its top-level names: ask, openai); ask() creates it with client = openai.OpenAI(). "
+    "Patch the constructor instead: " + WF_FIX
+)
+LIVE2_CODE_UNDER_TEST_WF = (
+    "mock target 'app.ask' in test_ask: the test calls ask() from app.py directly, so patching "
+    "it replaces the function being tested; patch what it calls instead: ask() creates "
+    "client = openai.OpenAI(), so " + WF_FIX
 )
 
 
@@ -361,11 +391,11 @@ class OpenAI:
 """
 
 
-def _pytest(root, tests: str) -> subprocess.CompletedProcess:
-    """Run `tests` against the live app.py with an openai stub that, like the real one,
-    raises without an API key."""
+def _pytest(root, tests: str, app: str = LIVE_APP) -> subprocess.CompletedProcess:
+    """Run `tests` against a live app.py with an openai stub that, like the real one, raises
+    without an API key."""
     root.mkdir()
-    for rel, text in {"app.py": LIVE_APP, "openai.py": STUB_OPENAI, "test_app.py": tests}.items():
+    for rel, text in {"app.py": app, "openai.py": STUB_OPENAI, "test_app.py": tests}.items():
         (root / rel).write_text(text)
     return subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "test_app.py"],
@@ -639,3 +669,159 @@ def test_no_suggestion_without_a_library_call():
         "mock target 'app.client.x': app.py has no top-level name 'client' (its top-level names: "
         "ask, json). Patch a name that exists in app.py"
     ]
+
+
+# --- live run 3: automatic imports, object-shaped mock data ------------------------------------
+
+RUN3 = Path(__file__).parent / "fixtures" / "live_run3"
+RUN3_APP_REPLIES = [(RUN3 / f"app_reply_{i}.txt").read_text() for i in range(1, 6)]
+RUN3_APP = RUN3_APP_REPLIES[-1]  # attempt 3's app.py, accepted
+RUN3_TESTS_1, RUN3_TESTS_2 = ((RUN3 / f"tests_reply_{i}.txt").read_text() for i in (1, 2))
+KNOWN = import_table(STDLIB_IMPORTS, get_migration("openai-v1").known_imports)
+
+
+@pytest.mark.parametrize(
+    ("reply", "added"),
+    [
+        (RUN3_APP_REPLIES[0], ["import os"]),
+        (RUN3_APP_REPLIES[1], ["from openai import OpenAI"]),
+        (RUN3_APP_REPLIES[2], ["from openai import OpenAI"]),
+        (RUN3_APP_REPLIES[3], ["import os"]),
+        (RUN3_APP_REPLIES[4], []),
+    ],
+)
+def test_run3_oscillating_app_replies_are_completed(reply, added):
+    text, got = add_missing_imports("app.py", TINY_APP, reply, KNOWN)
+    assert got == added
+    assert undefined_names("app.py", TINY_APP, text, KNOWN) == []
+
+
+def test_auto_import_cases():
+    original = "import openai\n"
+    table = import_table(STDLIB_IMPORTS, {"OpenAI": "from openai import OpenAI"})
+    stdlib = "import openai\n\nx = SimpleNamespace(a=os.sep)\n"
+    assert add_missing_imports("m.py", original, stdlib, table)[1] == [
+        "from types import SimpleNamespace",
+        "import os",
+    ]
+    migration = "import openai\n\nclient = OpenAI()\n"
+    assert add_missing_imports("m.py", original, migration, table) == (
+        "import openai\nfrom openai import OpenAI\n\nclient = OpenAI()\n",
+        ["from openai import OpenAI"],
+    )
+    ambiguous = import_table(
+        {"Client": "from openai import OpenAI as Client"}, {"Client": "from httpx import Client"}
+    )
+    assert ambiguous == {
+        "Client": ("from openai import OpenAI as Client", "from httpx import Client")
+    }
+    code = "import openai\n\nc = Client()\n"
+    assert add_missing_imports("m.py", original, code, ambiguous) == (code, [])
+    assert undefined_names("m.py", original, code, ambiguous) == [
+        "line 3: 'Client' is used but never imported or defined (add one of: from openai "
+        "import OpenAI as Client; from httpx import Client)"
+    ]
+    unknown = "import openai\n\nc = Whatever()\n"
+    assert add_missing_imports("m.py", original, unknown, table) == (unknown, [])
+    assert undefined_names("m.py", original, unknown, table) == [
+        "line 3: 'Whatever' is used but never imported or defined"
+    ]
+
+
+def test_names_undefined_in_the_original_get_no_import():
+    original = "x = os.sep\n"  # relies on something else (e.g. exec'd globals)
+    assert add_missing_imports("m.py", original, "x = os.sep\ny = 1\n", KNOWN) == (
+        "x = os.sep\ny = 1\n",
+        [],
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        # after the leading imports, not after later ones
+        (
+            "import a\nfrom b import (\n    c,\n)\n\nx = os.sep\nimport d\n",
+            "import a\nfrom b import (\n    c,\n)\nimport os\n\nx = os.sep\nimport d\n",
+        ),
+        # after a docstring, with no imports
+        ('"""Doc."""\n\nx = os.sep\n', '"""Doc."""\nimport os\n\nx = os.sep\n'),
+        # nothing at all before the code
+        ("x = os.sep\n", "import os\nx = os.sep\n"),
+        # CRLF line endings are kept, and a last import line without a newline
+        ("import a\r\n\r\nx = os.sep\r\n", "import a\r\nimport os\r\n\r\nx = os.sep\r\n"),
+        ("import a; x = os.sep", "import a; x = os.sep\nimport os\n"),
+    ],
+)
+def test_where_imports_are_inserted(source, expected):
+    text, added = add_missing_imports("m.py", "", source, KNOWN)
+    assert (text, added) == (expected, ["import os"])
+    ast.parse(text)
+
+
+MIGRATION = get_migration("openai-v1")
+
+
+def _wf_problems(tests: str, app: str) -> list[str]:
+    return mock_target_problems(
+        TINY_TESTS,
+        tests,
+        reader({"app.py": app}),
+        library_modules=OPENAI,
+        mock_responses=MIGRATION.mock_responses,
+    )
+
+
+def test_run3_test_file_gets_the_object_shaped_example():
+    (problem,) = _wf_problems(RUN3_TESTS_1, RUN3_APP)
+    assert problem == (
+        "mock target 'app.client.chat.completions.create': app.py has no top-level name 'client' "
+        "(its top-level names: OpenAI, ask, os); ask() creates it with client = "
+        "OpenAI(api_key=os.getenv('OPENAI_API_KEY')). Patch the constructor instead: "
+        'patch("app.OpenAI") and set OpenAI.return_value.chat.completions.create.return_value. '
+        "Mock responses must be objects, not dicts: completion() returns a dict; make it return "
+        "an object, e.g. with SimpleNamespace.\n"
+        "For example:\n"
+        '    @mock.patch("app.OpenAI")\n'
+        "    def test_ask(OpenAI):\n"
+        "        OpenAI.return_value.chat.completions.create.return_value = SimpleNamespace(\n"
+        '            choices=[SimpleNamespace(message=SimpleNamespace(content="hello"))]\n'
+        "        )"
+    )
+    assert _wf_problems(RUN3_TESTS_2, RUN3_APP) == []  # the target was right in the end
+
+
+RUN3_FIXED_TESTS = RUN3_TESTS_2.replace(
+    'return {"choices": [{"message": {"content": text}}]}',
+    "return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))])",
+).replace(
+    "from unittest import mock\n", "from types import SimpleNamespace\nfrom unittest import mock\n"
+)
+
+
+def test_run3_dict_helper_fails_and_the_object_helper_passes(tmp_path):
+    live = _pytest(tmp_path / "live", RUN3_TESTS_2, app=RUN3_APP)
+    assert live.returncode == 1 and "'dict' object has no attribute 'choices'" in live.stdout
+    fixed = _pytest(tmp_path / "fixed", RUN3_FIXED_TESTS, app=RUN3_APP)
+    assert fixed.returncode == 0, fixed.stdout
+
+
+def test_example_responses_follow_the_call_and_the_helpers():
+    app = "import openai\n\n\ndef ask(q):\n    return openai.embeddings.create(input=q)\n"
+    tests = (
+        "from unittest import mock\nfrom app import ask\n\n\ndef r1():\n    return {}\n\n\n"
+        "def r2():\n    return {'a': 1}\n\n\n@mock.patch('app.ask')\ndef test_a(m):\n    ask('q')\n"
+    )
+    (problem,) = _wf_problems(tests, app)
+    assert "r1(), r2() return dicts; make them return objects" in problem
+    assert (
+        "create.return_value = SimpleNamespace(data=[SimpleNamespace(embedding=[0.1, 0.2])])"
+        in (problem)
+    )  # short enough for one line
+    no_helpers = tests.replace("return {}", "return 1").replace("return {'a': 1}", "return 2")
+    (problem,) = _wf_problems(no_helpers, app)
+    assert "Mock responses must be objects, not dicts (1.x code uses attribute access)." in problem
+    # a call with no known shape keeps the placeholder, and no note
+    unknown = app.replace("embeddings.create", "batches.create")
+    (problem,) = _wf_problems(no_helpers, unknown)
+    assert "= <the test's mock response>" in problem and "Mock responses" not in problem

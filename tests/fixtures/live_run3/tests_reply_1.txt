@@ -1,0 +1,19 @@
+from unittest import mock
+
+from app import ask
+
+
+def completion(text):
+    return {"choices": [{"message": {"content": text}}]}
+
+
+@mock.patch("app.client.chat.completions.create")
+def test_ask(create):
+    create.return_value = completion("hello")
+    assert ask("hi") == "hello"
+
+
+@mock.patch("app.client.chat.completions.create")
+def test_strips_whitespace(create):
+    create.return_value = completion("  hello\n")
+    assert ask("hi") == "hello"

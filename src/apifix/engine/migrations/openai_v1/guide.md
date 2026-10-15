@@ -15,12 +15,13 @@ resp = openai.ChatCompletion.create(model="gpt-4o-mini", messages=msgs)
 # 1.x
 from openai import OpenAI
 
-client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"), base_url="https://example.test/v1", organization="org-x"
-)
+client = OpenAI(base_url="https://example.test/v1", organization="org-x")  # reads OPENAI_API_KEY
 resp = client.chat.completions.create(model="gpt-4o-mini", messages=msgs)
 ```
 
+- `OpenAI()` reads `OPENAI_API_KEY` from the environment itself: do not add
+  `api_key=os.getenv("OPENAI_API_KEY")` or `import os` for it. Pass `api_key=` only where
+  0.x code set a key from somewhere else.
 - `OpenAI()` raises at construction when no API key is available (argument or
   `OPENAI_API_KEY`). Tests run without keys, so a client built at import time breaks every
   test that imports the module. Build it lazily (e.g. a small `functools.lru_cache` function
@@ -122,6 +123,23 @@ openai.APIConnectionError(request=request)
 Update mocks to the new call path and keep every assertion as it is. Patch what the code under
 test calls, never the function or class the test exercises: after `from app import ask`,
 `patch("app.ask")` leaves the test's `ask` untouched, so the real one runs.
+
+Mock responses must be objects, not dicts: 1.x code reads `resp.choices[0].message.content`,
+which fails on a dict. Helpers that build dict responses must return objects:
+
+```python
+# 0.x
+def completion(text):
+    return {"choices": [{"message": {"content": text}}]}
+
+
+# 1.x
+from types import SimpleNamespace
+
+
+def completion(text):
+    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))])
+```
 
 `openai.OpenAI()` raises `OpenAIError` when no API key is set (argument or `OPENAI_API_KEY`),
 and tests normally run without one. A test must keep the real constructor from running, or the

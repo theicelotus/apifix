@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from apifix.engine.agent_tools import TOOLS, EditRecord, Workspace
+from apifix.engine.code_checks import STDLIB_IMPORTS, import_table
 from apifix.engine.dependencies import is_dependency_file
 from apifix.engine.diffing import diff_trees, read_text, unified_diff
 from apifix.engine.llm import LLMClient, LLMError, LLMResponse, Message, ToolResult, Usage
@@ -47,6 +48,7 @@ from apifix.engine.whole_file import (
     check_candidate,
     check_retry_message,
     context_candidates,
+    error_key,
     file_prompt,
     join_errors,
     must_change,
@@ -275,6 +277,10 @@ class _Job:
         self.wf_dependency_feedback = ""
         self.wf_previous: dict[str, tuple[str | None, str]] = {}
         self.guide_sections: list[str] | None = None  # whole-file: the job guide's parts
+        # whole-file: every check error of every reply so far, per file (error_key form), for
+        # the "keep these fixed" part of a retry message; and the imports apifix may add
+        self.wf_error_history: dict[str, list[str]] = {}
+        self.known_imports = import_table(STDLIB_IMPORTS, migration.known_imports)
         # Variables the repo's CI sets that the sandbox's test phase gets placeholders for
         # (name -> workflow file), in the baseline and in every verification.
         self.ci_env = ci_env_vars(repo, migration.ci_env_placeholders)
@@ -567,18 +573,29 @@ class _Job:
                 required=required,
                 read_module=self._working_copy_reader(path, candidate),
                 library_modules=self.migration.api_modules,
+                known_imports=self.known_imports,
+                mock_responses=self.migration.mock_responses,
             )
             reply["checks"] = result.checks
+            reply["auto_imports"] = result.auto_imports
+            candidate = result.text
             if not result.ok:
                 error = join_errors(result.errors)
+                history = self.wf_error_history.setdefault(path, [])
+                current = {error_key(e) for e in result.errors}
+                keep_fixed = [k for k in history if k not in current]
+                history += [
+                    k for k in dict.fromkeys(map(error_key, result.errors)) if k not in history
+                ]
                 if retries < self.config.max_check_retries_per_file:
                     retries += 1
-                    message = check_retry_message(path, error)
+                    message = check_retry_message(path, error, keep_fixed)
                     attempt.nudges.append(
                         {
                             "kind": "check_retry",
                             "file": path,
                             "error": error,
+                            "keep_fixed": keep_fixed,
                             "response": reply["response"],
                             "message": message,
                         }
@@ -588,6 +605,7 @@ class _Job:
                 entry["error"] = error
                 break
             (self.work / path).write_bytes(candidate.encode("utf-8"))
+            entry["auto_imports"] = result.auto_imports
             entry["accepted"] = True
             entry["changed"] = candidate != original
             break
@@ -914,6 +932,10 @@ def report_markdown(
             f"{', '.join(retried)}"
         )
     if job.whole_file:
+        for a in job.attempts:
+            for f in a.files:
+                for line in f.get("auto_imports", []) if f["accepted"] else []:
+                    lines.append(f"- apifix added: {line} ({f['path']}, attempt {a.number})")
         if job.guide_sections is not None:
             lines.append(f"- Guide sections sent: {', '.join(job.guide_sections)}")
         lines += [f"- Not sent: `{f['path']}` ({f['reason']})" for f in job.wf_skipped]

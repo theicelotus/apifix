@@ -1,0 +1,19 @@
+from unittest import mock
+
+from app import ask
+
+
+def completion(text):
+    return {"choices": [{"message": {"content": text}}]}
+
+
+@mock.patch("app.OpenAI")
+def test_ask(OpenAI):
+    OpenAI.return_value.chat.completions.create.return_value = completion("hello")
+    assert ask("hi") == "hello"
+
+
+@mock.patch("app.OpenAI")
+def test_strips_whitespace(OpenAI):
+    OpenAI.return_value.chat.completions.create.return_value = completion("  hello\n")
+    assert ask("hi") == "hello"

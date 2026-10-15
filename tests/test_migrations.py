@@ -102,7 +102,7 @@ def test_job_guide_for_the_live_run():
         assert gone not in text, gone
     assert '@mock.patch("app.openai.OpenAI")' in text and "## Dependencies" in text
     assert len(text) < len(get_migration("openai-v1").guide) * 0.6
-    assert "\n\n## Resources" in text and "\n\n\n" not in text.replace("\n\n\n# 1.x", "")
+    assert "\n\n## Resources" in text and "\n\n\n## " not in text  # sections joined cleanly
 
 
 @pytest.mark.parametrize(
@@ -146,3 +146,41 @@ def test_resources_table_keeps_only_used_rows():
     text, parts = mig.job_guide([_finding("removed_module", "openai.embeddings_utils")])
     assert "resources.removed" in parts and "| 0.x | 1.x |\n|---|---|\n| `openai.Chat" not in text
     assert "## Resources\n\nRemoved with no direct equivalent:" in text
+
+
+# --- known imports, mock responses, guide advice -------------------------------------------------
+
+
+def test_known_imports_cover_the_1x_names():
+    from apifix.engine.migrations.openai_v1 import rules
+
+    known = get_migration("openai-v1").known_imports
+    for new, _, _ in rules.ERROR_CLASSES.values():
+        if new:
+            assert known[new] == f"from openai import {new}"
+    for name in ("OpenAI", "AsyncOpenAI", "AzureOpenAI", "AsyncAzureOpenAI", "NotFoundError"):
+        assert known[name] == f"from openai import {name}"
+    assert (known["openai"], known["httpx"]) == ("import openai", "import httpx")
+
+
+def test_mock_responses_are_object_shaped_and_name_real_resources():
+    from apifix.engine.migrations.openai_v1 import rules
+
+    paths = set(rules.RESOURCES.values()) | {"audio.transcriptions"}
+    for call, example in get_migration("openai-v1").mock_responses.items():
+        assert call.rsplit(".", 1)[0] in paths, call
+        assert example.startswith("SimpleNamespace(") and "{" not in example, call
+
+
+def test_guide_advice_on_keys_and_mock_data():
+    guide = get_migration("openai-v1").guide
+    client = guide.split("## Client")[1].split("## Resources")[0]
+    v1_example = client.split("# 1.x")[1].split("```")[0]
+    assert "os.getenv" not in v1_example and "import os" not in v1_example
+    assert 'do not add\n  `api_key=os.getenv("OPENAI_API_KEY")` or `import os` for it' in client
+    tests = guide.split("## Tests")[1]
+    assert "Mock responses must be objects, not dicts" in tests
+    assert (
+        "return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))])"
+        in tests
+    )

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from apifix.engine.migrations.openai_v1 import rules
 from apifix.engine.models import CERTAIN, LIKELY, Category, Confidence, Finding
+from apifix.engine.tampering import is_test_file
 
 _MAX_PATTERN = 120
 
@@ -159,6 +160,7 @@ class _Visitor(ast.NodeVisitor):
         self.source = source
         self.aliases = aliases
         self.azure = azure
+        self.test_file = is_test_file(file)
         self.findings: list[Finding] = []
         # One dict per function/class scope: name -> True if it holds a stream, else False.
         self.scopes: list[dict[str, bool]] = [{}]
@@ -350,6 +352,30 @@ class _Visitor(ast.NodeVisitor):
 
     visit_For = _visit_for
     visit_AsyncFor = _visit_for
+
+    # test files: mock data shaped like a 0.x (dict) response
+
+    @staticmethod
+    def _key(node: ast.expr | None) -> object:
+        return node.value if isinstance(node, ast.Constant) else None
+
+    def _is_response_dict(self, node: ast.Dict) -> bool:
+        """{"choices": [{"message": ...}]} or {"choices": [{"text": ...}]} (list or tuple)."""
+        for key, value in zip(node.keys, node.values, strict=True):
+            if self._key(key) != rules.RESPONSE_DICT_KEY:
+                continue
+            if isinstance(value, ast.List | ast.Tuple):
+                for elt in value.elts:
+                    if isinstance(elt, ast.Dict) and any(
+                        self._key(k) in rules.RESPONSE_CHOICE_KEYS for k in elt.keys
+                    ):
+                        return True
+        return False
+
+    def visit_Dict(self, node: ast.Dict) -> None:
+        if self.test_file and self._is_response_dict(node):
+            self._report(node, "response_access", rules.MOCK_DICT_RESPONSE, LIKELY)
+        self.generic_visit(node)
 
     def _visit_scope(self, node: ast.AST) -> None:
         self.scopes.append({})

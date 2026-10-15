@@ -29,6 +29,11 @@ class Migration(Protocol):
     # (marker, explanation): when a failing test's output contains the marker, the retry
     # feedback carries the explanation.
     failure_hints: tuple[tuple[str, str], ...]
+    # name -> the import that defines it, for names the library's 1.x code uses (apifix adds
+    # a missing one when it is the only import known for the name).
+    known_imports: Mapping[str, str]
+    # call path (e.g. "chat.completions.create") -> an object-shaped example response for mocks
+    mock_responses: Mapping[str, str]
 
     def job_guide(self, findings: list[Finding]) -> tuple[str, list[str]]:
         """The parts of `guide` these findings need, and the ids of those parts."""

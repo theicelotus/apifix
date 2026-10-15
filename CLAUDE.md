@@ -72,8 +72,9 @@ src/apifix/
                       code-block parsing, pre-apply checks (syntax, dependency file, changed,
                       abbreviation, undefined names, mock targets)
     code_checks.py    static checks on a rewritten file (not mode-specific): new undefined names
-                      (pyflakes), new mock.patch targets missing from repo modules or patching
-                      the code under test, with the concrete target/mock chain to use instead
+                      (pyflakes; adds the import itself when exactly one is known), new
+                      mock.patch targets missing from repo modules or patching the code under
+                      test, with the concrete target, mock chain and response shape instead
 benchmark/            real repos + scoring
 docs/plans/           approved plans, one file per step (request, plan, amendments)
 tests/                pytest; fixtures/ holds realistic sample code
@@ -144,6 +145,10 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   response is assigned and used in the same function/module scope.
 - No `getattr(openai, ...)` or other dynamic-attribute detection.
 - `.ipynb` notebooks are not scanned yet.
+- openai-v1, test files only: dict literals shaped like a 0.x response (`"choices"` holding a
+  dict with `"message"` or `"text"`) are a [likely] `response_access` finding, without
+  requiring an openai import. `dict(choices=...)` calls and dicts built step by step are
+  missed; the same literal in a non-test file (fixtures modules, sample data) is not flagged.
 
 ## Known limitations (sandbox)
 
@@ -279,8 +284,14 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   comment like "# rest of the payload" can be rejected (one in-file retry softens this).
 - Undefined names (`code_checks.py`, Python files): pyflakes `UndefinedName` messages only, and
   only names the original did not already use undefined (star imports and builtins never
-  count). One message per name, with an import suggestion for a fixed table of common stdlib
-  names. Whole-file mode only for now.
+  count). Before the checks, apifix adds the import itself for each such name with exactly
+  one known import: the stdlib table (`STDLIB_IMPORTS`) plus the migration's `known_imports`
+  (openai: client classes, 1.x error classes, `openai`, `httpx`). Lines go after the
+  docstring and the leading block of imports (not after imports further down), one per name,
+  never merged into an existing `from` line; recorded per reply (`auto_imports`) and in the
+  report ("apifix added: ..."). The suspicious-edit check still sees them (e.g. an added
+  `import os` is warned about). Names with no known import fail the check; names with several
+  list them ("add one of: ..."). Whole-file mode only for now.
 - Code under test (test files): a new target `<module>.<name>` naming a repo module's top-level
   def/class/assignment is rejected when the test it applies to calls that name directly
   (`from app import ask` + `ask(...)`, or `import app` + `app.ask(...)`). Per test: the
@@ -288,10 +299,14 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   the `with patch(...)` / `mocker.patch(...)`; patches in fixtures, `setUp`, helpers or at
   module level are not checked. Methods (`app.Bot.helper`) and submodules never count.
 - Suggestions: for a missing name or the code under test, the message names the target and
-  mock chain to use, with a 3-line example (decorator form, or `mocker.patch` form), when the
+  mock chain to use, with a short example (decorator form, or `mocker.patch` form), when the
   module reaches the migrated library (`api_modules`) through: a local or module-level name
   assigned from a library call, a top-level function returning one (`get_client()`, one level
   deep), or a direct library call. First match in source order; no suggestion otherwise.
+  The example sets an object-shaped response from the migration's `mock_responses` (longest
+  call-path match; split over 3 lines when long), and the message then says mock responses
+  must be objects, naming the test file's top-level functions that `return` a dict literal.
+  Calls with no known shape keep a `<the test's mock response>` placeholder.
 - Mock targets (test files): string first arguments of `patch`, `mock.patch`,
   `unittest.mock.patch`, `mocker.patch` that are new versus the original. The longest prefix
   naming a repo module (`a/b.py` or `a/b/__init__.py`, at the root or under `src/`) decides; the
@@ -305,6 +320,9 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   a second failure ends the attempt (`check_failed`, not verified). The next attempt resends
   that file first (the original, with the rejected candidate as a diff and the error) and then
   the files after it. Several errors where one has an example are sent as a bullet list.
+- A retry message also lists the file's earlier check errors in this job (any attempt) that the
+  current reply does not have, under "Keep these fixed", compared and shown by first line
+  without the `line N:` prefix (so the same problem on another line counts as the same).
 - After a failed verification every file except a kept dependency file is resent with the
   verifier's reasons and failing test output (at most 10 tests, 2,000 characters each, 8,000
   in total).

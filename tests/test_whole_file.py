@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from apifix.engine.code_checks import STDLIB_IMPORTS, import_table
 from apifix.engine.migrations import get_migration
 from apifix.engine.models import Finding
 from apifix.engine.verifier import feedback_lines
@@ -16,6 +17,7 @@ from apifix.engine.whole_file import (
     check_candidate,
     check_retry_message,
     context_candidates,
+    error_key,
     fence_for,
     file_prompt,
     join_errors,
@@ -110,22 +112,59 @@ def test_undefined_names_and_mock_targets_are_checked_and_reported_together():
     original = 'from unittest import mock\n\n@mock.patch("app.ask")\ndef test_a(m):\n    pass\n'
     candidate = (
         'from unittest import mock\n\n@mock.patch("app.client.create")\n'
-        "def test_a(m):\n    m.return_value = SimpleNamespace()\n"
+        "def test_a(m):\n    m.return_value = FakeResponse()\n"
     )
     repo = {"app.py": "import openai\n\ndef ask():\n    client = openai.OpenAI()\n"}
     r = check_candidate(
         "tests/test_app.py", original, candidate, required=False, read_module=repo.get
     )
-    undefined = (
-        "line 5: 'SimpleNamespace' is used but never imported or defined "
-        "(add: from types import SimpleNamespace)"
-    )
+    undefined = "line 5: 'FakeResponse' is used but never imported or defined"
     target = (
         "mock target 'app.client.create': app.py has no top-level name 'client' "
         "(its top-level names: ask, openai). Patch a name that exists in app.py"
     )
     assert r.errors == [undefined, target]
     assert (r.checks["undefined_names"], r.checks["mock_targets"]) == (undefined, target)
+
+
+KNOWN = import_table(STDLIB_IMPORTS, {"OpenAI": "from openai import OpenAI"})
+
+
+def test_check_candidate_adds_known_imports_before_the_checks():
+    candidate = "import openai\n\n\ndef ask(q):\n    return OpenAI(timeout=os.environ['T'])\n"
+    r = check_candidate("app.py", APP, candidate, required=True, known_imports=KNOWN)
+    assert r.ok and r.checks["undefined_names"] == "ok"
+    assert r.auto_imports == ["from openai import OpenAI", "import os"]  # in line order
+    assert r.text == (
+        "import openai\nfrom openai import OpenAI\nimport os\n\n\n"
+        "def ask(q):\n    return OpenAI(timeout=os.environ['T'])\n"
+    )
+
+
+def test_check_candidate_without_a_known_import_still_fails():
+    candidate = "import openai\n\nx = Missing()\n"
+    r = check_candidate("app.py", APP, candidate, required=True, known_imports=KNOWN)
+    assert r.auto_imports == [] and r.text == candidate
+    assert r.errors == ["line 3: 'Missing' is used but never imported or defined"]
+    # syntax errors and non-Python files: nothing is added
+    broken = check_candidate("app.py", APP, "x = OpenAI(\n", required=True, known_imports=KNOWN)
+    assert broken.auto_imports == [] and broken.checks["undefined_names"] == "n/a"
+    reqs = check_candidate("requirements.txt", "openai==0.28\n", "openai>=1\n", required=True)
+    assert reqs.auto_imports == [] and reqs.text == "openai>=1\n"
+
+
+def test_retry_message_lists_problems_to_keep_fixed():
+    message = check_retry_message(
+        "app.py", "line 5: 'OpenAI' is used but never imported or defined", ["'os' is used ..."]
+    )
+    assert message == (
+        "The updated app.py was rejected:\n"
+        "line 5: 'OpenAI' is used but never imported or defined\n"
+        "Keep these fixed (problems in your earlier replies for this file):\n"
+        "- 'os' is used ...\n"
+        "Return the complete corrected file in exactly one code block."
+    )
+    assert error_key("line 12: 'x' is used\nFor example: ...") == "'x' is used"
 
 
 def test_new_checks_do_not_apply_when_they_cannot():
