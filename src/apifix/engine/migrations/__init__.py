@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from collections.abc import Mapping
 from typing import Protocol
 
 from apifix.engine.dependencies import DeclaredDependency
@@ -22,6 +23,16 @@ class Migration(Protocol):
     companion_modules: frozenset[str]
     # Short old -> new reference (Markdown) for the fix agent's prompt.
     guide: str
+    # Environment variables that get a placeholder value in the sandbox's test phase when the
+    # repo's CI (GitHub Actions) sets them for its own runs. Literal values only, never secrets.
+    ci_env_placeholders: Mapping[str, str]
+    # (marker, explanation): when a failing test's output contains the marker, the retry
+    # feedback carries the explanation.
+    failure_hints: tuple[tuple[str, str], ...]
+
+    def job_guide(self, findings: list[Finding]) -> tuple[str, list[str]]:
+        """The parts of `guide` these findings need, and the ids of those parts."""
+        ...
 
     def check_python(self, file: str, tree: ast.Module, source: str) -> list[Finding]:
         """Return findings for one parsed Python file."""

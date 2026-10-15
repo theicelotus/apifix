@@ -20,6 +20,7 @@ import dataclasses
 import fcntl
 import json
 import os
+import re
 import shutil
 import tempfile
 import uuid
@@ -89,6 +90,34 @@ BUILD_ERROR_MARKERS = (
     "pg_config",
     "command 'cc' failed",
 )
+# pip output that means the network or the index failed, not the requirements: the install is
+# retried once. A failure with no recognised marker at all is retried once too.
+NETWORK_ERROR_MARKERS = (
+    "NewConnectionError",
+    "ConnectTimeoutError",
+    "ReadTimeoutError",
+    "Read timed out",
+    "ConnectionResetError",
+    "Connection reset by peer",
+    "RemoteDisconnected",
+    "IncompleteRead",
+    "ProtocolError",
+    "Max retries exceeded",
+    "Temporary failure in name resolution",
+    "Name or service not known",
+    "Network is unreachable",
+    "SSLError",
+    "HTTP error 429",
+    "HTTP error 5",
+)
+# pip output that means the requirements themselves are wrong: never retried as transient.
+REQUIREMENT_ERROR_MARKERS = (
+    "Invalid requirement",
+    "InvalidRequirement",
+    "Could not find a version that satisfies",
+    "requires a different Python",
+    "is not a supported wheel",
+)
 RESOLUTION_ERROR_MARKERS = (
     "ResolutionImpossible",
     "conflicting dependencies",
@@ -108,7 +137,7 @@ class SandboxConfig:
     output_tail_bytes: int = 16_000
     default_python: str = DEFAULT_PYTHON
     image_repo: str = "python"
-    max_install_attempts: int = 3
+    max_install_attempts: int = 4
 
 
 @dataclass
@@ -146,6 +175,10 @@ class SandboxResult:
     # Line coverage of the repo copy (paths relative to the repo), when requested and measured.
     coverage: dict[str, FileCoverage] | None = None
     duration_s: float = 0.0
+    # The install failed in a way that looked transient and was run again (once).
+    install_retried: bool = False
+    # Test-phase environment variables set to placeholders (names only; see Sandbox.session).
+    env_placeholders: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -289,13 +322,25 @@ class Sandbox:
         self.user = container_user()
 
     def session(
-        self, repo_path: str | os.PathLike[str], *, coverage: bool = False
+        self,
+        repo_path: str | os.PathLike[str],
+        *,
+        coverage: bool = False,
+        env: Mapping[str, str] | None = None,
     ) -> SandboxSession:
-        """Install once, run the test phase as often as needed. Use as a context manager."""
-        return SandboxSession(self, repo_path, coverage=coverage)
+        """Install once, run the test phase as often as needed. Use as a context manager.
+        `env` adds test-phase variables: literal placeholders chosen by apifix (e.g. a fake
+        API key the repo's CI also sets), never values from the host environment."""
+        return SandboxSession(self, repo_path, coverage=coverage, env=env)
 
-    def run(self, repo_path: str | os.PathLike[str], *, coverage: bool = False) -> SandboxResult:
-        with self.session(repo_path, coverage=coverage) as session:
+    def run(
+        self,
+        repo_path: str | os.PathLike[str],
+        *,
+        coverage: bool = False,
+        env: Mapping[str, str] | None = None,
+    ) -> SandboxResult:
+        with self.session(repo_path, coverage=coverage, env=env) as session:
             return session.run_tests()
 
     # phases
@@ -304,6 +349,7 @@ class Sandbox:
         """Install dependencies; return the image that worked, or None (result is filled in)."""
         image = f"{self.config.image_repo}:{result.python_version}-slim"
         use_constraints = bool(plan.constraints)
+        known = (*BUILD_ERROR_MARKERS, *RESOLUTION_ERROR_MARKERS, *REQUIREMENT_ERROR_MARKERS)
         for _ in range(self.config.max_install_attempts):
             ws.reset_deps()
             command = ["python", "/apifix/driver.py", "install"]
@@ -328,6 +374,14 @@ class Sandbox:
                 return None
             if phase.status == "error":
                 break
+            if not result.install_retried and (
+                _has_marker(phase, NETWORK_ERROR_MARKERS) or not _has_marker(phase, known)
+            ):
+                result.install_retried = True
+                result.notes.append(
+                    "dependency install failed (network or unknown cause); retried once"
+                )
+                continue
             if image.endswith("-slim") and _has_marker(phase, BUILD_ERROR_MARKERS):
                 image = image.removesuffix("-slim")
                 result.notes.append(f"build error on the slim image; retrying with {image}")
@@ -350,6 +404,7 @@ class Sandbox:
         tests: TestPlan,
         result: SandboxResult,
         coverage: bool,
+        env: Mapping[str, str] | None = None,
     ) -> None:
         command = ["python", "/apifix/driver.py", "test"]
         command += ["--coverage", "--", *tests.command] if coverage else ["--", *tests.command]
@@ -359,7 +414,7 @@ class Sandbox:
             Mount(ws.results, "/results", writable=True),
             Mount(ws.tooling, "/apifix", writable=False),
         ]
-        phase = self._phase("test", image, "none", command, mounts, "/work", ws.root)
+        phase = self._phase("test", image, "none", command, mounts, "/work", ws.root, env)
         result.test = phase
 
         driver = _read_json(ws.results / "driver.json")
@@ -438,6 +493,7 @@ class Sandbox:
         mounts: list[Mount],
         workdir: str | None,
         workspace: Path,
+        env: Mapping[str, str] | None = None,
     ) -> PhaseResult:
         container = f"apifix-{name}-{uuid.uuid4().hex[:12]}"
         args = container_args(
@@ -449,7 +505,7 @@ class Sandbox:
             config=self.config,
             user=self.user,
             workdir=workdir,
-            extra_env=TEST_PHASE_ENV if name == "test" else None,
+            extra_env={**TEST_PHASE_ENV, **(env or {})} if name == "test" else None,
             workspace=workspace,
         )
         timeout = self.config.install_timeout_s if name == "install" else self.config.test_timeout_s
@@ -502,9 +558,18 @@ class SandboxSession:
     """
 
     def __init__(
-        self, sandbox: Sandbox, repo_path: str | os.PathLike[str], *, coverage: bool
+        self,
+        sandbox: Sandbox,
+        repo_path: str | os.PathLike[str],
+        *,
+        coverage: bool,
+        env: Mapping[str, str] | None = None,
     ) -> None:
         self.sandbox = sandbox
+        self.env = dict(env or {})
+        for key, value in self.env.items():
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) or "\n" in value:
+                raise ValueError(f"invalid sandbox environment variable {key!r}")
         self.repo = Path(repo_path).resolve()
         if not self.repo.is_dir():
             raise NotADirectoryError(f"not a directory: {self.repo}")
@@ -518,6 +583,7 @@ class SandboxSession:
             python_version_source=python.source,
             runner=self.tests.runner,
             test_command=list(self.tests.command),
+            env_placeholders=sorted(self.env),
         )
         self._workspace: _Workspace | None = None
         self._image: str | None = None
@@ -569,7 +635,7 @@ class SandboxSession:
                 self._workspace.reset_work(self.repo)
             self._runs += 1
             measure = self.coverage if coverage is None else (coverage and self.coverage)
-            self.sandbox._test(self._workspace, self._image, self.tests, result, measure)
+            self.sandbox._test(self._workspace, self._image, self.tests, result, measure, self.env)
             return result
         finally:
             # This run's cost: the (shared) install plus its own test phase.

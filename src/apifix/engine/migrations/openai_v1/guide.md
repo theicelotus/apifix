@@ -1,5 +1,6 @@
 # openai 0.x -> 1.x
 
+<!-- part: client -->
 ## Client
 
 0.x configured the module; 1.x uses a client object.
@@ -25,13 +26,17 @@ resp = client.chat.completions.create(model="gpt-4o-mini", messages=msgs)
   test that imports the module. Build it lazily (e.g. a small `functools.lru_cache` function
   `get_client()`), or where 0.x code read the key at import time, keep that behaviour but do
   not fail when it is missing. Never hardcode a real key.
+<!-- part: client.async -->
 - Async code: `AsyncOpenAI` and `await client.chat.completions.create(...)` (0.x `acreate`).
+<!-- part: client.azure -->
 - Azure (`api_type = "azure"`): `AzureOpenAI(azure_endpoint=<api_base>, api_version=<api_version>,
   api_key=...)`; `deployment_id=` / `engine=` become `model=<deployment name>`.
+<!-- part: client.kwargs -->
 - Per-call `api_key=` / `organization=` / `api_base=` move to the client (or
   `client.with_options(...)`).
 - `request_timeout=` becomes `timeout=`. `engine=` / `deployment_id=` become `model=`.
 
+<!-- part: resources -->
 ## Resources
 
 | 0.x | 1.x |
@@ -46,6 +51,7 @@ resp = client.chat.completions.create(model="gpt-4o-mini", messages=msgs)
 | `openai.FineTuningJob.create` / `list` / `retrieve` / `cancel` / `list_events` | `client.fine_tuning.jobs.*` (same names) |
 | `openai.Model.list` / `retrieve` | `client.models.list` / `retrieve` |
 
+<!-- part: resources.removed -->
 Removed with no direct equivalent:
 - `openai.Edit` (use `client.chat.completions.create` with an instruction prompt),
   `openai.Engine` (use `client.models`), `openai.Customer`, `openai.Deployment` (manage Azure
@@ -56,6 +62,7 @@ Removed with no direct equivalent:
   `openai.api_resources` / `openai.api_requestor` (use the client), `openai.util`,
   `openai.cli`, `openai.wandb_logger`, `openai.datalib`, `openai.validators`.
 
+<!-- part: responses -->
 ## Responses are objects, not dicts
 
 ```python
@@ -74,6 +81,7 @@ Use `resp.model_dump()` where code really needs a dict (JSON output, storage). C
 `resp.choices[0].text`. Images: `resp.data[0].url`. Transcriptions: `resp.text`.
 Moderations: `resp.results[0].flagged`.
 
+<!-- part: responses.streaming -->
 Streaming (`stream=True`) yields objects too:
 
 ```python
@@ -82,6 +90,7 @@ for chunk in client.chat.completions.create(model=m, messages=msgs, stream=True)
         out.append(chunk.choices[0].delta.content)
 ```
 
+<!-- part: errors -->
 ## Errors
 
 `openai.error.X` moved to `openai.X`:
@@ -107,9 +116,17 @@ openai.RateLimitError("slow down", response=httpx.Response(429, request=request)
 openai.APIConnectionError(request=request)
 ```
 
+<!-- part: tests -->
 ## Tests
 
-Update mocks to the new call path and keep every assertion as it is.
+Update mocks to the new call path and keep every assertion as it is. Patch what the code under
+test calls, never the function or class the test exercises: after `from app import ask`,
+`patch("app.ask")` leaves the test's `ask` untouched, so the real one runs.
+
+`openai.OpenAI()` raises `OpenAIError` when no API key is set (argument or `OPENAI_API_KEY`),
+and tests normally run without one. A test must keep the real constructor from running, or the
+module must not build a client at import. Pick the pattern from how the migrated module gets
+its client:
 
 ```python
 # 0.x
@@ -118,22 +135,42 @@ def test_answer(create):
     create.return_value = {"choices": [{"message": {"content": "hi"}}]}
 
 
-# 1.x (module builds `client` itself)
+# 1.x, client created inside the function (def answer(): client = openai.OpenAI() ...)
+@mock.patch("app.openai.OpenAI")
+def test_answer(OpenAI):
+    OpenAI.return_value.chat.completions.create.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="hi"))]
+    )
+
+
+# 1.x, module-level client (client = openai.OpenAI() at the top of app.py; the module must
+# import without a key)
 @mock.patch("app.client.chat.completions.create")
 def test_answer(create):
     create.return_value = SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content="hi"))]
     )
+
+
+# 1.x, lazily built client (def get_client() in app.py)
+@mock.patch("app.get_client")
+def test_answer(get_client):
+    get_client.return_value.chat.completions.create.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="hi"))]
+    )
 ```
 
-- With a lazily built client, patch the class method instead:
-  `mock.patch("openai.resources.chat.completions.Completions.create")`, or patch the
-  module's `get_client`.
+- When the module does `from openai import OpenAI`, patch `app.OpenAI` instead of
+  `app.openai.OpenAI`.
+- With any client, patching the class method also works:
+  `mock.patch("openai.resources.chat.completions.Completions.create")`.
 - Mock return values must support attribute access now that the code uses it; keep the same
-  values. `SimpleNamespace` or the real types (`openai.types.chat.ChatCompletion`) both work.
+  values. `SimpleNamespace` (`from types import SimpleNamespace`) or the real types
+  (`openai.types.chat.ChatCompletion`) both work.
 - Exception classes in `pytest.raises` / `except` follow the error table; do not replace a
   specific class with a broader one (`Exception`, `openai.APIError`, `openai.OpenAIError`).
 
+<!-- part: dependencies -->
 ## Dependencies
 
 Pin `openai>=1.0,<2` wherever openai is declared (requirements files, pyproject.toml, setup.py,

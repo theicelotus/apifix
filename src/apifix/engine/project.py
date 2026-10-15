@@ -10,6 +10,7 @@ import configparser
 import json
 import re
 import tomllib
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -76,8 +77,7 @@ def _runtime_txt(repo: Path) -> str | None:
 def _ci_versions(repo: Path) -> list[tuple[str, str]]:
     """(version, workflow file) for every python-version listed in GitHub Actions workflows."""
     found = []
-    workflows = repo / ".github" / "workflows"
-    files = sorted(workflows.glob("*.yml")) + sorted(workflows.glob("*.yaml"))
+    files = _workflow_files(repo)
     key = re.compile(r"^(\s*)-?\s*python(?:-versions?)?\s*:\s*(.*)$")
     for wf in files:
         lines = (_read(wf) or "").splitlines()
@@ -95,6 +95,31 @@ def _ci_versions(repo: Path) -> list[tuple[str, str]]:
                 if not im:
                     break
                 found += [(v, rel) for v in _minors(im.group(1))]
+    return found
+
+
+def _workflow_files(repo: Path) -> list[Path]:
+    workflows = repo / ".github" / "workflows"
+    return sorted(workflows.glob("*.yml")) + sorted(workflows.glob("*.yaml"))
+
+
+def ci_env_vars(repo: Path, names: Iterable[str]) -> dict[str, str]:
+    """Which of `names` a GitHub Actions workflow sets (name -> first workflow file): as a YAML
+    key (`env:` blocks, `NAME: ${{ secrets.NAME }}`) or as `NAME=` in a step (`$GITHUB_ENV`,
+    inline). Regex over the files, no YAML parser; comments are ignored."""
+    found: dict[str, str] = {}
+    wanted = [n for n in names if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", n)]
+    for wf in _workflow_files(repo):
+        rel = wf.relative_to(repo).as_posix()
+        for line in (_read(wf) or "").splitlines():
+            code = line.split("#", 1)[0]
+            for name in wanted:
+                if name in found:
+                    continue
+                if re.match(rf"^\s*-?\s*{name}\s*:", code) or re.search(
+                    rf"(?<![\w$]){name}=", code
+                ):
+                    found[name] = rel
     return found
 
 

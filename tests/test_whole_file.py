@@ -6,18 +6,25 @@ from types import SimpleNamespace
 
 import pytest
 
+from apifix.engine.migrations import get_migration
 from apifix.engine.models import Finding
 from apifix.engine.verifier import feedback_lines
 from apifix.engine.whole_file import (
     MIN_LINES_FOR_LENGTH_CHECK,
+    PREVIOUS_DIFF_CHARS,
     as_file,
     check_candidate,
+    check_retry_message,
+    context_candidates,
     fence_for,
     file_prompt,
+    join_errors,
     must_change,
     parse_code_block,
+    previous_version_note,
     select_context,
     select_files,
+    system_prompt,
     verification_feedback,
 )
 
@@ -323,13 +330,15 @@ def test_file_prompt_for_likely_only_files_and_long_fences():
     text = 'D = """\n```\n"""\n'
     prompt = file_prompt("t.py", text, [], summary="s", required=False, feedback="FEEDBACK")
     assert "````python\n" in prompt and "(open and close it with ````)" in prompt
-    assert "\nFEEDBACK\n" in prompt
+    assert prompt.startswith("FEEDBACK\n\nMigrate this file: t.py\n")  # first: a shared prefix
     assert prompt.endswith("If the file needs no change, return it unchanged.")
     assert "read-only context" not in prompt
 
 
 def _verification(messages):
-    tests = [SimpleNamespace(id=f"t{i}", message=m) for i, m in enumerate(messages)]
+    tests = [
+        SimpleNamespace(id=f"t{i}", message=m, outcome="failed") for i, m in enumerate(messages)
+    ]
     return SimpleNamespace(
         verdict="rejected",
         reasons=[
@@ -343,12 +352,12 @@ def _verification(messages):
             )
         ],
         delta=SimpleNamespace(newly_failing=[t.id for t in tests], newly_erroring=[]),
-        fixed=SimpleNamespace(tests=tests, status="completed", reason=""),
+        fixed=SimpleNamespace(tests=tests, status="completed", reason="", test=None),
     )
 
 
 def test_verification_feedback_is_truncated():
-    v = _verification(["E" * 5000, "short", *["x" * 1500] * 12])
+    v = _verification(["E" * 5000, "short", *[f"{i} " + "x" * 1500 for i in range(12)]])
     text = verification_feedback(2, v)
     assert text.startswith("The verifier did not accept attempt 2 (verdict: rejected).")
     assert "- [reject] regression: tests fail (tests: t0)" in text
@@ -365,3 +374,108 @@ def test_feedback_lines_unbounded_by_default():
     v = _verification(["E" * 5000])
     lines = feedback_lines(v)
     assert "--- t0\n" + "E" * 5000 in lines
+
+
+# --- later attempts, context, messages ----------------------------------------------------------
+
+
+def test_context_only_for_test_files_and_only_the_code_they_test():
+    files = ["requirements.txt", "app.py", "pkg/util.py", "tests/conftest.py", "tests/test_app.py"]
+    assert context_candidates("tests/test_app.py", files) == ["app.py", "pkg/util.py"]
+    assert context_candidates("app.py", files) == []
+    assert context_candidates("requirements.txt", files) == []
+
+
+def test_previous_version_note_shows_a_short_diff():
+    note = previous_version_note("app.py", APP, NEW, "")
+    assert note.startswith(
+        "Your previous version of app.py did not pass verification (see above). Its changes "
+        "from the original"
+    )
+    assert "```diff\n--- a/app.py\n+++ b/app.py\n" in note
+    assert "+client = openai.OpenAI()\n" in note and note.endswith("\n```")
+    assert "\n import openai\n" not in note  # one line of context, not three
+    rejected = previous_version_note("app.py", APP, NEW, "line 3: 'x' is used but never imported")
+    assert (
+        "Your previous version of app.py was rejected: line 3: 'x' is used but never " in rejected
+    )
+    assert "imported. Its changes from the original" in rejected
+    multi = previous_version_note("app.py", APP, NEW, "mock target 'a': x\nFor example:\n    y")
+    assert (
+        "app.py was rejected:\nmock target 'a': x\nFor example:\n    y\nIts changes from" in multi
+    )
+
+
+def test_previous_version_note_without_a_usable_or_changed_version():
+    assert previous_version_note("app.py", APP, None, "the reply had no complete code block") == (
+        "Your previous reply for app.py was rejected: the reply had no complete code block."
+    )
+    assert previous_version_note("app.py", APP, APP, "") == (
+        "Your previous version of app.py was identical to the original and did not pass "
+        "verification (see above)."
+    )
+
+
+def test_previous_version_note_is_bounded_and_fenced_safely():
+    big_old = "".join(f"x{i} = {i}\n" for i in range(2000))
+    big_new = big_old.replace(" = ", " =  ")
+    note = previous_version_note("big.py", big_old, big_new, "")
+    assert "... (diff truncated)" in note and len(note) < PREVIOUS_DIFF_CHARS + 400
+    # a context line " ```" would close a 3-backtick fence ("+```" could not)
+    fenced = previous_version_note("d.py", 'A = """\n```\nB\n"""\n', 'A = """\n```\nC\n"""\n', "")
+    assert "````diff\n" in fenced and fenced.endswith("\n````")
+
+
+def test_file_prompt_layout_for_a_later_attempt():
+    prompt = file_prompt(
+        "app.py",
+        APP,
+        [finding()],
+        summary="s",
+        feedback="SHARED FEEDBACK",
+        previous="PREVIOUS NOTE",
+        context=[("lib.py", "X = 1\n")],
+    )
+    order = [
+        "SHARED FEEDBACK",
+        "Migrate this file: app.py",
+        "Original contents of app.py:",
+        "PREVIOUS NOTE",
+        "--- lib.py",
+        "Return the complete updated app.py",
+    ]
+    positions = [prompt.index(part) for part in order]
+    assert positions == sorted(positions) and positions[0] == 0
+
+
+def test_errors_with_examples_become_a_bullet_list():
+    one_line = ["line 1: 'x' is used but never imported or defined", "mock target 'a.b': ..."]
+    assert join_errors(one_line) == "; ".join(one_line)
+    assert check_retry_message("t.py", join_errors(one_line)) == (
+        f"The updated t.py was rejected: {'; '.join(one_line)}. Return the complete corrected "
+        "file in exactly one code block."
+    )
+    example = "mock target 'a.b': ...\nFor example:\n    x = 1"
+    assert join_errors([example]) == example  # one error: no bullet
+    with_example = [one_line[0], example]
+    joined = join_errors(with_example)
+    assert joined == f"- {one_line[0]}\n- mock target 'a.b': ...\nFor example:\n    x = 1"
+    assert check_retry_message("t.py", joined) == (
+        f"The updated t.py was rejected:\n{joined}\nReturn the complete corrected file in "
+        "exactly one code block."
+    )
+
+
+def test_system_prompt_takes_the_job_guide():
+    mig = get_migration("openai-v1")
+    assert system_prompt(mig).endswith(mig.guide)
+    assert system_prompt(mig, "# just this\n").endswith("Migration guide:\n\n# just this\n")
+
+
+def test_dependency_feedback_has_problems_but_no_test_output():
+    v = _verification(["AssertionError: boom"])
+    python = verification_feedback(2, v, hints=[("boom", "A hint.")])
+    deps = verification_feedback(2, v, dependency_file=True, hints=[("boom", "A hint.")])
+    assert "boom" in python and "Hint: A hint." in python
+    assert "- [reject] regression: tests fail (tests: t0)" in deps
+    assert "boom" not in deps and "Hint" not in deps

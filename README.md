@@ -65,13 +65,16 @@ apifix fix ... --provider openai-compat --base-url http://gpu-box.local:8000/v1 
 
 **Whole-file mode (recommended for small local models).** Models around 7B often cannot drive
 the tool loop, but can rewrite a file. `--edit-mode whole-file` uses no tools: each file with
-findings is sent in its own request (with the files already updated as read-only context), and
-the model returns the complete updated file in one code block. Before a file is written it must
+findings is sent in its own request (test files also see the updated code they test, read-only),
+and the model returns the complete updated file in one code block. Prompts carry only the guide
+sections the repo's findings need, and are laid out so a server's prompt cache can reuse them. Before a file is written it must
 parse as Python (or as a dependency file), differ from the original when it has certain
 findings, contain no placeholders such as `# ... rest unchanged`, use no name it never imports
-or defines, and (test files) patch no repo-module name that does not exist; a failing file gets
-its error back once. All files are then verified together exactly as in agent mode, and a failed
-verification starts the next attempt with the failing test output.
+or defines, and (test files) patch neither a repo-module name that does not exist nor the
+function the test calls; the error names the target to patch instead where it can, and a
+failing file gets it back once. All files are then verified together exactly as in agent mode,
+and a failed verification starts the next attempt from the original files, with the failing
+test output and each file's previous version as a diff.
 
 ```
 apifix fix path/to/repo --migration openai-v1 --provider openai-compat \

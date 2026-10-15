@@ -9,6 +9,7 @@ import pytest
 from apifix.engine.project import (
     PYTEST_COMMAND,
     build_install_plan,
+    ci_env_vars,
     detect_python_version,
     detect_tests,
 )
@@ -386,3 +387,66 @@ def test_corrupt_lock_is_noted(tmp_path):
     plan = build_install_plan(tmp_path, None)
     assert plan.lockfile is None
     assert any("poetry.lock unreadable" in n for n in plan.notes)
+
+
+# --- environment variables the repo's CI sets ---------------------------------------------------
+
+
+def _workflow(tmp_path, name: str, text: str):
+    wf = tmp_path / ".github" / "workflows" / name
+    wf.parent.mkdir(parents=True, exist_ok=True)
+    wf.write_text(textwrap.dedent(text))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        """
+        jobs:
+          test:
+            env:
+              OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        """,
+        """
+        env:
+          OPENAI_API_KEY: sk-dummy
+        """,
+        """
+        steps:
+          - run: echo "OPENAI_API_KEY=dummy" >> $GITHUB_ENV
+        """,
+        """
+        steps:
+          - run: OPENAI_API_KEY=x pytest
+        """,
+    ],
+)
+def test_ci_env_vars_found(tmp_path, text):
+    _workflow(tmp_path, "ci.yml", text)
+    assert ci_env_vars(tmp_path, ["OPENAI_API_KEY"]) == {
+        "OPENAI_API_KEY": ".github/workflows/ci.yml"
+    }
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "# OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}\n",
+        "env:\n  MY_OPENAI_API_KEY: x\n",
+        "run: echo $OPENAI_API_KEY\n",
+        "run: echo ${OPENAI_API_KEY}=x\n",
+    ],
+)
+def test_ci_env_vars_not_found(tmp_path, text):
+    _workflow(tmp_path, "ci.yaml", text)
+    assert ci_env_vars(tmp_path, ["OPENAI_API_KEY"]) == {}
+
+
+def test_ci_env_vars_without_workflows_or_names(tmp_path):
+    assert ci_env_vars(tmp_path, ["OPENAI_API_KEY"]) == {}
+    _workflow(tmp_path, "a.yml", "env:\n  OPENAI_API_KEY: x\n")
+    _workflow(tmp_path, "b.yml", "env:\n  OPENAI_API_KEY: y\n")
+    assert ci_env_vars(tmp_path, []) == {}
+    assert ci_env_vars(tmp_path, ["OPENAI_API_KEY"]) == {
+        "OPENAI_API_KEY": ".github/workflows/a.yml"
+    }

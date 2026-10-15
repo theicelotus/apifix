@@ -397,6 +397,51 @@ def test_plain_install_failure_is_not_retried(repo):
     docker = FakeDocker(install=[exited(1, stderr="ERROR: Invalid requirement")])
     result = run_sandbox(repo, docker=docker)
     assert result.status == "error" and len(result.install_attempts) == 1
+    assert result.install_retried is False
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        # pip's network failure ends in "No matching distribution found" as well
+        "WARNING: Retrying (Retry(total=4)) after connection broken by "
+        "'NewConnectionError(...)': /simple/openai/\n"
+        "ERROR: No matching distribution found for openai>=1.0,<2",
+        "ERROR: HTTP error 503 while getting https://files.pythonhosted.org/...",
+        "Killed",  # no recognised marker: the cause is unknown, so it may be transient
+    ],
+)
+def test_transient_install_failure_is_retried_once(repo, stderr):
+    docker = FakeDocker(install=[exited(1, stderr=stderr), ok()], test=pytest_run(passed=1))
+    result = run_sandbox(repo, docker=docker)
+    assert result.status == "passed" and result.install_retried is True
+    assert [p.status for p in result.install_attempts] == ["failed", "ok"]
+    assert "dependency install failed (network or unknown cause); retried once" in result.notes
+
+
+def test_transient_install_failure_is_retried_only_once(repo):
+    flaky = exited(1, stderr="ReadTimeoutError: HTTPSConnectionPool(host='pypi.org')")
+    docker = FakeDocker(install=[flaky, flaky])
+    result = run_sandbox(repo, docker=docker)
+    assert (result.status, result.reason) == ("error", "dependency install failed")
+    assert len(result.install_attempts) == 2 and result.install_retried is True
+
+
+def test_env_placeholders_reach_the_test_phase_only(repo):
+    docker = FakeDocker(test=pytest_run(passed=1))
+    placeholder = {"OPENAI_API_KEY": "sk-placeholder"}
+    result = Sandbox(docker=docker).run(repo, env=placeholder)
+    install, test = docker.calls
+    assert env_of(install) == CONTAINER_ENV
+    assert env_of(test) == {**CONTAINER_ENV, **TEST_PHASE_ENV, **placeholder}
+    assert CANARY not in " ".join(test.args)  # the host's real key never
+    assert result.env_placeholders == ["OPENAI_API_KEY"]
+
+
+@pytest.mark.parametrize("env", [{"BAD NAME": "x"}, {"A": "line\nbreak"}])
+def test_invalid_env_placeholders_are_refused(repo, env):
+    with pytest.raises(ValueError, match="invalid sandbox environment variable"):
+        Sandbox(docker=FakeDocker()).session(repo, env=env)
 
 
 def test_docker_run_failure_is_error(repo):

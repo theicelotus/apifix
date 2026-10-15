@@ -24,10 +24,12 @@ from pathlib import Path
 from typing import Any, Literal
 
 from apifix.engine.agent_tools import TOOLS, EditRecord, Workspace
+from apifix.engine.dependencies import is_dependency_file
 from apifix.engine.diffing import diff_trees, read_text, unified_diff
 from apifix.engine.llm import LLMClient, LLMError, LLMResponse, Message, ToolResult, Usage
 from apifix.engine.migrations import Migration, get_migration
 from apifix.engine.models import Finding
+from apifix.engine.project import ci_env_vars
 from apifix.engine.sandbox import Sandbox, SandboxResult
 from apifix.engine.scanner import scan
 from apifix.engine.verifier import (
@@ -43,11 +45,13 @@ from apifix.engine.whole_file import (
     DEFAULT_MAX_BYTES,
     as_file,
     check_candidate,
-    check_failure_feedback,
     check_retry_message,
+    context_candidates,
     file_prompt,
+    join_errors,
     must_change,
     parse_code_block,
+    previous_version_note,
     select_context,
     select_files,
     verification_feedback,
@@ -107,6 +111,8 @@ class Attempt:
     nudges: list[dict[str, Any]] = field(default_factory=list)
     edits: list[EditRecord] = field(default_factory=list)
     files: list[dict[str, Any]] = field(default_factory=list)  # whole-file mode: one per request
+    # whole-file mode: files not sent in this attempt (accepted earlier and still in place)
+    kept_files: list[str] = field(default_factory=list)
     diff: str = ""
     verification: Verification | None = None
     result: str = ""  # a verdict, "no_changes", "check_failed" (whole-file) or "aborted"
@@ -125,6 +131,7 @@ class Attempt:
             "nudges": self.nudges,
             "edits": [asdict(e) for e in self.edits],
             "files": self.files,
+            "kept_files": self.kept_files,
             "diff": self.diff,
             "verification": self.verification.to_dict() if self.verification else None,
             "verification_duration_s": round(self.verification_duration_s, 3),
@@ -256,12 +263,22 @@ class _Job:
         if self.whole_file:
             self.system = whole_file_system_prompt(migration)
         self.tools = [] if self.whole_file else TOOLS
-        # whole-file state: files to send, files not sent, and what is still pending (with the
-        # feedback each pending file's next request carries)
+        # whole-file state: files to send, files not sent, what is still pending, the last
+        # verification's feedback (the same text for every Python file, so it is sent first and
+        # a server can cache it; and a shorter one for dependency files), and per pending file
+        # its previous version (None: no usable reply) with the check error that rejected it
+        # ("" when the verification feedback says why)
         self.wf_files: list[str] = []
         self.wf_skipped: list[dict[str, object]] = []
         self.wf_pending: list[str] = []
-        self.wf_feedback: dict[str, str] = {}
+        self.wf_feedback = ""
+        self.wf_dependency_feedback = ""
+        self.wf_previous: dict[str, tuple[str | None, str]] = {}
+        self.guide_sections: list[str] | None = None  # whole-file: the job guide's parts
+        # Variables the repo's CI sets that the sandbox's test phase gets placeholders for
+        # (name -> workflow file), in the baseline and in every verification.
+        self.ci_env = ci_env_vars(repo, migration.ci_env_placeholders)
+        self.sandbox_env = {name: migration.ci_env_placeholders[name] for name in self.ci_env}
         # wall-clock seconds: LLM requests, and sandbox work (baseline run, verify() calls)
         self.llm_seconds = 0.0
         self.sandbox_seconds = 0.0
@@ -447,40 +464,58 @@ class _Job:
         accepted (the tree is ready to verify); False when one failed its checks, which ends
         the attempt: that file and the ones after it stay pending for the next attempt."""
         pending = self.wf_pending
+        attempt.kept_files = [p for p in self.wf_files if p not in pending]
         for i, path in enumerate(pending):
-            entry = self._whole_file_request(attempt, path, self.wf_feedback.get(path, ""))
+            entry, candidate = self._whole_file_request(attempt, path)
             attempt.files.append(entry)
             if not entry["accepted"]:
-                rest = {p: self.wf_feedback[p] for p in pending[i + 1 :] if p in self.wf_feedback}
-                own = check_failure_feedback(path, entry["error"])
-                if path in self.wf_feedback:
-                    own += "\n\n" + self.wf_feedback[path]
-                self.wf_pending, self.wf_feedback = pending[i:], {path: own, **rest}
+                rest = {p: self.wf_previous[p] for p in pending[i + 1 :] if p in self.wf_previous}
+                self.wf_pending = pending[i:]
+                self.wf_previous = {path: (candidate, entry["error"]), **rest}
                 return False
-        self.wf_pending, self.wf_feedback = [], {}
+        self.wf_pending, self.wf_previous = [], {}
         return True
+
+    def _after_rejection(self, number: int, v: Verification) -> None:
+        """Whole-file: what the next attempt sends. Every file again, from the original with
+        the previous version as a diff, except accepted dependency files the verification did
+        not implicate."""
+        self.wf_feedback = verification_feedback(number, v, hints=self.migration.failure_hints)
+        self.wf_dependency_feedback = verification_feedback(number, v, dependency_file=True)
+        self.wf_pending = [
+            p for p in self.wf_files if not is_dependency_file(p) or _dependency_problem(p, v)
+        ]
+        self.wf_previous = {p: (self._read(self.work, p), "") for p in self.wf_pending}
 
     def _read(self, root: Path, path: str) -> str:
         return (root / path).read_bytes().decode("utf-8")
 
-    def _whole_file_request(self, attempt: Attempt, path: str, feedback: str) -> dict[str, Any]:
-        original, current = self._read(self.repo, path), self._read(self.work, path)
+    def _whole_file_request(self, attempt: Attempt, path: str) -> tuple[dict[str, Any], str | None]:
+        """One file's conversation: the entry for the trajectory, and the last candidate the
+        model returned (None if no reply had a usable code block)."""
+        original = self._read(self.repo, path)
         required = must_change(path, self.findings)
         updated = [
             (p, self._read(self.work, p))
-            for p in self.wf_files
-            if p != path and self._read(self.work, p) != self._read(self.repo, p)
+            for p in context_candidates(path, self.wf_files)
+            if self._read(self.work, p) != self._read(self.repo, p)
         ]
-        own_bytes = len(current.encode("utf-8"))
+        own_bytes = len(original.encode("utf-8"))
         context, left_out = select_context(updated, own_bytes, self.config.whole_file_max_bytes)
+        previous = ""
+        if path in self.wf_previous:
+            text, reason = self.wf_previous[path]
+            previous = previous_version_note(path, original, text, reason)
+        dependency = is_dependency_file(path)
         prompt = file_prompt(
             path,
-            current,
+            original,
             self.findings,
             summary=self.migration.summary,
             context=context,
             required=required,
-            feedback=feedback,
+            feedback=self.wf_dependency_feedback if dependency else self.wf_feedback,
+            previous=previous,
         )
         messages = [Message("user", text=prompt)]
         entry: dict[str, Any] = {
@@ -488,12 +523,14 @@ class _Job:
             "bytes_sent": own_bytes,
             "context_files": [p for p, _ in context],
             "context_left_out": left_out,
+            "previous_version_sent": bool(previous),
             "change_required": required,
             "replies": [],
             "accepted": False,
             "error": "",
         }
         retries = 0
+        candidate: str | None = None
         while True:
             response = self._call_llm(attempt, messages)
             if response.stop_reason == "refusal":
@@ -529,10 +566,11 @@ class _Job:
                 candidate,
                 required=required,
                 read_module=self._working_copy_reader(path, candidate),
+                library_modules=self.migration.api_modules,
             )
             reply["checks"] = result.checks
             if not result.ok:
-                error = "; ".join(result.errors)
+                error = join_errors(result.errors)
                 if retries < self.config.max_check_retries_per_file:
                     retries += 1
                     message = check_retry_message(path, error)
@@ -554,7 +592,7 @@ class _Job:
             entry["changed"] = candidate != original
             break
         entry["messages"] = [_message_dict(m) for m in messages]
-        return entry
+        return entry, candidate
 
     def _working_copy_reader(self, path: str, candidate: str) -> Callable[[str], str | None]:
         """Repo files as they are now in the working copy (files accepted so far written),
@@ -613,6 +651,9 @@ class _Job:
             self.wf_pending = list(self.wf_files)
             if not self.wf_files:
                 return "aborted", "no_files: no affected file can be sent (see skipped files)"
+            sent = [f for f in self.findings if f.file in self.wf_files]
+            guide, self.guide_sections = self.migration.job_guide(sent)
+            self.system = whole_file_system_prompt(self.migration, guide)
         preflight = getattr(self.llm, "preflight", None)
         if callable(preflight):
             try:
@@ -623,7 +664,7 @@ class _Job:
             self.system += tool_call_example(self.findings)
             self.tool_call_example = True
         start = time.monotonic()
-        self.baseline = self.sandbox.run(self.repo)
+        self.baseline = self.sandbox.run(self.repo, env=self.sandbox_env)
         self.baseline_seconds = time.monotonic() - start
         self.sandbox_seconds += self.baseline_seconds
         if self.baseline.status == "error" and self.baseline.reason.startswith("docker not usable"):
@@ -665,6 +706,7 @@ class _Job:
                 sandbox=self.sandbox,
                 baseline=self.baseline,
                 config=self.config.verifier,
+                sandbox_env=self.sandbox_env,
             )
             attempt.verification_duration_s = time.monotonic() - start
             self.sandbox_seconds += attempt.verification_duration_s
@@ -674,10 +716,8 @@ class _Job:
                 return attempt.result, f"{attempt.result} on attempt {number}"
             if not self._retryable(attempt.verification):
                 break
-            if self.whole_file:  # resend every file, each with the verifier's feedback
-                feedback = verification_feedback(number, attempt.verification)
-                self.wf_pending = list(self.wf_files)
-                self.wf_feedback = {p: feedback for p in self.wf_files}
+            if self.whole_file:
+                self._after_rejection(number, attempt.verification)
 
         best = self.best_attempt()
         if best is None:
@@ -720,6 +760,8 @@ class _Job:
                 "endpoint": getattr(self.llm, "endpoint", None),
                 "edit_mode": self.config.edit_mode,
                 "skipped_files": self.wf_skipped if self.whole_file else None,
+                "guide_sections": self.guide_sections,
+                "sandbox_env_placeholders": self.ci_env,
                 "strict_tool_calls": getattr(self.llm, "strict_tool_calls", None),
                 "tool_call_example": self.tool_call_example,
                 "config": dataclasses.asdict(self.config),
@@ -744,6 +786,17 @@ class _Job:
                 "sandbox_s": round(self.sandbox_seconds, 3),
             },
         }
+
+
+def _dependency_problem(path: str, v: Verification) -> bool:
+    """Did the verification implicate this dependency file: the install failed, or a reason
+    or a remaining finding points at it?"""
+    install_failed = v.fixed.status in ("error", "timeout") and "install" in v.fixed.reason
+    return (
+        install_failed
+        or any(r.file == path for r in v.reasons)
+        or any(f.file == path for f in v.remaining_findings)
+    )
 
 
 _PARSE_ERRORS = {
@@ -774,6 +827,21 @@ def time_line(job: _Job, total_s: float) -> str:
         f"response{'' if responses == 1 else 's'}); sandbox {_seconds(job.sandbox_seconds)} "
         f"({sandbox})"
     )
+
+
+def _one_line(text: str, limit: int = 300) -> str:
+    flat = " ".join(line.strip().removeprefix("- ") for line in text.splitlines() if line.strip())
+    return flat if len(flat) <= limit else flat[: limit - 3] + "..."
+
+
+def _install_retries(job: _Job) -> list[str]:
+    """Which sandbox runs retried their dependency install ("baseline", "attempt 2", ...)."""
+    found = ["baseline"] if job.baseline is not None and job.baseline.install_retried else []
+    for a in job.attempts:
+        v = a.verification
+        if v is not None and (v.fixed.install_retried or (v.rerun and v.rerun.install_retried)):
+            found.append(f"attempt {a.number}")
+    return found
 
 
 def report_markdown(
@@ -834,15 +902,32 @@ def report_markdown(
         lines.append(
             f"- Files that failed a check and were sent back once: {nudges.count('check_retry')}"
         )
+    for name, workflow in job.ci_env.items():
+        lines.append(
+            f"- Sandbox env: `{name}` set to a placeholder in the test phase, because the repo's "
+            f"CI sets it (`{workflow}`); the sandbox has no network"
+        )
+    retried = _install_retries(job)
+    if retried:
+        lines.append(
+            f"- Dependency install retried once after a failure that looked transient: "
+            f"{', '.join(retried)}"
+        )
     if job.whole_file:
+        if job.guide_sections is not None:
+            lines.append(f"- Guide sections sent: {', '.join(job.guide_sections)}")
         lines += [f"- Not sent: `{f['path']}` ({f['reason']})" for f in job.wf_skipped]
         for a in job.attempts:
             if a.files:
                 files = ", ".join(
-                    f"`{f['path']}` " + ("ok" if f["accepted"] else f"failed: {f['error']}")
+                    f"`{f['path']}` "
+                    + ("ok" if f["accepted"] else f"failed: {_one_line(f['error'])}")
                     for f in a.files
                 )
-                lines.append(f"- Attempt {a.number} ({a.result}): {files}")
+                kept = (
+                    f"; kept: {', '.join(f'`{p}`' for p in a.kept_files)}" if a.kept_files else ""
+                )
+                lines.append(f"- Attempt {a.number} ({a.result}): {files}{kept}")
     lines += [f"- Note: {n}" for n in job.llm.notes]
     lines.append("")
     if chosen and chosen.verification:

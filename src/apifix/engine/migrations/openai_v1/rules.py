@@ -176,3 +176,29 @@ JSON_DUMP = "Responses are not JSON-serialisable as-is: use resp.model_dump_json
 PACKAGE = "openai"
 FIRST_V1 = "1.0"
 DEPENDENCY = "Pin openai>=1.0 (e.g. openai>=1.0,<2) and migrate call sites"
+
+# Guide parts (guide.md `<!-- part: id -->` markers) and when a job's prompt includes them.
+# A selector (categories, keywords) matches a finding whose category is in `categories` (empty:
+# any) and whose old_pattern or suggestion contains one of `keywords` (empty: no condition).
+GUIDE_ALWAYS = frozenset({"client"})
+GUIDE_FOR_TEST_FILES = frozenset({"tests"})  # when a finding is in a test file
+GUIDE_SELECTORS: dict[str, tuple[tuple[frozenset[str], tuple[str, ...]], ...]] = {
+    "client.async": ((frozenset(), ("AsyncOpenAI", "await ", "aiosession")),),
+    "client.azure": ((frozenset(), ("Azure", "azure", "deployment_id")),),
+    "client.kwargs": (
+        (frozenset({"client_config"}), ()),
+        (frozenset({"api_call"}), tuple(f"{kwarg}=" for kwarg in KWARG_CHANGES)),
+    ),
+    "resources": ((frozenset({"api_call", "import"}), ()),),
+    "resources.removed": (
+        (frozenset({"removed_module"}), ()),
+        (frozenset({"api_call", "import"}), tuple(f"{name}." for name in REMOVED_RESOURCES)),
+    ),
+    "responses": ((frozenset({"api_call", "response_access"}), ()),),
+    "responses.streaming": ((frozenset({"api_call", "response_access"}), ("stream", "delta")),),
+    "errors": (
+        (frozenset({"error_class"}), ()),
+        (frozenset({"import"}), tuple(ERROR_CLASSES)),
+    ),
+    "dependencies": ((frozenset({"dependency"}), ()),),
+}

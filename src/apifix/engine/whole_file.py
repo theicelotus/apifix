@@ -9,6 +9,7 @@ This module holds the pure pieces (file selection, prompts, reply parsing, pre-a
 from __future__ import annotations
 
 import ast
+import difflib
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -28,6 +29,11 @@ CODE_BLOCK_NUDGE = "Return the complete updated file in exactly one code block."
 FEEDBACK_TESTS = 10
 FEEDBACK_MESSAGE_CHARS = 2_000
 FEEDBACK_TOTAL_CHARS = 8_000
+FEEDBACK_PIP_CHARS = 1_500  # dependency files: the tail of pip's output when the install failed
+# A later attempt's request shows the model's previous version of the file as a diff against
+# the original, at most this long, with this many lines of context.
+PREVIOUS_DIFF_CHARS = 3_000
+PREVIOUS_DIFF_CONTEXT = 1
 MIN_LINES_FOR_LENGTH_CHECK = 20
 
 ParseOutcome = Literal["ok", "no_block", "several_blocks", "truncated"]
@@ -76,6 +82,14 @@ def must_change(path: str, findings: list[Finding]) -> bool:
     return any(f.file == path and f.confidence == CERTAIN for f in findings)
 
 
+def context_candidates(path: str, files: list[str]) -> list[str]:
+    """Which of the job's other files a request for `path` may show as read-only context: only
+    test files get context, namely the non-test Python files (the code they test and mock)."""
+    if not is_test_file(path):
+        return []
+    return [p for p in files if p != path and p.endswith(".py") and not is_test_file(p)]
+
+
 def select_context(
     candidates: list[tuple[str, str]], own_bytes: int, budget: int
 ) -> tuple[list[tuple[str, str]], list[str]]:
@@ -95,7 +109,8 @@ def select_context(
 # --- prompts ----------------------------------------------------------------------------------
 
 
-def system_prompt(migration: Migration) -> str:
+def system_prompt(migration: Migration, guide: str | None = None) -> str:
+    """`guide`: the job's guide parts (Migration.job_guide); the full guide by default."""
     return f"""You are apifix's migration assistant. You update one file of a Python \
 repository at a time for a breaking library change: {migration.summary}. A verifier then runs \
 the repository's tests in a network-less sandbox and checks the result.
@@ -116,7 +131,7 @@ changed or not. Never abbreviate with placeholders such as "# ... rest unchanged
 
 Migration guide:
 
-{migration.guide}"""
+{migration.guide if guide is None else guide}"""
 
 
 def _language(path: str) -> str:
@@ -140,9 +155,15 @@ def file_prompt(
     context: Sequence[tuple[str, str]] = (),
     required: bool = True,
     feedback: str = "",
+    previous: str = "",
 ) -> str:
+    """One file's request. `text` is the original file. `feedback` (the attempt's verifier
+    feedback, the same text for every file of a kind) comes first, so that consecutive
+    requests share a prefix a server can cache; `previous` (previous_version_note) follows
+    the file."""
     fence = fence_for(text, *(t for _, t in context))
-    lines = [f"Migrate this file: {path}", f"Breaking change: {summary}", ""]
+    lines = [feedback, ""] if feedback else []
+    lines += [f"Migrate this file: {path}", f"Breaking change: {summary}", ""]
     lines.append("Scanner findings in this file (line: category [confidence]):")
     for f in findings:
         if f.file == path:
@@ -151,8 +172,10 @@ def file_prompt(
                 f"    old: {f.old_pattern}",
                 f"    fix: {f.suggestion}",
             ]
-    lines += ["", f"Current contents of {path}:", f"{fence}{_language(path)}", text.rstrip("\n")]
+    lines += ["", f"Original contents of {path}:", f"{fence}{_language(path)}", text.rstrip("\n")]
     lines += [fence, ""]
+    if previous:
+        lines += [previous, ""]
     if context:
         lines.append(
             "Files already updated for this migration (read-only context; do not return them):"
@@ -161,8 +184,6 @@ def file_prompt(
             lines += [f"--- {ctx_path}", f"{fence}{_language(ctx_path)}", ctx_text.rstrip("\n")]
             lines += [fence]
         lines.append("")
-    if feedback:
-        lines += [feedback, ""]
     instruction = (
         f"Return the complete updated {path} in exactly one fenced code block"
         + (f" (open and close it with {fence})" if len(fence) > 3 else "")
@@ -174,8 +195,16 @@ def file_prompt(
     return "\n".join(lines)
 
 
-def verification_feedback(attempt_number: int, v: Verification) -> str:
-    """For every file of the next attempt: why the verifier rejected the last one."""
+def verification_feedback(
+    attempt_number: int,
+    v: Verification,
+    *,
+    dependency_file: bool = False,
+    hints: Sequence[tuple[str, str]] = (),
+) -> str:
+    """For the next attempt's files: why the verifier rejected the last one. Python files get
+    the failing tests' output (repeated errors shown once) and the migration's hints;
+    dependency files only the problems, plus pip's output when the install failed."""
     head = (
         f"The verifier did not accept attempt {attempt_number} (verdict: {v.verdict}). Fix the "
         "problems below in this file if they concern it; do not weaken, skip or delete tests."
@@ -185,17 +214,61 @@ def verification_feedback(attempt_number: int, v: Verification) -> str:
         max_tests=FEEDBACK_TESTS,
         message_chars=FEEDBACK_MESSAGE_CHARS,
         total_chars=FEEDBACK_TOTAL_CHARS,
+        failure_output=not dependency_file,
+        dedupe=True,
+        hints=() if dependency_file else hints,
+        install_output_chars=FEEDBACK_PIP_CHARS if dependency_file else None,
     )
     return "\n".join([head, "", *body]).rstrip()
 
 
-def check_failure_feedback(path: str, error: str) -> str:
-    """For the next attempt's request for a file whose candidate failed its checks."""
-    return f"Your previous version of {path} was rejected: {error}"
+def previous_version_note(path: str, original: str, previous: str | None, reason: str) -> str:
+    """For a later attempt's request: the model's previous version of `path` as a short diff
+    against the original, and why it failed (`reason`: a check error, or "" when the
+    verifier's feedback above says why). `previous` is None when there was no usable file
+    (e.g. the reply had no code block)."""
+    if "\n" in reason:  # several errors, or one with an example: on lines of their own
+        why = f" was rejected:\n{reason}\n"
+    else:
+        why = f" was rejected: {reason}." if reason else " did not pass verification (see above)."
+    if previous is None:
+        return f"Your previous reply for {path}{why}".rstrip()
+    if previous == original:
+        return f"Your previous version of {path} was identical to the original and{why}".rstrip()
+    diff = "".join(
+        difflib.unified_diff(
+            original.splitlines(keepends=True),
+            previous.splitlines(keepends=True),
+            f"a/{path}",
+            f"b/{path}",
+            n=PREVIOUS_DIFF_CONTEXT,
+        )
+    )
+    if len(diff) > PREVIOUS_DIFF_CHARS:
+        diff = diff[:PREVIOUS_DIFF_CHARS].rsplit("\n", 1)[0] + "\n... (diff truncated)"
+    fence = fence_for(diff)
+    sep = "" if why.endswith("\n") else " "
+    return (
+        f"Your previous version of {path}{why}{sep}Its changes from the original (do not copy "
+        f"them back unchanged; fix what failed):\n{fence}diff\n{diff.rstrip()}\n{fence}"
+    )
+
+
+def join_errors(errors: list[str]) -> str:
+    """Check errors as one string: "; "-joined, or a bullet list when there are several and one
+    spans lines (a message with an example)."""
+    if len(errors) > 1 and any("\n" in e for e in errors):
+        return "\n".join(f"- {e}" for e in errors)
+    return "; ".join(errors)
 
 
 def check_retry_message(path: str, error: str) -> str:
     """Sent in the file's conversation when a candidate fails a check (one retry)."""
+    if "\n" in error:  # join_errors' bullet list (a message with an example)
+        return (
+            f"The updated {path} was rejected:\n{error}\nReturn the complete corrected file in "
+            "exactly one code block."
+        )
     return (
         f"The updated {path} was rejected: {error}. Return the complete corrected file in "
         "exactly one code block."
@@ -293,12 +366,14 @@ def check_candidate(
     *,
     required: bool,
     read_module: Callable[[str], str | None] | None = None,
+    library_modules: frozenset[str] = frozenset(),
 ) -> CheckResult:
     """Syntax (Python files), well-formedness (dependency files), "differs from the original"
     (only when `required`), abbreviation (placeholders, or under half the original's lines
     when it has at least MIN_LINES_FOR_LENGTH_CHECK), names used but never defined (Python
-    files), and mock targets missing from repo modules (test files; `read_module(relpath)`
-    returns the working copy's text of a repo file, or None)."""
+    files), and mock targets that are missing from repo modules or patch the code under test
+    (test files; `read_module(relpath)` returns the working copy's text of a repo file, or
+    None; `library_modules`, the migrated library, lets messages name the target to patch)."""
     checks: dict[str, str] = {}
     errors: list[str] = []
 
@@ -346,6 +421,10 @@ def check_candidate(
     record("undefined_names", "; ".join(names) or None, python)
 
     mocks = python and read_module is not None and is_test_file(path)
-    targets = mock_target_problems(original, candidate, read_module) if mocks else []
+    targets = (
+        mock_target_problems(original, candidate, read_module, library_modules=library_modules)
+        if mocks and read_module is not None
+        else []
+    )
     record("mock_targets", "; ".join(targets) or None, mocks)
     return CheckResult(errors, checks)
