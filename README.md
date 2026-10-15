@@ -109,4 +109,12 @@ kill, power loss) left behind. Runs that are still in progress are not touched: 
 a lock that the operating system releases when the process dies. Use `--dry-run` to see what
 would be removed.
 
+## Live results
+
+Runs of the live test `test_local_whole_file_fix_completes` (a small openai 0.x fixture repo):
+
+| Date | Model | Mode | Hardware | Attempts | Time | Tokens | Verdict | Trajectory |
+|---|---|---|---|---|---|---|---|---|
+| 2026-10-15 | `qwen2.5-coder:7b` (Ollama) | whole-file | CPU only | 2 | 48 min | 12,825 | verified | [JSON](benchmark/live/2026-10-15-qwen2.5-coder-7b-whole-file-verified.json) |
+
 See `CLAUDE.md` for scope, architecture and rules.
