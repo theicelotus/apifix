@@ -43,7 +43,7 @@ pytestmark = [pytest.mark.local_llm, pytest.mark.skipif(_why is not None, reason
 
 
 def llm() -> OpenAICompatLLM:
-    return OpenAICompatLLM(MODEL, base_url=BASE_URL, timeout_s=900)
+    return OpenAICompatLLM(MODEL, base_url=BASE_URL)  # the CLI's default timeout
 
 
 def test_local_model_makes_tool_calls():

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import http.server
 import json
 import threading
+import time
 from dataclasses import dataclass, field
 
 import pytest
@@ -15,8 +17,10 @@ from apifix.engine.llm_openai_compat import (
     MAX_RESPONSE_BYTES,
     TEXT_CALLS_NOTE,
     ConnectFailed,
+    HTTPRequest,
     HTTPResponse,
     OpenAICompatLLM,
+    RequestTimedOut,
     count_text_tool_calls,
     is_local_host,
     parse_text_tool_call,
@@ -91,7 +95,7 @@ def test_request_shape(monkeypatch):
     (req,) = http.requests
     assert (req.method, req.url) == ("POST", "http://localhost:11434/v1/chat/completions")
     assert "Authorization" not in req.headers
-    assert req.timeout_s == 600.0
+    assert req.timeout_s == 3600.0  # local endpoint
     body = http.body()
     assert body["model"] == "qwen2.5-coder:7b"
     assert body["messages"] == [
@@ -278,6 +282,53 @@ def test_retries_are_bounded():
     with pytest.raises(LLMError, match="HTTP 503 .*still busy"):
         complete(llm)
     assert len(http.requests) == 3
+
+
+def test_default_timeout_depends_on_the_endpoint(monkeypatch):
+    monkeypatch.delenv("APIFIX_BASE_URL", raising=False)
+    assert make()[0].timeout_s == 3600.0
+    assert make(base_url="http://192.168.1.20:8000/v1")[0].timeout_s == 3600.0
+    assert make(base_url="https://api.example.com/v1")[0].timeout_s == 600.0
+    assert make(base_url="https://api.example.com/v1", timeout_s=30)[0].timeout_s == 30.0
+    with pytest.raises(LLMError, match="timeout must be positive"):
+        make(timeout_s=0)
+
+
+def test_timeout_is_reported_as_a_timeout_and_not_retried():
+    llm, http = make(RequestTimedOut("timed out"), reply("never sent"), timeout_s=1200)
+    with pytest.raises(LLMError) as exc:
+        complete(llm)
+    message = str(exc.value)
+    assert "timed out after 1,200 s" in message
+    assert "--request-timeout SECONDS" in message
+    assert "no server" not in message and "ollama serve" not in message
+    assert len(http.requests) == 1
+
+
+def _opener_raising(monkeypatch, exc):
+    def open_(*args, **kwargs):
+        raise exc
+
+    monkeypatch.setattr(
+        "apifix.engine.llm_openai_compat._OPENER", type("O", (), {"open": open_})()
+    )
+
+
+def test_transport_tells_read_timeouts_from_connect_failures(monkeypatch):
+    import urllib.error
+
+    req = HTTPRequest("GET", "http://localhost/v1/models", {}, None, 5)
+    # getresponse() / read() raise TimeoutError as is: the server took the request.
+    _opener_raising(monkeypatch, TimeoutError("timed out"))
+    with pytest.raises(RequestTimedOut):
+        urllib_transport(req)
+    # Connecting or sending: urllib wraps the error, so the server was not reached.
+    _opener_raising(monkeypatch, urllib.error.URLError(TimeoutError("timed out")))
+    with pytest.raises(ConnectFailed):
+        urllib_transport(req)
+    _opener_raising(monkeypatch, ConnectionResetError("reset by peer"))
+    with pytest.raises(ConnectFailed):
+        urllib_transport(req)
 
 
 def test_auth_errors_mention_the_key():
@@ -510,12 +561,15 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Location", "http://example.com/steal")
             self.end_headers()
             return
+        if self.path == "/v1/slow/chat/completions":
+            time.sleep(0.5)
         data = reply(None, [tool_call()], finish="tool_calls").body
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        with contextlib.suppress(BrokenPipeError):  # the client timed out (slow path)
+            self.wfile.write(data)
 
 
 @pytest.fixture
@@ -540,6 +594,13 @@ def test_real_http_round_trip(server, monkeypatch):
 def test_redirects_are_not_followed(server):
     llm = OpenAICompatLLM("m", base_url=f"{server}/v1/redirect")
     with pytest.raises(LLMError, match="HTTP 302"):
+        complete(llm)
+    assert len(_Handler.seen) == 1
+
+
+def test_real_slow_server_times_out(server):
+    llm = OpenAICompatLLM("m", base_url=f"{server}/v1/slow", timeout_s=0.1)
+    with pytest.raises(LLMError, match=r"timed out after 0.1 s .*--request-timeout"):
         complete(llm)
     assert len(_Handler.seen) == 1
 
@@ -572,8 +633,6 @@ def test_oversized_responses_are_refused(monkeypatch):
     monkeypatch.setattr(
         "apifix.engine.llm_openai_compat._OPENER", type("O", (), {"open": lambda *a, **k: Big()})()
     )
-    from apifix.engine.llm_openai_compat import HTTPRequest
-
     with pytest.raises(LLMError, match=f"larger than {MAX_RESPONSE_BYTES:,} bytes"):
         urllib_transport(HTTPRequest("GET", "http://localhost/v1/models", {}, None, 5))
 

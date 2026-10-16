@@ -684,7 +684,7 @@ def test_cli_openai_compat_options(repo, tmp_path, monkeypatch, capsys):
     monkeypatch.setattr("apifix.engine.sandbox.Sandbox", lambda *a, **k: JudgingSandbox())
     args = ["fix", str(repo), "--migration", "openai-v1", "--provider", "openai-compat"]
     args += ["--model", "m", "--base-url", "https://x.example/v1", "--api-key-env", "K"]
-    args += ["--timeout", "30", "--no-cost-limit", "--out", str(tmp_path / "out")]
+    args += ["--request-timeout", "30", "--no-cost-limit", "--out", str(tmp_path / "out")]
     assert cli.main(args) == 0
     assert seen == {
         "provider": "openai-compat",
@@ -693,6 +693,26 @@ def test_cli_openai_compat_options(repo, tmp_path, monkeypatch, capsys):
     }
     err = capsys.readouterr().err
     assert err == "notice: repository code will be sent to the third-party server X\n"
+
+
+def test_cli_timeout_alias_and_validation(repo, tmp_path, monkeypatch, capsys):
+    seen = {}
+
+    def fake_get_llm(provider, model, *, prices=None, **options):
+        seen.update(options)
+        return FakeLLM([tools(FIX_APP, FIX_REQS, FIX_TESTS), done()], price=None)
+
+    monkeypatch.setattr("apifix.engine.llm.get_llm", fake_get_llm)
+    monkeypatch.setattr("apifix.engine.sandbox.Sandbox", lambda *a, **k: JudgingSandbox())
+    args = ["fix", str(repo), "--migration", "openai-v1", "--provider", "openai-compat"]
+    args += ["--model", "m", "--no-cost-limit", "--out", str(tmp_path / "out")]
+    assert cli.main([*args, "--timeout", "45"]) == 0  # the older spelling still works
+    assert seen == {"timeout_s": 45.0}
+    seen.clear()
+    assert cli.main(args) == 0
+    assert seen == {}  # the provider picks its default (local endpoints get longer)
+    assert cli.main([*args, "--request-timeout", "0"]) == 2
+    assert "--request-timeout must be positive" in capsys.readouterr().err
 
 
 def test_cli_unpriced_hosted_endpoint_is_refused(repo, tmp_path, monkeypatch, capsys):

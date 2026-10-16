@@ -161,3 +161,39 @@ Decisions made while building:
   provider-side aborts (preflight / provider errors), not on a weak verdict or a limit.
 - A test checks that the README and CLAUDE.md hardware tables name the same models as the
   error message's suggestions.
+
+## Request timeout (2026-10-16)
+
+Request, verbatim:
+
+> apifix fix with --provider openai-compat against local Ollama aborted with "provider_error:
+> no server at http://localhost:11434/v1 ... timed out" after 2,319 tokens, on a real repo whose
+> app.py is much bigger than the tiny repo's (trajectory at ~/apifix-runs/resume-1/
+> trajectory.json). Find out which timeout fired and whether the live tests use a different
+> value than the CLI. Then (1) add a --request-timeout option for openai-compat with a generous
+> default for local endpoints, (2) report a timeout as a timeout, not "no server", and say how
+> to raise it. Add tests, run the full suite with --docker and ruff, then commit.
+
+Findings:
+
+- The provider's own per-request socket timeout fired (`OpenAICompatLLM(timeout_s=600)`, the
+  CLI default; `--timeout` was not passed). urllib raised `TimeoutError` while waiting for the
+  reply; the transport turned it into `ConnectFailed`, which `_call` retries (1 s, 4 s) unless
+  the message says "refused". So, contrary to the documented "Timeouts are not retried", each
+  slow request was sent three times. The trajectory matches: app.py's request ended after
+  1,805 s = 600 + 1 + 600 + 4 + 600, and requirements.txt's reply (1,622 s, more than one
+  socket timeout) most likely arrived on the
+  third try after two timeouts.
+- The live local-LLM tests used `timeout_s=900`, not the CLI's 600.
+
+Changes:
+
+- `--request-timeout SECONDS` (`--timeout` kept as an alias; must be positive). Default from the
+  provider: 3,600 s for local endpoints (`LOCAL_TIMEOUT_S`), 600 s for hosted ones
+  (`HOSTED_TIMEOUT_S`); Claude keeps 600 s.
+- The transport raises `RequestTimedOut` for a timeout after the request was sent (urllib
+  raises `TimeoutError` unwrapped from `getresponse()` / `read()`); timeouts while connecting
+  or sending arrive wrapped in `URLError` and stay `ConnectFailed`. `RequestTimedOut` is not
+  retried and reads "request to <endpoint> timed out after N s without a complete reply (the
+  server is reachable, ...). Raise the limit with --request-timeout SECONDS".
+- The live tests use the provider default, the same value as the CLI.

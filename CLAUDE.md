@@ -29,7 +29,8 @@ dashboard. Do not build these until asked.
 src/apifix/
   cli.py              `apifix scan <path> --migration openai-v1 [--json]`,
                       `apifix fix <path> --migration openai-v1 [--model] [--max-cost] [--out]`,
-                      (openai-compat: `--base-url`, `--strict-tool-calls`;
+                      (openai-compat: `--base-url`, `--strict-tool-calls`,
+                      `--request-timeout`;
                       `--edit-mode agent|whole-file`, `--max-file-bytes`),
                       `apifix cleanup [--dry-run]`
   api/                FastAPI app (later)
@@ -391,8 +392,12 @@ Known limitations:
   their explicit "context length" errors.
 - Servers that report no token usage get character-based estimates (noted in the trajectory),
   so token limits are approximate there.
-- No streaming: a request blocks until the reply is complete (600 s timeout by default,
-  `--timeout`). Timeouts are not retried.
+- No streaming: a request blocks until the reply is complete. Timeout per request
+  (`--request-timeout`, older spelling `--timeout`): 3,600 s for local endpoints, 600 s for
+  hosted ones and for Claude. It is a socket timeout, so it bounds the wait for the reply, not
+  the request's total time. A timeout is reported as one ("timed out after N s ... Raise the
+  limit with --request-timeout") and is not retried; refused/reset connections are "no
+  server" (resets retried twice).
 - Tool calls written as text (on unless `--strict-tool-calls`): used only when the server sent
   no structured call and the whole reply is one `{"name", "arguments"}` object (bare, in one
   ```` ```json ```` / ```` ``` ```` fence, or in one `<tool_call>` block) naming an offered tool,

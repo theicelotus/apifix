@@ -49,6 +49,10 @@ API_KEY_ENV = "APIFIX_LLM_API_KEY"
 MAX_RESPONSE_BYTES = 20_000_000
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 RETRY_DELAYS_S = (1.0, 4.0)
+# Seconds to wait for one reply. Local models on CPU can need far longer than hosted ones for a
+# whole file (prompt evaluation plus several thousand output tokens at a few tokens a second).
+LOCAL_TIMEOUT_S = 3600.0
+HOSTED_TIMEOUT_S = 600.0
 CHARS_PER_TOKEN = 4  # for truncation checks: an underestimate of tokens is the safe side
 CONTEXT_HEADROOM_TOKENS = 1024
 TRUNCATION_RATIO = 0.7  # room for the reply when checking against the context window
@@ -102,6 +106,10 @@ class ConnectFailed(Exception):
     """The server could not be reached (refused, DNS, reset before a response)."""
 
 
+class RequestTimedOut(Exception):
+    """The server accepted the request but sent no complete reply within the timeout."""
+
+
 Transport = Callable[[HTTPRequest], HTTPResponse]
 
 
@@ -122,9 +130,11 @@ def urllib_transport(req: HTTPRequest) -> HTTPResponse:
             return HTTPResponse(resp.status, _read_bounded(resp))
     except urllib.error.HTTPError as exc:
         return HTTPResponse(exc.code, _read_bounded(exc))
-    except urllib.error.URLError as exc:
+    except urllib.error.URLError as exc:  # raised while connecting / sending (incl. timeouts)
         raise ConnectFailed(str(exc.reason)) from exc
-    except (ConnectionError, TimeoutError) as exc:
+    except TimeoutError as exc:  # waiting for or reading the reply
+        raise RequestTimedOut(str(exc) or "timed out") from exc
+    except ConnectionError as exc:
         raise ConnectFailed(str(exc) or type(exc).__name__) from exc
 
 
@@ -167,7 +177,7 @@ class OpenAICompatLLM:
         base_url: str | None = None,
         api_key_env: str = API_KEY_ENV,
         models: Mapping[str, ModelInfo] | None = None,
-        timeout_s: float = 600.0,
+        timeout_s: float | None = None,
         strict_tool_calls: bool = False,
         transport: Transport = urllib_transport,
         sleep: Callable[[float], None] = time.sleep,
@@ -182,7 +192,11 @@ class OpenAICompatLLM:
         self.endpoint = _redact(self.base_url)
         self.local = is_local_host(parts.hostname)
         self.models = dict(models or {})
-        self.timeout_s = timeout_s
+        if timeout_s is None:
+            timeout_s = LOCAL_TIMEOUT_S if self.local else HOSTED_TIMEOUT_S
+        if timeout_s <= 0:
+            raise LLMError("the request timeout must be positive")
+        self.timeout_s = float(timeout_s)
         self.strict_tool_calls = strict_tool_calls
         self.text_tool_calls_seen = False  # a call was parsed from reply text (never if strict)
         self.transport = transport
@@ -263,6 +277,14 @@ class OpenAICompatLLM:
                     continue
                 hint = " (is Ollama running? `ollama serve`)" if self.local else ""
                 raise LLMError(f"no server at {self.endpoint}{hint}: {exc}") from None
+            except RequestTimedOut:
+                # Not retried: the server is up but slow, and a retry would wait just as long.
+                raise LLMError(
+                    f"request to {self.endpoint} timed out after {self.timeout_s:,g} s "
+                    "without a complete reply (the server is reachable, but large files on a "
+                    "slow or CPU-only machine can take longer). Raise the limit with "
+                    "--request-timeout SECONDS"
+                ) from None
             if resp.status in RETRY_STATUSES and delays:
                 self.sleep(delays.pop(0))
                 continue

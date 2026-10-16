@@ -53,7 +53,14 @@ def main(argv: list[str] | None = None) -> int:
         "--api-key-env",
         help="openai-compat: env var holding the API key (default: APIFIX_LLM_API_KEY)",
     )
-    p_fix.add_argument("--timeout", type=float, help="seconds per LLM request (default 600)")
+    p_fix.add_argument(
+        "--request-timeout",
+        "--timeout",
+        dest="request_timeout",
+        type=float,
+        help="seconds to wait for one LLM reply (default 600; openai-compat on a local "
+        "endpoint: 3600)",
+    )
     p_fix.add_argument(
         "--edit-mode",
         choices=["agent", "whole-file"],
@@ -129,12 +136,15 @@ def _fix(args: argparse.Namespace) -> int:
     if args.max_file_bytes is not None and args.max_file_bytes <= 0:
         print("apifix: --max-file-bytes must be positive", file=sys.stderr)
         return EXIT_USAGE
+    if args.request_timeout is not None and args.request_timeout <= 0:
+        print("apifix: --request-timeout must be positive", file=sys.stderr)
+        return EXIT_USAGE
     options = {
         key: value
         for key, value in (
             ("base_url", args.base_url),
             ("api_key_env", args.api_key_env),
-            ("timeout_s", args.timeout),
+            ("timeout_s", args.request_timeout),
             ("strict_tool_calls", args.strict_tool_calls or None),
         )
         if value is not None
