@@ -190,10 +190,19 @@ would be removed.
 
 ## Live results
 
-Runs of the live test `test_local_whole_file_fix_completes` (a small openai 0.x fixture repo):
+The results now include real repos as well as runs of the live test
+`test_local_whole_file_fix_completes` (a small openai 0.x fixture repo). Real repos are linked,
+not copied: without a license that allows it, their code, the diff and the trajectory stay out
+of this repo.
 
-| Date | Model | Mode | Hardware | Attempts | Time | Tokens | Verdict | Trajectory |
-|---|---|---|---|---|---|---|---|---|
-| 2026-10-15 | `qwen2.5-coder:7b` (Ollama) | whole-file | CPU only | 2 | 48 min | 12,825 | verified | [JSON](benchmark/live/2026-10-15-qwen2.5-coder-7b-whole-file-verified.json) |
+| Date | Repo | Model | Mode | Hardware | Attempts | Time | Tokens | Verdict | Trajectory |
+|---|---|---|---|---|---|---|---|---|---|
+| 2026-10-15 | fixture (live test) | `qwen2.5-coder:7b` (Ollama) | whole-file | CPU only | 2 | 48 min | 12,825 | verified | [JSON](benchmark/live/2026-10-15-qwen2.5-coder-7b-whole-file-verified.json) |
+| 2026-10-22 | [brianAbell/AI-powered-Resume-Analyzer-and-Feedback-Generator](https://github.com/brianAbell/AI-powered-Resume-Analyzer-and-Feedback-Generator) | `openai/gpt-oss-120b` (hosted free tier, $0) | whole-file | hosted | 1 | 140 s | 12,675 | verified | not published (repo has no license) |
+
+2026-10-22: a Flask app on openai 0.28.1, CRLF line endings, tests in `backend/testapp.py`.
+Time: LLM 57 s, sandbox 82 s with the pip cache warm. All 8 findings resolved, 100%
+changed-line coverage; 4 tests that need PDF files missing from the repo fail before and after
+the fix, so they count as no signal, not as passes.
 
 See `CLAUDE.md` for scope, architecture and rules.
