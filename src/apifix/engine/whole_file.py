@@ -163,7 +163,10 @@ Migration guide:
 def _language(path: str) -> str:
     if path.endswith(".py"):
         return "python"
-    return "toml" if path.lower().endswith(("pyproject.toml", "pipfile")) else ""
+    name = path.lower().rsplit("/", 1)[-1]
+    if name in ("pyproject.toml", "pixi.toml", "pipfile"):
+        return "toml"
+    return "yaml" if name.endswith((".yml", ".yaml")) else ""
 
 
 def fence_for(*texts: str) -> str:

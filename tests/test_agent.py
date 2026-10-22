@@ -23,6 +23,7 @@ from apifix.engine.agent import (
     AgentConfig,
     fix,
     system_prompt,
+    token_limit_margin,
     tool_call_example,
 )
 from apifix.engine.llm import (
@@ -36,7 +37,8 @@ from apifix.engine.llm import (
 )
 from apifix.engine.llm_openai_compat import TEXT_CALLS_NOTE
 from apifix.engine.migrations import get_migration
-from apifix.engine.sandbox import DownloadStats, PhaseResult, SandboxResult
+from apifix.engine.project import SandboxRequirements
+from apifix.engine.sandbox import DownloadStats, PhaseResult, SandboxConfig, SandboxResult
 from apifix.engine.scanner import scan
 from apifix.engine.test_results import FileCoverage
 from tests.integration.tiny_repo import ORIGINAL as TINY
@@ -107,7 +109,7 @@ class JudgingSandbox:
         self.envs.append(env)
         return self.baseline or self.judge(Path(repo))
 
-    def session(self, repo, *, coverage=False, env=None, smoke=None):
+    def session(self, repo, *, coverage=False, env=None, smoke=None, original=None):
         sandbox = self
         self.envs.append(env)
 
@@ -1832,7 +1834,7 @@ def test_request_over_the_per_minute_limit_is_sent_again_with_fewer_reply_tokens
     llm = FakeLLM([too_large(3000, 2000 + first), *GOOD])
     result = wf(repo, llm)
     assert result.outcome == "verified"
-    lowered = 3000 - 2000 - 64
+    lowered = 3000 - 2000 - 256
     assert llm.max_tokens_seen[:3] == [first, lowered, budget(APP_OLD)]  # per request
     response = result.trajectory["attempts"][0]["responses"][0]
     assert (response["max_tokens"], response["max_tokens_lowered_from"]) == (lowered, first)
@@ -1853,7 +1855,34 @@ def test_hosted_run_numbers_fit_after_one_retry(tmp_path):
     assert first == 5734  # 3,265 + 5,734 > 8,000: refused
     llm = FakeLLM([GOOD[0], GOOD[1], too_large(8000, 3265 + first), block(TESTS_NEW + padding)])
     wf(repo, llm, max_output_tokens=6000)
-    assert llm.max_tokens_seen[2:] == [first, 8000 - 3265 - 64]
+    assert llm.max_tokens_seen[2:] == [first, 8000 - 3265 - 256]
+
+
+def test_token_limit_margin_is_proportional_with_a_floor():
+    assert token_limit_margin(6_000) == 256
+    assert token_limit_margin(8_000) == 256  # 3% would be 240
+    assert token_limit_margin(10_000) == 300
+    assert token_limit_margin(30_000) == 900
+
+
+@pytest.mark.parametrize(
+    ("requested", "max_tokens", "recounted_prompt", "need"),
+    [
+        # Refusals from the 2026-10-22 the hosted provider runs (8,000 tokens per minute), worked back from
+        # the recorded max_tokens figures: the resume-analyzer test file (prompt 3,265, before
+        # the retry existed), a djgpt check retry (prompt 2,237; the old retry was accepted)
+        # and the next djgpt file, whose resend the hosted provider counted 79 tokens higher (refused at
+        # 8,015 with the old 64-token slack).
+        (9_265, 6_000, 3_265, 1_843),
+        (8_237, 6_000, 2_237, 2_660),
+        (8_015, 3_556, 4_459 + 79, 754),
+    ],
+)
+def test_todays_refusals_fit_with_the_new_margin(requested, max_tokens, recounted_prompt, need):
+    prompt = requested - max_tokens
+    fit = 8_000 - prompt - token_limit_margin(8_000)
+    assert need <= fit < max_tokens
+    assert recounted_prompt + fit <= 8_000
 
 
 def test_request_that_cannot_fit_stops_the_job(repo):
@@ -1874,18 +1903,18 @@ def test_a_second_refusal_stops_the_job(repo):
     llm = FakeLLM([too_large(3000, 2000 + first), too_large(3000, 3100)])
     result = wf(repo, llm)
     assert result.outcome == "aborted"
-    assert f"(already sent again with max_tokens lowered from {first:,} to 936)" in result.reason
+    assert f"(already sent again with max_tokens lowered from {first:,} to 744)" in result.reason
 
 
 def test_agent_mode_request_is_lowered_once_and_later_requests_use_the_maximum(repo):
     llm = FakeLLM([too_large(10_000, 4000 + 16_000), tools(FIX_APP, FIX_REQS, FIX_TESTS), done()])
     result = go(repo, llm)
     assert result.outcome == "verified"
-    assert llm.max_tokens_seen == [16_000, 10_000 - 4000 - 64, 16_000]
+    assert llm.max_tokens_seen == [16_000, 10_000 - 4000 - 300, 16_000]
 
 
 def test_agent_mode_needs_room_for_a_reply(repo):
-    llm = FakeLLM([too_large(5000, 4500 + 16_000)])  # 436 tokens would be left
+    llm = FakeLLM([too_large(5000, 4500 + 16_000)])  # 244 tokens would be left
     result = go(repo, llm)
     assert result.outcome == "aborted" and "less than the reply needs (~1,024)" in result.reason
 
@@ -1906,6 +1935,46 @@ def test_failures_without_a_baseline_are_unverified_and_not_retried(repo):
     assert report.startswith("# apifix fix: Not verified (not enough evidence)\n")
     assert "To check it again later without the LLM: `apifix verify " in report
     assert "--migration openai-v1 --diff fix.diff`" in report
+
+
+def test_incomplete_environment_is_never_retried(repo):
+    # The original code's tests cannot import a module the sandbox lacks; attempt 1 is also
+    # rejected (app.py not migrated), but no next attempt could be judged either.
+    baseline = run(("tests.test_app", "error", "collection failure", "dotenv"))
+    llm = FakeLLM([tools(FIX_REQS, FIX_TESTS), done()])  # one attempt only
+    sandbox = JudgingSandbox(baseline=baseline)
+    result = go(repo, llm, sandbox)
+    assert result.attempts == 1 and result.outcome == "rejected"
+    codes = {r.code for r in result.verification.reasons}
+    assert {"environment_incomplete", "incomplete_migration"} <= codes
+    report = result.report_markdown
+    assert "the fix could not be judged and was not retried" in report
+    assert "--diff fix.diff --sandbox-requirements FILE`" in report
+    assert "To check it again later without the LLM" not in report
+
+
+def test_sandbox_requirements_reach_the_report_and_trajectory(repo):
+    sandbox = JudgingSandbox()
+    sandbox.config = SandboxConfig(
+        requirements_override=SandboxRequirements("/x/reqs.txt", "ab" * 32, ("openai==0.28",))
+    )
+    llm = FakeLLM([tools(FIX_APP, FIX_REQS, FIX_TESTS), done()])
+    result = go(repo, llm, sandbox)
+    assert result.trajectory["job"]["sandbox_requirements"] == {
+        "path": "/x/reqs.txt",
+        "sha256": "ab" * 32,
+        "lines": ["openai==0.28"],
+    }
+    assert (
+        "- Sandbox dependencies: from `/x/reqs.txt` (1 requirement(s), sha256 abababababab), "
+        "replacing apifix's detection for the original code and the fix"
+    ) in result.report_markdown
+    assert (
+        go(repo, FakeLLM([tools(FIX_APP, FIX_REQS, FIX_TESTS), done()])).trajectory["job"][
+            "sandbox_requirements"
+        ]
+        is None
+    )
 
 
 def test_download_figures_reach_the_report_and_trajectory(repo):

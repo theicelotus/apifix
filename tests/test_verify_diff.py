@@ -147,6 +147,7 @@ def fake_sandbox(monkeypatch):
     def make(config=None, *a, **k):
         configs.append(config)
         sandboxes.append(FakeSandbox(PASSING, [PASSING]))
+        sandboxes[-1].config = config
         return sandboxes[-1]
 
     monkeypatch.setattr("apifix.engine.sandbox.Sandbox", make)
@@ -194,7 +195,7 @@ def test_cli_pip_cache_default_and_opt_out(saved, tmp_path, fake_sandbox, monkey
 
 
 def test_cli_fix_takes_no_pip_cache_too():
-    sandbox = cli._sandbox(argparse.Namespace(no_pip_cache=True))
+    sandbox = cli._sandbox(argparse.Namespace(no_pip_cache=True, sandbox_requirements=None))
     assert sandbox.config.pip_cache_dir is None
 
 
@@ -223,3 +224,35 @@ def test_a_crlf_repo_round_trips_through_fix_diff(tmp_path, fake_sandbox):
     args = ["verify", str(original), "--migration", "openai-v1", "--diff", str(diff)]
     assert cli.main([*args, "--out", str(out)]) == cli.EXIT_CLEAN
     assert (out / "fix.diff").read_bytes() == diff.read_bytes()
+
+
+def test_cli_verify_with_sandbox_requirements(saved, tmp_path, fake_sandbox):
+    original, diff = saved
+    reqs = tmp_path / "reqs.txt"
+    reqs.write_text("openai==0.28.1\npytest\n")
+    out = tmp_path / "out"
+    args = ["verify", str(original), "--migration", "openai-v1", "--diff", str(diff)]
+    assert cli.main([*args, "--sandbox-requirements", str(reqs), "--out", str(out)]) == (
+        cli.EXIT_CLEAN
+    )
+    (config,) = fake_sandbox
+    assert config.requirements_override.lines == ("openai==0.28.1", "pytest")
+    report = (out / "report.md").read_text()
+    assert f"- Sandbox dependencies: from `{reqs.resolve()}` (2 requirement(s), sha256 " in report
+    job = json.loads((out / "trajectory.json").read_text())["job"]
+    assert job["sandbox_requirements"]["lines"] == ["openai==0.28.1", "pytest"]
+
+
+@pytest.mark.parametrize("command", ["verify", "fix"])
+def test_cli_refuses_an_unusable_sandbox_requirements_file(
+    saved, tmp_path, fake_sandbox, capsys, command
+):
+    original, diff = saved
+    reqs = tmp_path / "reqs.txt"
+    reqs.write_text("-r other.txt\n")
+    args = [command, str(original), "--migration", "openai-v1", "--sandbox-requirements", str(reqs)]
+    if command == "verify":
+        args += ["--diff", str(diff)]
+    assert cli.main([*args, "--out", str(tmp_path / "o")]) == cli.EXIT_USAGE
+    assert "line 1: option -r is not allowed" in capsys.readouterr().err
+    assert not (tmp_path / "o").exists()

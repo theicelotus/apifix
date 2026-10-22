@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import textwrap
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -13,7 +14,7 @@ import pytest
 from apifix.engine import sandbox as sandbox_mod
 from apifix.engine.docker import ProcResult
 from apifix.engine.models import SmokeCheck
-from apifix.engine.project import TestPlan
+from apifix.engine.project import SandboxRequirements, TestPlan
 from apifix.engine.sandbox import (
     CONTAINER_ENV,
     PIP_CACHE_MARKER,
@@ -849,3 +850,34 @@ def test_install_download_figures_are_recorded(repo):
 @pytest.mark.parametrize("stdout", ["", "APIFIX_INSTALL_STATS not json\n", stats_line()[:-10]])
 def test_missing_or_broken_download_figures(stdout):
     assert parse_install_stats(stdout) is None
+
+
+# --- --sandbox-requirements -------------------------------------------------------------------
+
+
+def test_sandbox_requirements_replace_detection_and_keep_the_fixs_changes(repo, tmp_path):
+    override = SandboxRequirements("/x/reqs.txt", "f" * 64, ("openai==0.28", "typer"))
+    config = SandboxConfig(requirements_override=override)
+    docker = FakeDocker(install=[ok(), ok()], test=pytest_run(passed=1))
+    baseline = Sandbox(config, docker).run(repo)
+    fixed = tmp_path / "fixed"
+    shutil.copytree(repo, fixed)
+    pyproject = fixed / "pyproject.toml"
+    pyproject.write_text(pyproject.read_text().replace("openai==0.28.1", "openai>=1.0"))
+    after = Sandbox(config, docker).run(fixed, original=repo)
+
+    first, second = docker.requirements
+    assert first.splitlines()[:2] == ["openai==0.28", "typer"]
+    assert second.splitlines()[:2] == ["typer", "openai>=1.0"]
+    assert baseline.requirements_override == "--sandbox-requirements reqs.txt"
+    assert baseline.dependency_sources == ["--sandbox-requirements reqs.txt"]
+    assert baseline.override_replaced == []
+    assert after.override_replaced == ["openai: openai==0.28 -> openai>=1.0"]
+    assert after.declared["openai"] == ["pyproject.toml"]
+    assert baseline.declared["openai"] == ["--sandbox-requirements reqs.txt"]
+
+
+def test_detected_dependencies_are_recorded_per_run(repo):
+    result = run_sandbox(repo, docker=FakeDocker(test=pytest_run(passed=1)))
+    assert result.declared == {"openai": ["pyproject.toml"]}
+    assert result.requirements_override is None and result.not_installed == []

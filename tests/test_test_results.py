@@ -206,3 +206,62 @@ def test_parse_unittest_messages_for_tests_with_docstrings():
     assert "FileNotFoundError" in messages["testserver.ServerTest.test_upload"]
     assert "Upload reads" not in messages["testserver.ServerTest.test_upload"]
     assert messages["testserver.ServerTest.test_quiet"].startswith("AssertionError: 1 != 2")
+
+
+# --- missing modules --------------------------------------------------------------------------
+
+
+def test_missing_module_is_read_from_the_whole_traceback_before_clipping():
+    trace = "\n".join(
+        f"/work/src/app/mod{i}.py:{i}: in &lt;module&gt;\n    import x" for i in range(40)
+    )
+    xml = f"""<testsuites><testsuite>
+      <testcase classname="" name="tests.test_app"><error message="collection failure">\
+ImportError while importing test module '/work/tests/test_app.py'.
+Traceback:
+{trace}
+E   ModuleNotFoundError: No module named 'dotenv'</error></testcase>
+      <testcase classname="tests.test_b" name="test_ok"/>
+      <testcase classname="tests.test_b" name="test_bad">
+        <failure message="assert 1 == 2"/></testcase>
+    </testsuite></testsuites>"""
+    _, cases = parse_junit(xml)
+    by_id = {c.id: c for c in cases}
+    broken = by_id["tests.test_app"]
+    assert "dotenv" not in broken.message  # clipped to the first 500 characters
+    assert broken.missing_module == "dotenv"
+    assert by_id["tests.test_b::test_bad"].missing_module == ""
+    assert by_id["tests.test_b::test_ok"].missing_module == ""
+
+
+def test_missing_module_is_the_last_one_named_and_keeps_dotted_names():
+    xml = """<testsuites><testsuite><testcase classname="t" name="test_x"><error message="e">\
+ModuleNotFoundError: No module named 'yaml'
+During handling of the above exception, another exception occurred:
+ModuleNotFoundError: No module named "google.protobuf"</error></testcase>
+    </testsuite></testsuites>"""
+    _, (case,) = parse_junit(xml)
+    assert case.missing_module == "google.protobuf"
+
+
+def test_unittest_import_errors_have_their_missing_module():
+    text = """\
+test_app (unittest.loader._FailedTest.test_app) ... ERROR
+
+======================================================================
+ERROR: test_app (unittest.loader._FailedTest.test_app)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_app
+Traceback (most recent call last):
+  File "/work/test_app.py", line 1, in <module>
+    import spotipy
+ModuleNotFoundError: No module named 'spotipy'
+
+
+----------------------------------------------------------------------
+Ran 1 test in 0.001s
+
+FAILED (errors=1)
+"""
+    _, (case,) = parse_unittest_output(text)
+    assert case.outcome == "error" and case.missing_module == "spotipy"

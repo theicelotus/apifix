@@ -15,6 +15,7 @@ SKIP_DIRS = {
     "venv",
     ".tox",
     ".nox",
+    ".pixi",  # pixi's environments (conda environments have no pyvenv.cfg)
     ".eggs",
     ".mypy_cache",
     ".pytest_cache",
@@ -33,6 +34,7 @@ def is_skipped_dir(path: Path) -> bool:
         or path.name.endswith(".egg-info")
         or path.is_symlink()
         or (path / "pyvenv.cfg").exists()  # a virtualenv under another name
+        or (path / "conda-meta").is_dir()  # a conda environment
     )
 
 

@@ -162,6 +162,17 @@ def test_skips_virtualenvs_and_caches(tmp_path):
     assert {f.file for f in result.findings} == {"pkg/mod.py"}
 
 
+def test_skips_pixi_and_conda_environments(tmp_path):
+    # conda environments (pixi's too) have no pyvenv.cfg, and their stdlib is not under
+    # site-packages
+    for d in [".pixi/envs/default/lib/python3.11", "condaenv/lib/python3.11", "pkg"]:
+        (tmp_path / d).mkdir(parents=True)
+        (tmp_path / d / "mod.py").write_text(OLD_CALL)
+    (tmp_path / "condaenv" / "conda-meta").mkdir()
+    result = scan(tmp_path, "openai-v1")
+    assert {f.file for f in result.findings} == {"pkg/mod.py"}
+
+
 def test_paths_are_relative_posix(tmp_path):
     (tmp_path / "a" / "b").mkdir(parents=True)
     (tmp_path / "a" / "b" / "c.py").write_text(OLD_CALL)

@@ -8,16 +8,21 @@ retry) and a Markdown section (for the pull request).
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import Any, Literal
 
-from apifix.engine.dependencies import is_dependency_file
+from apifix.engine.dependencies import (
+    distribution_candidates,
+    is_dependency_file,
+    normalize_name,
+)
 from apifix.engine.diffing import FileChange, diff_trees, read_text
 from apifix.engine.migrations import Migration, get_migration
 from apifix.engine.models import Finding
-from apifix.engine.project import is_test_file
+from apifix.engine.project import NotInstalled, is_test_file
 from apifix.engine.sandbox import PhaseResult, Sandbox, SandboxResult
 from apifix.engine.scanner import scan
 from apifix.engine.scope import tooling_change
@@ -29,6 +34,7 @@ from apifix.engine.tampering import (
     check_test_file,
 )
 from apifix.engine.test_results import TestCaseResult
+from apifix.engine.walk import iter_files
 
 Verdict = Literal["verified", "verified_weak", "rejected", "unverified"]
 # reject -> rejected; unverified -> unverified; weak -> verified_weak; warn/info: report only.
@@ -57,6 +63,15 @@ MAX_LISTED = 15
 # pip output kept per failed install phase in run summaries (the tail: that is where pip's
 # error is)
 INSTALL_OUTPUT_CHARS = 4_000
+# Reasons about the sandbox's environment, not the code: never sent to the model as feedback
+# (no edit can fix them, and they must not read as "fix the pins").
+ENVIRONMENT_REASONS = frozenset(
+    {"environment_incomplete", "missing_modules", "library_not_declared"}
+)
+SANDBOX_REQUIREMENTS_HINT = (
+    "pass --sandbox-requirements FILE listing the packages the tests need (for `apifix "
+    "verify` on the diff too)"
+)
 
 
 @dataclass(frozen=True)
@@ -183,8 +198,9 @@ def feedback_lines(
     ((marker, explanation)) add explanations for markers found in the failing tests' output;
     `install_output_chars` adds the tail of pip's output when the install failed."""
     out: list[str] = []
-    blocking = [r for r in v.reasons if r.severity in ("reject", "unverified", "weak")]
-    warnings = [r for r in v.reasons if r.severity == "warn"]
+    shown = [r for r in v.reasons if r.code not in ENVIRONMENT_REASONS]
+    blocking = [r for r in shown if r.severity in ("reject", "unverified", "weak")]
+    warnings = [r for r in shown if r.severity == "warn"]
     for title, reasons in (("Problems", blocking), ("Warnings (review)", warnings)):
         if not reasons:
             continue
@@ -261,6 +277,15 @@ def run_summary(run: SandboxResult) -> dict:
         "notes": list(run.notes),
         "import_paths": list(run.import_paths),
         **({"smoke": asdict(run.smoke)} if run.smoke else {}),
+        **({"not_installed": [asdict(n) for n in run.not_installed]} if run.not_installed else {}),
+        **(
+            {
+                "requirements_override": run.requirements_override,
+                "override_replaced": list(run.override_replaced),
+            }
+            if run.requirements_override
+            else {}
+        ),
         "duration_s": round(run.duration_s, 3),
     }
 
@@ -291,6 +316,25 @@ def downloads_line(runs: Sequence[tuple[str, SandboxResult]]) -> str | None:
         return None
     cached = any(run.pip_cache for _, run in runs)
     return f"- Dependency downloads (pip cache {'on' if cached else 'off'}): {'; '.join(parts)}"
+
+
+def sandbox_requirements_record(sandbox: Sandbox) -> dict[str, Any] | None:
+    """The --sandbox-requirements file for trajectories (the user's own file: kept whole)."""
+    req = getattr(getattr(sandbox, "config", None), "requirements_override", None)
+    if req is None:
+        return None
+    return {"path": req.path, "sha256": req.sha256, "lines": list(req.lines)}
+
+
+def sandbox_requirements_lines(sandbox: Sandbox) -> list[str]:
+    """Report line for a --sandbox-requirements file, if one replaced dependency detection."""
+    req = getattr(getattr(sandbox, "config", None), "requirements_override", None)
+    if req is None:
+        return []
+    return [
+        f"- Sandbox dependencies: from `{req.path}` ({req.count} requirement(s), sha256 "
+        f"{req.sha256[:12]}), replacing apifix's detection for the original code and the fix"
+    ]
 
 
 # --- per-test comparison --------------------------------------------------------------------
@@ -759,13 +803,19 @@ def _suspicious_reasons(
     return reasons
 
 
-def smoke_reasons(fixed: SandboxResult) -> list[Reason]:
-    """A failed post-install smoke check: a dependency problem, with what got installed."""
+def smoke_reasons(fixed: SandboxResult, baseline: SandboxResult | None = None) -> list[Reason]:
+    """A failed post-install smoke check. When the library is not installed at all, say why
+    (nothing apifix reads declares it, or the fix removed it); otherwise it is a dependency
+    problem, reported with what got installed."""
     smoke = fixed.smoke
     if smoke is None or smoke.status != "failed":
         return []
-    error = next((line.strip() for line in reversed(smoke.output.splitlines()) if line.strip()), "")
     lib = smoke.distribution
+    if smoke.version is None:
+        reason = _not_installed_reason(lib, fixed, baseline)
+        if reason is not None:
+            return [reason]
+    error = next((line.strip() for line in reversed(smoke.output.splitlines()) if line.strip()), "")
     installed = f"{lib} {smoke.version}" if smoke.version else f"{lib} not installed"
     deps = ", ".join(f"{name} {v}" for name, v in sorted(smoke.requires.items()) if v)
     message = (
@@ -781,6 +831,105 @@ def smoke_reasons(fixed: SandboxResult) -> list[Reason]:
         )
     message += " Fix the dependency file(s): raise or drop the pins that conflict."
     return [Reason("smoke_check_failed", "reject", message)]
+
+
+def _not_installed_reason(
+    lib: str, fixed: SandboxResult, baseline: SandboxResult | None
+) -> Reason | None:
+    """Why the migrated library is missing, when its declarations explain it; None when it is
+    declared for the fixed code (then the install itself left it out)."""
+    key = normalize_name(lib)
+    if fixed.declared.get(key):
+        return None
+    before = baseline.declared.get(key, []) if baseline is not None else []
+    if before:
+        return Reason(
+            "library_removed",
+            "reject",
+            f"{lib} is not installed: the fix's dependency files no longer declare it (the "
+            f"original declared it in {', '.join(before)}). Keep {lib} declared and raise its "
+            "version requirement instead of removing it.",
+        )
+    read = ", ".join(fixed.dependency_sources) or "none found"
+    message = f"{lib} is not installed: no dependency file apifix reads declares it (read: {read})"
+    left_out = [n for n in fixed.not_installed if n.name == key]
+    if left_out:
+        message += "; declared but not installed: " + "; ".join(
+            f"{n.source} ({n.why})" for n in left_out
+        )
+    message += f". If the project declares it somewhere else, {SANDBOX_REQUIREMENTS_HINT}."
+    return Reason("library_not_declared", "unverified", message)
+
+
+def repo_module_names(root: Path) -> set[str]:
+    """Names a repo's own code can be imported by at the top level: every Python file's stem
+    and every directory that holds Python files."""
+    names: set[str] = set()
+    for path in iter_files(root):
+        if path.suffix != ".py":
+            continue
+        parts = path.relative_to(root).parts
+        names.add(path.stem)
+        names.update(parts[:-1])
+    return names
+
+
+def _module_detail(module: str, run: SandboxResult) -> str:
+    """Where the distribution that provides `module` is declared, and what became of it."""
+    for dist in distribution_candidates(module):
+        alias = f"{dist}, " if dist != normalize_name(module) else ""
+        if run.declared.get(dist):
+            return (
+                f"{module} ({alias}declared in {', '.join(run.declared[dist])}, but not "
+                "importable after the install)"
+            )
+        left_out = [n for n in run.not_installed if n.name == dist]
+        if left_out:
+            where = "; ".join(f"{n.source}: not installed ({n.why})" for n in left_out)
+            return f"{module} ({alias}{where})"
+    return f"{module} (not declared in any dependency file apifix reads)"
+
+
+def environment_reasons(baseline: SandboxResult, original: Path) -> list[Reason]:
+    """The original code's tests fail because modules are missing from the sandbox's
+    environment (not the repo's own modules, not the stdlib). With no passing test at all
+    that is `environment_incomplete`: nothing the fix does can be judged, and no edit to the
+    code can change it."""
+    if not baseline_usable(baseline) or baseline.test is None:
+        return []
+    local = repo_module_names(original)
+    missing: dict[str, list[str]] = {}
+    for t in baseline.tests:
+        if t.outcome not in ("failed", "error") or not t.missing_module:
+            continue
+        top = t.missing_module.split(".", 1)[0]
+        if top in sys.stdlib_module_names or top in local:
+            continue
+        missing.setdefault(top, []).append(t.id)
+    if not missing:
+        return []
+    details = "; ".join(_module_detail(m, baseline) for m in sorted(missing))
+    tests = _ids([t for ids in missing.values() for t in ids])
+    if baseline.counts.passed == 0:
+        return [
+            Reason(
+                "environment_incomplete",
+                "unverified",
+                "the original code's tests cannot run: they import modules the sandbox's "
+                f"environment does not have: {details}. No edit to the code can fix this; "
+                f"{SANDBOX_REQUIREMENTS_HINT}",
+                tests,
+            )
+        ]
+    return [
+        Reason(
+            "missing_modules",
+            "info",
+            f"some of the original code's tests import modules the sandbox's environment does "
+            f"not have: {details}",
+            tests,
+        )
+    ]
 
 
 def _evidence_reasons(
@@ -868,7 +1017,7 @@ def verify(
         baseline = sandbox.run(original, env=env)
     rerun = None
     smoke = getattr(mig, "smoke_check", None)
-    with sandbox.session(fixed, coverage=True, env=env, smoke=smoke) as session:
+    with sandbox.session(fixed, coverage=True, env=env, smoke=smoke, original=original) as session:
         fixed_run = session.run_tests()
         delta = compare_runs(baseline, fixed_run)
         if config.rerun_new_failures and (delta.newly_failing or delta.newly_erroring):
@@ -885,7 +1034,8 @@ def verify(
         + _scan_reasons(after_scan.findings, new_errors)
         + _scope_reasons(original, fixed, changes, {f.file for f in before_scan.findings})
         + _suspicious_reasons(original, fixed, changes, mig)
-        + smoke_reasons(fixed_run)
+        + smoke_reasons(fixed_run, baseline)
+        + environment_reasons(baseline, original)
         + _evidence_reasons(fixed_run, coverage, config)
     )
     return Verification(
@@ -939,6 +1089,20 @@ def _tests_suffix(r: Reason, shown: int = 5) -> str:
     return f" ({names}{more})"
 
 
+def _not_installed_section(left_out: Sequence[NotInstalled], shown: int = 12) -> list[str]:
+    """Declared dependencies the install left out, grouped by where and why."""
+    groups: dict[tuple[str, str], list[str]] = {}
+    for n in left_out:
+        groups.setdefault((n.source, n.why), []).append(n.name)
+    if not groups:
+        return []
+    lines = []
+    for (source, why), names in groups.items():
+        more = f" and {len(names) - shown} more" if len(names) > shown else ""
+        lines.append(f"`{source}`: {', '.join(names[:shown])}{more}: not installed ({why})")
+    return ["### Declared dependencies not installed", "", *_bullets(lines), ""]
+
+
 def _report(v: Verification) -> str:
     out = [f"## Verification: {_VERDICT_TEXT[v.verdict]}", ""]
     out += [
@@ -972,6 +1136,16 @@ def _report(v: Verification) -> str:
             f"**Import paths:** {paths} on PYTHONPATH in the test phase (test files import "
             "modules from there by bare name)."
         )
+    if v.fixed.requirements_override:
+        line = (
+            f"**Dependencies:** from `{v.fixed.requirements_override}`, replacing apifix's "
+            "detection for the original code and the fix."
+        )
+        if v.fixed.override_replaced:
+            line += " For the fix, its own dependency edits replaced: " + "; ".join(
+                f"`{r}`" for r in v.fixed.override_replaced
+            )
+        out.append(line)
     resolved = v.findings_before - len(v.remaining_findings)
     out += [
         f"**Migration findings:** {resolved} of {v.findings_before} resolved, "
@@ -986,6 +1160,8 @@ def _report(v: Verification) -> str:
             [f"**{r.code}**: {_where(r)}{r.message}{_tests_suffix(r)}" for r in blocking]
         )
         out.append("")
+
+    out += _not_installed_section(v.fixed.not_installed or v.baseline.not_installed)
 
     d = v.delta
     if d.fixed_by_change:

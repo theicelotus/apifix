@@ -37,6 +37,8 @@ from apifix.engine.models import SmokeCheck
 from apifix.engine.project import (
     DEFAULT_PYTHON,
     InstallPlan,
+    NotInstalled,
+    SandboxRequirements,
     TestPlan,
     build_install_plan,
     detect_python_version,
@@ -156,6 +158,8 @@ class SandboxConfig:
     max_install_attempts: int = 4
     # Persistent pip cache shared by install phases (None: off). See default_pip_cache_dir().
     pip_cache_dir: Path | None = None
+    # A user's requirements file that replaces dependency detection (--sandbox-requirements).
+    requirements_override: SandboxRequirements | None = None
 
 
 def default_pip_cache_dir() -> Path:
@@ -268,6 +272,13 @@ class SandboxResult:
     import_paths: list[str] = field(default_factory=list)
     smoke: SmokeResult | None = None
     pip_cache: bool = False  # the install phase used the persistent pip cache
+    # From the install plan: normalised name -> where it is declared; declared dependencies left
+    # out on purpose; the --sandbox-requirements label and its lines the fix's declarations
+    # replaced, when a user's file replaced detection.
+    declared: dict[str, list[str]] = field(default_factory=dict)
+    not_installed: list[NotInstalled] = field(default_factory=list)
+    requirements_override: str | None = None
+    override_replaced: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -421,13 +432,23 @@ class Sandbox:
         env: Mapping[str, str] | None = None,
         smoke: SmokeCheck | None = None,
         tests: TestPlan | None = None,
+        original: str | os.PathLike[str] | None = None,
     ) -> SandboxSession:
         """Install once, run the test phase as often as needed. Use as a context manager.
         `env` adds test-phase variables: literal placeholders chosen by apifix (e.g. a fake
         API key the repo's CI also sets), never values from the host environment. `smoke`
         runs once after the install (SmokeResult in every result). `tests` replaces the
-        detected test plan."""
-        return SandboxSession(self, repo_path, coverage=coverage, env=env, smoke=smoke, tests=tests)
+        detected test plan. `original`: the tree `repo_path` is a fix of, so that with a
+        --sandbox-requirements file the fix's dependency edits still apply."""
+        return SandboxSession(
+            self,
+            repo_path,
+            coverage=coverage,
+            env=env,
+            smoke=smoke,
+            tests=tests,
+            original=original,
+        )
 
     def run(
         self,
@@ -437,9 +458,10 @@ class Sandbox:
         env: Mapping[str, str] | None = None,
         smoke: SmokeCheck | None = None,
         tests: TestPlan | None = None,
+        original: str | os.PathLike[str] | None = None,
     ) -> SandboxResult:
         with self.session(
-            repo_path, coverage=coverage, env=env, smoke=smoke, tests=tests
+            repo_path, coverage=coverage, env=env, smoke=smoke, tests=tests, original=original
         ) as session:
             return session.run_tests()
 
@@ -724,8 +746,10 @@ class SandboxSession:
         env: Mapping[str, str] | None = None,
         smoke: SmokeCheck | None = None,
         tests: TestPlan | None = None,
+        original: str | os.PathLike[str] | None = None,
     ) -> None:
         self.sandbox = sandbox
+        self.original = Path(original).resolve() if original is not None else None
         self.env = dict(env or {})
         for key, value in self.env.items():
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) or "\n" in value:
@@ -772,12 +796,21 @@ class SandboxSession:
         if not self.tests.test_files:
             base.status, base.reason = "unverified", "no test files found"
             return
-        plan = build_install_plan(self.repo, self.tests.runner)
+        plan = build_install_plan(
+            self.repo,
+            self.tests.runner,
+            override=self.sandbox.config.requirements_override,
+            original=self.original,
+        )
         if self.coverage and "coverage" not in plan.requirements:
             plan = dataclasses.replace(plan, requirements=(*plan.requirements, "coverage"))
         base.dependency_sources = list(plan.sources)
         base.lockfile = plan.lockfile
         base.notes += plan.notes
+        base.declared = {name: list(where) for name, where in plan.declared.items()}
+        base.not_installed = list(plan.not_installed)
+        base.requirements_override = plan.override
+        base.override_replaced = list(plan.replaced)
 
         usable, why = self.sandbox.docker.available()
         if not usable:

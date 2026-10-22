@@ -377,6 +377,22 @@ def test_file_prompt_for_likely_only_files_and_long_fences():
     assert "read-only context" not in prompt
 
 
+@pytest.mark.parametrize(
+    ("path", "language"),
+    [
+        ("pyproject.toml", "toml"),
+        ("sub/pixi.toml", "toml"),
+        ("Pipfile", "toml"),
+        ("environment.yml", "yaml"),
+        ("envs/environment.yaml", "yaml"),
+        ("requirements.txt", ""),
+    ],
+)
+def test_dependency_files_are_fenced_with_their_language(path, language):
+    prompt = file_prompt(path, "x\n", [], summary="s")
+    assert f"```{language}\nx\n```" in prompt
+
+
 def _verification(messages):
     tests = [
         SimpleNamespace(id=f"t{i}", message=m, outcome="failed") for i, m in enumerate(messages)

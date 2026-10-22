@@ -7,6 +7,10 @@ apifix fix <path> --migration openai-v1 --provider openai-compat --model M [--ba
     [--strict-tool-calls] [--api-key-env NAME] [--request-timeout S] [--max-output-tokens N]
 apifix verify <path> --migration openai-v1 --diff FILE [--out DIR]
                                  apply a saved diff to a copy and verify it (no LLM)
+apifix fix|verify ... --sandbox-requirements FILE
+                                 install FILE in the sandbox instead of the repo's detected
+                                 dependencies (original code and fix; the fix's own
+                                 dependency edits still apply)
 apifix cleanup [--dry-run]      remove containers/temp dirs left by interrupted runs
 
 fix and verify keep a pip cache for the sandbox's dependency installs
@@ -118,6 +122,13 @@ def main(argv: list[str] | None = None) -> int:
             action="store_true",
             help="download every dependency again instead of using apifix's pip cache",
         )
+        p.add_argument(
+            "--sandbox-requirements",
+            metavar="FILE",
+            help="requirements file installed in the sandbox instead of the repo's detected "
+            "dependencies (original code and fix); names the fix's dependency edits change "
+            "take the fix's version. Only requirements and --index-url / --extra-index-url",
+        )
     p_clean = sub.add_parser(
         "cleanup",
         help="remove apifix containers and temp dirs left behind by crashed or killed runs",
@@ -148,10 +159,15 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _sandbox(args: argparse.Namespace):
+    """The sandbox for fix/verify; ValueError if --sandbox-requirements is unusable."""
+    from apifix.engine.project import load_sandbox_requirements
     from apifix.engine.sandbox import Sandbox, SandboxConfig, default_pip_cache_dir
 
     cache = None if args.no_pip_cache else default_pip_cache_dir()
-    return Sandbox(SandboxConfig(pip_cache_dir=cache))
+    override = (
+        load_sandbox_requirements(args.sandbox_requirements) if args.sandbox_requirements else None
+    )
+    return Sandbox(SandboxConfig(pip_cache_dir=cache, requirements_override=override))
 
 
 def _out_dir(args: argparse.Namespace) -> Path:
@@ -177,7 +193,7 @@ def _verify(args: argparse.Namespace) -> int:
         return EXIT_USAGE
     try:
         result = verify_diff(args.path, args.migration, args.diff, sandbox=_sandbox(args))
-    except VerifyError as exc:
+    except (VerifyError, ValueError) as exc:
         print(f"apifix: {exc}", file=sys.stderr)
         return EXIT_USAGE
     out = _out_dir(args)
@@ -226,6 +242,7 @@ def _fix(args: argparse.Namespace) -> int:
         if value is not None
     }
     try:
+        sandbox = _sandbox(args)  # checks --sandbox-requirements before any LLM setup
         llm = get_llm(args.provider, args.model, prices=args.prices, **options)
         notice = getattr(llm, "privacy_notice", None)
         if notice:
@@ -245,7 +262,7 @@ def _fix(args: argparse.Namespace) -> int:
             edit_mode=args.edit_mode,
             **limits,
         )
-        result = fix(args.path, args.migration, llm=llm, sandbox=_sandbox(args), config=config)
+        result = fix(args.path, args.migration, llm=llm, sandbox=sandbox, config=config)
     except (LLMError, ValueError) as exc:
         print(f"apifix: {exc}", file=sys.stderr)
         return EXIT_USAGE

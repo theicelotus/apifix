@@ -1,0 +1,13 @@
+name: notes-app
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy>=1.24
+  - conda-forge::pandas 2.1.*
+  - pip:
+      - openai==0.27.6
+      - requests>=2.31  # http
+      - pyobjc-core==10.1
+      - pywin32; sys_platform == "win32"

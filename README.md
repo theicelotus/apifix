@@ -42,7 +42,41 @@ a test imports a neighbouring module by bare name (`backend/testapp.py`: `from a
 that directory goes on `PYTHONPATH`. After the fixed code's dependencies are installed, a
 smoke check makes sure the new library actually works with them (openai: create a client). If
 it fails, the fix is rejected with the installed versions and the pins that can hold the
-library back (e.g. `typing_extensions==4.5.0` forcing an old openai).
+library back (e.g. `typing_extensions==4.5.0` forcing an old openai). If the library is not
+installed at all because no dependency file apifix reads declares it, the report says that
+instead (verdict "unverified"); if the fix removed its declaration, the fix is rejected.
+
+### Dependencies in the sandbox
+
+apifix reads `pyproject.toml` (`[project]`, dependency groups, Poetry, and pixi's
+`pypi-dependencies`, including features and Linux targets), `pixi.toml`, `setup.py`/`setup.cfg`,
+`Pipfile`, requirements files and the `pip:` list of a conda `environment.yml`. Some declared
+packages are not installed, and the report lists them under "Declared dependencies not
+installed":
+
+- conda-only packages (pixi `dependencies`, an environment's conda list): not supported yet;
+- pixi targets for other platforms (`osx-*`, `win-*`), and pip packages that only install on
+  macOS or Windows (`pyobjc*`, `appnope`, `pywin32`, ...);
+- `environment.yml` next to a pixi manifest (pixi never reads it), and the conda list of an
+  exported environment (`conda env export`: build strings, `prefix:`).
+
+When the original code's tests import modules that the sandbox does not have and no test
+passes, the verdict is "unverified" with `environment_incomplete`. The report names each missing
+module, where it is declared, and why it was not installed. No edit to the code can change
+that, so the fix is not retried, and the model is never told to change pins because of it.
+
+`--sandbox-requirements FILE` (for `fix` and `verify`) replaces apifix's dependency detection
+with your own requirements file for both the original code and the fix. The fix's own
+dependency edits still apply: for every package whose declaration the fix changed, the fix's
+version replaces your line (e.g. your `openai==0.28` becomes the fix's `openai>=1.0`), and the
+report lists each replacement. The file may hold requirements and `--index-url` /
+`--extra-index-url` lines (e.g. a CPU-only torch index), but no includes, editables, local paths
+or URLs with credentials, since it is passed to pip in the networked install container.
+
+```
+apifix verify path/to/repo --migration openai-v1 --diff fix.diff \
+    --sandbox-requirements sandbox-requirements.txt
+```
 
 Dependency installs share a pip cache (`~/.cache/apifix/pip`, or `$APIFIX_PIP_CACHE`), so a
 package downloaded once is reused by later runs, and the baseline and each attempt no longer

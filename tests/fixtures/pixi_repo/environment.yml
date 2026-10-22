@@ -1,0 +1,11 @@
+# An older conda environment for the same project; pixi does not read it.
+name: voicebot
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - typer
+  - pip:
+    - openai==0.27.6  # the old pin
+    - "rich>=12"

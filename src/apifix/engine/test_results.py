@@ -26,6 +26,9 @@ class TestCaseResult:
     id: str
     outcome: Outcome
     message: str = ""  # start of the failure/error text; empty for passes and skips
+    # the module in "No module named 'x'" anywhere in the full failure text (read before the
+    # message is clipped: pytest prints it at the end of a traceback); "" if none
+    missing_module: str = ""
 
 
 @dataclass(frozen=True)
@@ -45,6 +48,16 @@ class ReportError(ValueError):
 
 def _clip(text: str) -> str:
     return text.strip()[:MAX_MESSAGE]
+
+
+_MISSING_MODULE = re.compile(r"No module named ['\"]?([A-Za-z_][\w.]*)")
+
+
+def missing_module(text: str) -> str:
+    """The module of the last "No module named 'x'" in `text` (the error that ended the run,
+    after any chained ones), or ""."""
+    found = _MISSING_MODULE.findall(text)
+    return found[-1] if found else ""
 
 
 def _unittest_id(name: str, where: str) -> str:
@@ -87,12 +100,13 @@ def parse_junit(xml_text: str) -> tuple[TestCounts, list[TestCaseResult]]:
             outcome = "skipped"
         else:
             outcome = "passed"
-        message = ""
+        message = missing = ""
         if outcome in ("failed", "error"):
             node = children["failure" if outcome == "failed" else "error"]
-            message = _clip(f"{node.get('message', '')}\n{node.text or ''}")
+            full = f"{node.get('message', '')}\n{node.text or ''}"
+            message, missing = _clip(full), missing_module(full)
         test_id = f"{classname}::{name}" if classname else name
-        cases.append(TestCaseResult(test_id, outcome, message))
+        cases.append(TestCaseResult(test_id, outcome, message, missing))
     cases = _dedupe(cases)
     return counts_from(cases), cases
 
@@ -143,16 +157,16 @@ def _unittest_lines(text: str) -> list[tuple[str, str, str]]:
 def parse_unittest_output(text: str) -> tuple[TestCounts, list[TestCaseResult]]:
     """Parse `python -m unittest -v` output (stderr). The summary lines are authoritative for
     counts; per-test lines are best effort (test output can interleave with them)."""
-    messages = {
-        _unittest_id(m.group("name"), m.group("where")): _clip(m.group("body"))
+    bodies = {
+        _unittest_id(m.group("name"), m.group("where")): m.group("body")
         for m in _UNITTEST_BLOCK.finditer(text)
     }
     cases = []
     for name, where, status in _unittest_lines(text):
         test_id = _unittest_id(name, where)
         outcome = "skipped" if status.startswith("skipped") else _UNITTEST_STATUS[status]
-        message = messages.get(test_id, "") if outcome in ("failed", "error") else ""
-        cases.append(TestCaseResult(test_id, outcome, message))
+        body = bodies.get(test_id, "") if outcome in ("failed", "error") else ""
+        cases.append(TestCaseResult(test_id, outcome, _clip(body), missing_module(body)))
     cases = _dedupe(cases)
 
     ran = _RAN.findall(text)

@@ -60,3 +60,33 @@ def test_nested_config_files_and_source_are_not_tooling():
 
 def test_unparseable_config():
     assert "could not be parsed" in tooling_change("pyproject.toml", PYPROJECT, "[x\n")
+
+
+PIXI = """\
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+
+[tool.pixi.pypi-dependencies]
+openai = "==0.28"
+
+[tool.pixi.target.linux-64.pypi-dependencies]
+httpx = "<0.28"
+
+[tool.pixi.feature.test.pypi-dependencies]
+pytest = ">=7"
+
+[tool.pixi.feature.test.target.unix.pypi-dependencies]
+openai = "==0.28"
+"""
+
+
+def test_pixi_pypi_dependency_edits_are_not_tooling_changes():
+    new = PIXI.replace('"==0.28"', '">=1.0,<2"').replace('"<0.28"', '">=0.27"')
+    assert tooling_change("pyproject.toml", PIXI, new) is None
+
+
+def test_other_pixi_settings_are():
+    new = PIXI.replace('"conda-forge"', '"defaults"')
+    assert tooling_change("pyproject.toml", PIXI, new) == (
+        "settings other than dependency pins changed: tool.pixi.workspace.channels"
+    )

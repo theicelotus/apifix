@@ -7,22 +7,30 @@ from __future__ import annotations
 
 import ast
 import configparser
+import hashlib
 import json
 import re
 import tomllib
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
 from apifix.engine.dependencies import (
+    CONDA_ENVIRONMENT_FILES,
+    NotInstalled,
     allows,
     build_system_requires,
+    has_pixi_manifest,
+    install_requirements,
     is_dependency_file,
     normalize_name,
     pep440_clauses,
+    platform_only,
     poetry_clauses,
     requirements_from_file,
+    sandbox_requirement_lines,
+    sandbox_requirements_problem,
 )
 from apifix.engine.walk import iter_files
 
@@ -467,12 +475,52 @@ class InstallPlan:
     sources: tuple[str, ...]
     lockfile: str | None
     notes: tuple[str, ...] = field(default=())
+    # normalised name -> where it is declared (files read, or the --sandbox-requirements file)
+    declared: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    not_installed: tuple[NotInstalled, ...] = ()
+    override: str | None = None  # SandboxRequirements.label when a user's file replaced detection
+    replaced: tuple[str, ...] = ()  # its lines the fix's declarations replaced ("name: a -> b")
+
+
+@dataclass(frozen=True)
+class SandboxRequirements:
+    """A user's requirements file that replaces dependency detection for the sandbox install
+    (`--sandbox-requirements`), for the original code and the fix alike."""
+
+    path: str
+    sha256: str
+    lines: tuple[str, ...]  # requirement and index-option lines, comments dropped
+
+    @property
+    def label(self) -> str:
+        return f"--sandbox-requirements {PurePosixPath(self.path).name}"
+
+    @property
+    def count(self) -> int:
+        return sum(not line.startswith("-") for line in self.lines)
+
+
+def load_sandbox_requirements(path: str | Path) -> SandboxRequirements:
+    """Read and check a --sandbox-requirements file; ValueError says what is wrong."""
+    p = Path(path)
+    try:
+        text = p.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(f"cannot read --sandbox-requirements {path}: {exc}") from None
+    problem = sandbox_requirements_problem(text)
+    if problem:
+        raise ValueError(f"--sandbox-requirements {path}: {problem}")
+    return SandboxRequirements(
+        str(p.resolve()),
+        hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        tuple(sandbox_requirement_lines(text)),
+    )
 
 
 _REQ_NAME_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(\[[^\]]*\])?\s*([^;@]*)")
 _PINNED_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(\[[^\]]*\])?\s*==\s*[^\s*;,]+\s*(;.*)?$")
 _INCLUDE_RE = re.compile(r"^\s*(-r|-c|--requirement|--constraint)\b", re.M)
-_MANIFESTS = ("pyproject.toml", "setup.py", "setup.cfg", "Pipfile")
+_MANIFESTS = ("pyproject.toml", "pixi.toml", "setup.py", "setup.cfg", "Pipfile")
 
 
 def _req_name(req: str) -> str | None:
@@ -609,38 +657,96 @@ def _filter_pins(
     return kept
 
 
-def build_install_plan(repo: Path, runner: Runner | None) -> InstallPlan:
-    notes: list[str] = []
-    sources: list[str] = []
-    reqs: list[str] = []
-    req_files = _requirement_files(repo)
-    for rel in [m for m in _MANIFESTS if (repo / m).is_file()] + req_files:
-        text = _read(repo / rel)
-        if text is None:
-            notes.append(f"{rel}: unreadable; skipped")
-            continue
-        try:
-            reqs += requirements_from_file(rel, text)
-        except (SyntaxError, ValueError, configparser.Error) as exc:
-            notes.append(f"{rel}: could not parse ({type(exc).__name__}); skipped")
-            continue
-        sources.append(rel)
-
+def _build_requirements(repo: Path) -> list[str]:
+    """What the build backend needs to install the repo itself (offline, in the test phase)."""
     try:
-        reqs += build_system_requires(
+        return build_system_requires(
             _read(repo / "pyproject.toml") if (repo / "pyproject.toml").is_file() else None,
             has_setup=(repo / "setup.py").is_file() or (repo / "setup.cfg").is_file(),
         )
     except ValueError:
-        reqs += ["setuptools", "wheel"]
+        return ["setuptools", "wheel"]
 
+
+def _with_tooling(
+    repo: Path, runner: Runner | None, reqs: list[str], notes: list[str]
+) -> list[str]:
+    """`reqs` plus the build backend's requirements and the test runner, without
+    self-references to the repo's own project (it is installed from source)."""
+    reqs = reqs + _build_requirements(repo)
     own = _project_name(repo)
     if own and any(_req_name(r) == own for r in reqs):
         notes.append(f"self-references to {own} dropped (the repo is installed from source)")
         reqs = [r for r in reqs if _req_name(r) != own]
     if runner == "pytest" and not any(_req_name(r) == "pytest" for r in reqs):
         reqs.append("pytest")
+    return reqs
 
+
+def build_install_plan(
+    repo: Path,
+    runner: Runner | None,
+    override: SandboxRequirements | None = None,
+    original: Path | None = None,
+) -> InstallPlan:
+    """What to install for `repo`. With `override` (a user's requirements file), that file
+    replaces the repo's declared dependencies; when `repo` is a fix of `original`, every name
+    whose declaration the fix changed takes the fix's declaration instead."""
+    if override is not None:
+        return _override_plan(repo, runner, override, original)
+    notes: list[str] = []
+    sources: list[str] = []
+    reqs: list[str] = []
+    declared: dict[str, list[str]] = {}
+    left_out: list[NotInstalled] = []
+    req_files = _requirement_files(repo)
+    # environment.yml comes last: its pip list yields to every other source
+    env_files = [n for n in CONDA_ENVIRONMENT_FILES if (repo / n).is_file()]
+    pyproject = repo / "pyproject.toml"
+    pixi = has_pixi_manifest(
+        _read(pyproject) if pyproject.is_file() else None, (repo / "pixi.toml").is_file()
+    )
+    for rel in [m for m in _MANIFESTS if (repo / m).is_file()] + req_files + env_files:
+        text = _read(repo / rel)
+        if text is None:
+            notes.append(f"{rel}: unreadable; skipped")
+            continue
+        try:
+            found, skipped = install_requirements(rel, text)
+        except (SyntaxError, ValueError, configparser.Error) as exc:
+            notes.append(f"{rel}: could not parse ({type(exc).__name__}); skipped")
+            continue
+        if rel in env_files and pixi:
+            # pixi never reads environment.yml: next to a pixi manifest it is another,
+            # usually older, environment
+            notes.append(
+                f"{rel}: not installed (the repo has a pixi manifest, which does not read it)"
+            )
+            why = "the pixi manifest takes precedence; pixi does not read this file"
+            left_out += [
+                NotInstalled(name, source, why) for req, source in found if (name := _req_name(req))
+            ]
+            left_out += [NotInstalled(n.name, n.source, why) for n in skipped]
+            continue
+        sources.append(rel)
+        for req, source in found:
+            name = _req_name(req)
+            if rel in env_files and name in declared:
+                notes.append(
+                    f"{source}: {req} not installed ({', '.join(declared[name])} declares {name})"
+                )
+                continue
+            if name and ";" not in req and (why := platform_only(name)):
+                left_out.append(NotInstalled(name, source, why))
+                continue
+            reqs.append(req)
+            if source not in sources:
+                sources.append(source)
+            if name and source not in declared.setdefault(name, []):
+                declared[name].append(source)
+        left_out += skipped
+
+    reqs = _with_tooling(repo, runner, reqs, notes)
     lockfile, pins, lock_notes = _lock_pins(repo, req_files)
     notes += lock_notes
     if lockfile:
@@ -651,4 +757,59 @@ def build_install_plan(repo: Path, runner: Runner | None) -> InstallPlan:
         sources=tuple(sources),
         lockfile=lockfile,
         notes=tuple(notes),
+        declared={name: tuple(where) for name, where in declared.items()},
+        # a package installed anyway (another source, or apifix's own tooling) is not missing
+        not_installed=tuple(
+            n for n in left_out if n.name not in declared and n.name not in _by_name(reqs)
+        ),
+    )
+
+
+def _by_name(reqs: Iterable[str]) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for req in reqs:
+        if name := _req_name(req):
+            out.setdefault(name, []).append(req)
+    return out
+
+
+def _override_plan(
+    repo: Path, runner: Runner | None, override: SandboxRequirements, original: Path | None
+) -> InstallPlan:
+    notes = [
+        f"dependencies from {override.label} ({override.count} requirement(s)), replacing "
+        "apifix's detection"
+    ]
+    reqs = list(override.lines)
+    declared = {name: (override.label,) for line in reqs if (name := _req_name(line))}
+    replaced = []
+    if original is not None:
+        # The fix's own dependency edits still count: compare what detection finds in both
+        # trees, and let the fix's declaration win for every name it changed.
+        fixed_plan = build_install_plan(repo, None)
+        original_plan = build_install_plan(original, None)
+        new, old = _by_name(fixed_plan.requirements), _by_name(original_plan.requirements)
+        for name in sorted(set(new) | set(old)):
+            if new.get(name) == old.get(name):
+                continue
+            before = [r for r in reqs if _req_name(r) == name]
+            reqs = [r for r in reqs if _req_name(r) != name] + new.get(name, [])
+            if name in new:
+                declared[name] = fixed_plan.declared.get(name, ())
+            else:
+                declared.pop(name, None)
+            replaced.append(
+                f"{name}: {', '.join(before) or 'not listed'} -> "
+                f"{', '.join(new.get(name, [])) or 'removed by the fix'}"
+            )
+    reqs = _with_tooling(repo, runner, reqs, notes)
+    return InstallPlan(
+        requirements=tuple(dict.fromkeys(reqs)),
+        constraints=(),
+        sources=(override.label,),
+        lockfile=None,
+        notes=tuple(notes),
+        declared=declared,
+        override=override.label,
+        replaced=tuple(replaced),
     )

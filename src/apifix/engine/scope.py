@@ -57,10 +57,27 @@ def _flatten(data: object, prefix: str = "") -> dict[str, object]:
     return out
 
 
+def _drop_pixi_dependencies(data: dict) -> None:
+    """pixi pypi-dependencies tables: at the top of [tool.pixi], per target, per feature and
+    per feature target."""
+    pixi = data.get("tool", {}).get("pixi")
+    if not isinstance(pixi, dict):
+        return
+    features = pixi.get("feature")
+    levels = [pixi, *(f for f in (features or {}).values() if isinstance(f, dict))]
+    for level in levels:
+        level.pop("pypi-dependencies", None)
+        targets = level.get("target")
+        for target in (targets or {}).values() if isinstance(targets, dict) else ():
+            if isinstance(target, dict):
+                target.pop("pypi-dependencies", None)
+
+
 def _pyproject_settings(text: str) -> dict[str, object]:
     data = tomllib.loads(text)
     for path in _PYPROJECT_DEPENDENCY_KEYS:
         _drop(data, path)
+    _drop_pixi_dependencies(data)
     return _flatten(data)
 
 

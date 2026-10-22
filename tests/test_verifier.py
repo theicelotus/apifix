@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from apifix.engine.project import NotInstalled
 from apifix.engine.sandbox import PhaseResult, SandboxResult, SmokeResult
 from apifix.engine.test_results import FileCoverage, TestCaseResult, counts_from
 from apifix.engine.verifier import (
@@ -86,15 +87,17 @@ class FakeSandbox:
     last_session: FakeSession | None = None
     envs: list[dict | None] = field(default_factory=list)
     smokes: list[object] = field(default_factory=list)
+    originals: list[object] = field(default_factory=list)
 
     def run(self, repo, *, coverage=False, env=None):
         self.baseline_runs += 1
         self.envs.append(env)
         return self.baseline
 
-    def session(self, repo, *, coverage=False, env=None, smoke=None):
+    def session(self, repo, *, coverage=False, env=None, smoke=None, original=None):
         self.envs.append(env)
         self.smokes.append(smoke)
+        self.originals.append(original)
         self.session_coverage = coverage
         self.last_session = FakeSession(list(self.fixed))
         return self.last_session
@@ -877,3 +880,166 @@ def test_import_paths_are_in_the_report(trees):
     fixed_run.import_paths = ["svc"]
     v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(PASSING, [fixed_run]))
     assert "**Import paths:** `svc/` on PYTHONPATH" in v.report_markdown()
+
+
+# --- environment ------------------------------------------------------------------------------
+
+
+def no_env_baseline() -> SandboxResult:
+    """The original code's tests all fail on modules the environment lacks."""
+    baseline = run(
+        ("tests.test_app", "error", "collection failure", "dotenv.main"),
+        ("tests.test_spotify", "error", "collection failure", "spotipy"),
+        ("tests.test_os", "error", "collection failure", "os.missing"),  # stdlib: not counted
+        ("tests.test_local", "error", "collection failure", "app"),  # repo module: not counted
+    )
+    baseline.declared = {"openai": ["requirements.txt"]}
+    baseline.not_installed = [
+        NotInstalled(
+            "spotipy",
+            "pyproject.toml [tool.pixi.dependencies]",
+            "conda-only package; not supported yet",
+        ),
+    ]
+    return baseline
+
+
+def test_environment_incomplete_names_missing_modules_and_where_they_are_declared(trees):
+    original, fixed = trees({})
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(no_env_baseline(), [PASSING]))
+    assert v.verdict == "unverified"
+    r = reason(v, "environment_incomplete")
+    assert r.severity == "unverified"
+    assert "dotenv (python-dotenv, not declared in any dependency file apifix reads)" not in (
+        r.message
+    )
+    assert "dotenv (not declared in any dependency file apifix reads)" in r.message
+    assert (
+        "spotipy (pyproject.toml [tool.pixi.dependencies]: not installed (conda-only package; "
+        "not supported yet))" in r.message
+    )
+    assert "; os (" not in r.message and "; app (" not in r.message  # stdlib, repo module
+    assert "--sandbox-requirements FILE" in r.message
+    assert r.tests == ("tests.test_app", "tests.test_spotify")
+    # the model never sees it
+    lines = "\n".join(feedback_lines(v))
+    assert "environment_incomplete" not in lines and "sandbox's environment" not in lines
+
+
+def test_environment_detail_uses_the_import_name_table(trees):
+    original, fixed = trees({})
+    baseline = run(("tests.test_app", "error", "collection failure", "dotenv"))
+    baseline.declared = {"python-dotenv": ["pyproject.toml"]}
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(baseline, [PASSING]))
+    assert (
+        "dotenv (python-dotenv, declared in pyproject.toml, but not importable after the "
+        "install)" in reason(v, "environment_incomplete").message
+    )
+
+
+def test_missing_modules_with_passing_baseline_tests_are_only_info(trees):
+    original, fixed = trees({})
+    baseline = run(
+        (T_ASK, "passed"),
+        (T_STRIP, "passed"),
+        ("tests.test_extra", "error", "collection failure", "spotipy"),
+    )
+    fixed_run = run(
+        (T_ASK, "passed"),
+        (T_STRIP, "passed"),
+        ("tests.test_extra", "error", "collection failure", "spotipy"),
+        coverage=FULL_COVERAGE,
+    )
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(baseline, [fixed_run]))
+    assert "environment_incomplete" not in codes(v)
+    r = reason(v, "missing_modules")
+    assert r.severity == "info" and "spotipy (not declared" in r.message
+
+
+def test_a_baseline_without_import_errors_is_not_environment_incomplete(trees):
+    original, fixed = trees({})
+    baseline = run((T_ASK, "failed", "assert 1 == 2"), (T_STRIP, "failed", "boom"))
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(baseline, [PASSING]))
+    assert not codes(v) & {"environment_incomplete", "missing_modules"}
+
+
+def missing_library_run(**declared) -> SandboxResult:
+    fixed_run = run(("tests.test_app", "error", "collection failure", "openai"))
+    fixed_run.smoke = SmokeResult(
+        "failed",
+        'import openai; openai.OpenAI(api_key="<dummy key>")',
+        "ModuleNotFoundError: No module named 'openai'",
+        "openai",
+        None,
+    )
+    fixed_run.dependency_sources = ["pyproject.toml"]
+    fixed_run.declared = {k: list(v) for k, v in declared.items()}
+    return fixed_run
+
+
+def test_smoke_check_says_when_nothing_declares_the_library(trees):
+    original, fixed = trees({})
+    fixed_run = missing_library_run()
+    fixed_run.not_installed = [
+        NotInstalled("openai", "environment.yml (pip)", "a pixi manifest takes precedence")
+    ]
+    baseline = run(("tests.test_app", "error", "collection failure", "openai"))
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(baseline, [fixed_run]))
+    assert "smoke_check_failed" not in codes(v)
+    r = reason(v, "library_not_declared")
+    assert r.severity == "unverified" and v.verdict == "unverified"
+    assert r.message.startswith(
+        "openai is not installed: no dependency file apifix reads declares it (read: "
+        "pyproject.toml); declared but not installed: environment.yml (pip) (a pixi manifest "
+        "takes precedence). If the project declares it somewhere else, pass "
+        "--sandbox-requirements FILE"
+    )
+    assert "raise or drop" not in r.message
+    assert "library_not_declared" not in "\n".join(feedback_lines(v))
+
+
+def test_smoke_check_says_when_the_fix_removed_the_library(trees):
+    original, fixed = trees({})
+    baseline = run((T_ASK, "passed"), (T_STRIP, "passed"))
+    baseline.declared = {"openai": ["requirements.txt"]}
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(baseline, [missing_library_run()]))
+    r = reason(v, "library_removed")
+    assert r.severity == "reject" and v.verdict == "rejected"
+    assert "the fix's dependency files no longer declare it (the original declared it in " in (
+        r.message
+    )
+    assert "library_removed" in "\n".join(feedback_lines(v))
+
+
+def test_declared_but_uninstalled_library_keeps_the_dependency_message(trees):
+    original, fixed = trees({})
+    fixed_run = missing_library_run(openai=["requirements.txt"])
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(PASSING, [fixed_run]))
+    r = reason(v, "smoke_check_failed")
+    assert "Installed: openai not installed" in r.message
+
+
+def test_report_lists_dependencies_left_out_and_the_override(trees):
+    original, fixed = trees({})
+    fixed_run = run((T_ASK, "passed"), (T_STRIP, "passed"), coverage=FULL_COVERAGE)
+    conda = ("pyproject.toml [tool.pixi.dependencies]", "conda-only package; not supported yet")
+    fixed_run.not_installed = [NotInstalled(name, *conda) for name in ("typer", "spotipy")]
+    fixed_run.requirements_override = "--sandbox-requirements reqs.txt"
+    fixed_run.override_replaced = ["openai: openai==0.28 -> openai>=1.0"]
+    sandbox = FakeSandbox(PASSING, [fixed_run])
+    v = verify(original, fixed, "openai-v1", sandbox=sandbox)
+    md = v.report_markdown()
+    assert "### Declared dependencies not installed" in md
+    assert (
+        "- `pyproject.toml [tool.pixi.dependencies]`: typer, spotipy: not installed "
+        "(conda-only package; not supported yet)" in md
+    )
+    assert (
+        "**Dependencies:** from `--sandbox-requirements reqs.txt`, replacing apifix's "
+        "detection for the original code and the fix. For the fix, its own dependency edits "
+        "replaced: `openai: openai==0.28 -> openai>=1.0`" in md
+    )
+    summary = v.to_dict()["runs"]["fixed"]
+    assert summary["not_installed"][0] == {"name": "typer", "source": conda[0], "why": conda[1]}
+    assert summary["override_replaced"] == ["openai: openai==0.28 -> openai>=1.0"]
+    assert sandbox.originals == [original.resolve()]

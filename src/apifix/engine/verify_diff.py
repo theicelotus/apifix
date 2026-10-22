@@ -11,6 +11,7 @@ import re
 import subprocess
 import tempfile
 import time
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,6 +27,8 @@ from apifix.engine.verifier import (
     VerifierConfig,
     downloads_line,
     run_summary,
+    sandbox_requirements_lines,
+    sandbox_requirements_record,
     verify,
 )
 from apifix.engine.walk import copy_repo
@@ -151,6 +154,7 @@ def verify_diff(
             "diff": str(Path(diff_path).resolve()),
             "files_changed": [ch.path for ch in changes],
             "sandbox_env_placeholders": ci_env,
+            "sandbox_requirements": sandbox_requirements_record(sandbox),
             "started_at": started.isoformat(),
             "finished_at": datetime.now(UTC).isoformat(),
         },
@@ -165,7 +169,16 @@ def verify_diff(
         "duration_s": round(duration, 3),
     }
     report = _report(
-        v, mig, Path(diff_path), len(changes), reason, ci_env, duration, baseline_s, verify_s
+        v,
+        mig,
+        Path(diff_path),
+        len(changes),
+        reason,
+        ci_env,
+        duration,
+        baseline_s,
+        verify_s,
+        sandbox_requirements_lines(sandbox),
     )
     return VerifyResult(v.verdict, reason, applied, v, report, trajectory)
 
@@ -184,6 +197,7 @@ def _report(
     duration: float,
     baseline_s: float,
     verify_s: float,
+    dependency_lines: Sequence[str] = (),
 ) -> str:
     lines = [
         f"# apifix verify: {_TITLES[v.verdict]}",
@@ -200,6 +214,7 @@ def _report(
             f"- Sandbox env: `{name}` set to a placeholder in the test phase, because the repo's "
             f"CI sets it (`{workflow}`); the sandbox has no network"
         )
+    lines += dependency_lines
     retried = [
         label
         for label, run in (("baseline", v.baseline), ("fixed", v.fixed))

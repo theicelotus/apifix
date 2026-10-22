@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import shutil
 import tempfile
 import time
@@ -47,6 +48,8 @@ from apifix.engine.verifier import (
     downloads_line,
     feedback_lines,
     run_summary,
+    sandbox_requirements_lines,
+    sandbox_requirements_record,
     verify,
 )
 from apifix.engine.walk import copy_repo
@@ -81,11 +84,18 @@ ONE_CALL_NUDGE = "Send exactly one tool call per reply."
 NO_CALL_NUDGE = "You can't see files directly. Call a tool, for example read_file, to get them."
 _RANK = {"verified": 3, "verified_weak": 2, "unverified": 1, "rejected": 0}
 # A request refused by a per-minute token limit is sent once more with fewer reply tokens if
-# at least this many remain (whole-file mode: the file's estimated size instead), keeping this
-# many tokens below the limit (the server counts the prompt itself).
+# at least this many remain (whole-file mode: the file's estimated size instead), keeping
+# token_limit_margin(limit) tokens below the limit: the server counts the prompt itself, and
+# the hosted provider counted a resent prompt 79 tokens higher than its first refusal implied.
 AGENT_MIN_REPLY_TOKENS = 1_024
-TOKEN_LIMIT_SLACK = 64
+TOKEN_LIMIT_MIN_MARGIN = 256
+TOKEN_LIMIT_MARGIN_RATIO = 0.03
 LOWERED_NOTE = "sent again with fewer reply tokens"
+
+
+def token_limit_margin(limit: int) -> int:
+    """Tokens a request resent after a per-minute refusal stays below the limit."""
+    return max(TOKEN_LIMIT_MIN_MARGIN, math.ceil(TOKEN_LIMIT_MARGIN_RATIO * limit))
 
 
 @dataclass(frozen=True)
@@ -437,7 +447,7 @@ class _Job:
                 f"{max_tokens:,})"
             )
         prompt = exc.requested - max_tokens  # the server's count of the prompt itself
-        fit = exc.limit - prompt - TOKEN_LIMIT_SLACK
+        fit = exc.limit - prompt - token_limit_margin(exc.limit)
         if fit >= max_tokens:  # the server's figure does not include the reply allowance
             raise LLMError(str(exc))
         if fit < need:
@@ -824,7 +834,11 @@ class _Job:
     def _retryable(self, v: Verification) -> bool:
         """Rejections are retried. An unverified result is retried unless no edit can change
         it: the repo has no tests, the sandbox could not run at all, or tests fail on the fix
-        while the original code's run failed (no edit produces the missing baseline)."""
+        while the original code's run failed (no edit produces the missing baseline). Nothing
+        is retried when the sandbox's environment lacks modules the original code's tests
+        need: the next attempt could not be judged either."""
+        if any(r.code == "environment_incomplete" for r in v.reasons):
+            return False
         if v.verdict == "rejected":
             return True
         assert self.baseline is not None
@@ -854,6 +868,7 @@ class _Job:
                 "skipped_files": self.wf_skipped if self.whole_file else None,
                 "guide_sections": self.guide_sections,
                 "sandbox_env_placeholders": self.ci_env,
+                "sandbox_requirements": sandbox_requirements_record(self.sandbox),
                 "strict_tool_calls": getattr(self.llm, "strict_tool_calls", None),
                 "tool_call_example": self.tool_call_example,
                 "config": dataclasses.asdict(self.config),
@@ -886,7 +901,7 @@ def _dependency_problem(path: str, v: Verification) -> bool:
     install_failed = v.fixed.status in ("error", "timeout") and "install" in v.fixed.reason
     return (
         install_failed
-        or any(r.code == "smoke_check_failed" for r in v.reasons)
+        or any(r.code in ("smoke_check_failed", "library_removed") for r in v.reasons)
         or any(r.file == path for r in v.reasons)
         or any(f.file == path for f in v.remaining_findings)
     )
@@ -920,6 +935,10 @@ def time_line(job: _Job, total_s: float) -> str:
         f"response{'' if responses == 1 else 's'}); sandbox {_seconds(job.sandbox_seconds)} "
         f"({sandbox})"
     )
+
+
+def environment_incomplete(v: Verification) -> bool:
+    return any(r.code == "environment_incomplete" for r in v.reasons)
 
 
 def _one_line(text: str, limit: int = 300) -> str:
@@ -1000,6 +1019,7 @@ def report_markdown(
             f"- Sandbox env: `{name}` set to a placeholder in the test phase, because the repo's "
             f"CI sets it (`{workflow}`); the sandbox has no network"
         )
+    lines += sandbox_requirements_lines(job.sandbox)
     retried = _install_retries(job)
     if retried:
         lines.append(
@@ -1031,7 +1051,14 @@ def report_markdown(
                 )
                 lines.append(f"- Attempt {a.number} ({a.result}): {files}{kept}")
     lines += [f"- Note: {n}" for n in job.llm.notes]
-    if chosen and chosen.verification and not chosen.verification.delta.baseline_available:
+    if chosen and chosen.verification and environment_incomplete(chosen.verification):
+        lines.append(
+            "- The sandbox's environment lacks modules the original code's tests import, so "
+            "the fix could not be judged and was not retried. To check it again with packages "
+            f"you list: `apifix verify {job.repo} --migration {job.migration.name} --diff "
+            "fix.diff --sandbox-requirements FILE`"
+        )
+    elif chosen and chosen.verification and not chosen.verification.delta.baseline_available:
         lines.append(
             "- The original code's tests did not run, so this fix could not be compared with "
             "them. To check it again later without the LLM: `apifix verify "

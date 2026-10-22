@@ -34,14 +34,19 @@ src/apifix/
                       `--edit-mode agent|whole-file`, `--max-file-bytes`,
                       `--max-output-tokens`),
                       `apifix verify <path> --migration openai-v1 --diff FILE [--out]`,
-                      (`fix`/`verify`: `--no-pip-cache`),
+                      (`fix`/`verify`: `--no-pip-cache`, `--sandbox-requirements FILE`),
                       `apifix cleanup [--dry-run]`
   api/                FastAPI app (later)
   worker/             background jobs (later)
   engine/
     models.py         Finding / ScanResult dataclasses
-    walk.py           shared repo walker (skips venvs/tooling dirs, never follows symlinks)
-    dependencies.py   parses requirements/pyproject/setup.py/setup.cfg/Pipfile
+    walk.py           shared repo walker (skips venvs, conda/pixi envs, tooling dirs; never
+                      follows symlinks)
+    dependencies.py   parses requirements/pyproject (incl. pixi tables)/pixi.toml/setup.py/
+                      setup.cfg/Pipfile/conda environment.yml (YAML subset; its pip: list);
+                      strict checks of edited files; what to install per source and what is
+                      left out (conda-only, other platforms); --sandbox-requirements checks;
+                      import name -> distribution table
     scanner.py        finds affected call sites + dependency pins (ast, no LLM)
     migrations/       one package per migration; registry in __init__.py; guide.py splits
                       guides into `<!-- part: id -->` parts for per-job selection
@@ -50,8 +55,9 @@ src/apifix/
                       guide_parts.py (which parts / Resources rows a job's findings need)
     project.py        target repo facts: Python version, test files (`is_test_file`, the one
                       definition everything uses), test plan (pytest, explicit file list,
-                      import paths), install plan, lockfile pins, env vars the repo's GitHub
-                      Actions set
+                      import paths), install plan (where each dependency is declared, what
+                      is left out, --sandbox-requirements plans), lockfile pins, env vars the
+                      repo's GitHub Actions set
     sandbox.py        two-phase Docker run (install with network, test without); sessions
                       install once and run tests repeatedly; optional coverage; one retry of
                       an install that failed transiently; test-phase env placeholders; the
@@ -60,14 +66,16 @@ src/apifix/
     sandbox_driver.py runs INSIDE containers (Python 3.8+ compatible, stdlib only)
     docker.py         DockerClient protocol + `docker` CLI implementation (bounded output)
     cleanup.py        removes containers / temp workspaces left by crashed or killed runs
-    test_results.py   JUnit / unittest output -> counts + per-test outcomes
+    test_results.py   JUnit / unittest output -> counts + per-test outcomes (+ the module of
+                      a "No module named" error, read before messages are clipped)
     diffing.py        original vs fixed tree: changed files and changed lines
     tampering.py      AST comparison of test files: removed/weakened asserts, skips, ...
     scope.py          CI/tooling config changes (warned, not rejected)
     suspicious.py     added code unrelated to the migration (network/process calls, eval,
                       encoded literals, new imports/deps): prompt-injection warnings
     verifier.py       baseline vs fix: per-test deltas, flaky rerun, tampering, completeness,
-                      changed-line coverage -> verdict + reasons + PR report section
+                      changed-line coverage, environment (missing modules, library not
+                      declared) -> verdict + reasons + PR report section
     llm.py            provider-neutral LLM interface, model/price table (TOML-overridable)
     llm_anthropic.py  Claude via the official `anthropic` SDK (optional extra)
     llm_openai_compat.py  any OpenAI-compatible endpoint (Ollama, LM Studio, vLLM, hosted);
@@ -152,6 +160,10 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
 
 ## Known limitations (scanner)
 
+- Dependency pins: pip entries only (pixi `pypi-dependencies` of every table, all platforms;
+  an environment file's `pip:` list). Conda entries (pixi `dependencies`, an environment's conda
+  list) are not scanned. Environment files: `environment.yml` / `environment.yaml` only (not
+  `environment-dev.yml` or files passed to `conda env create -f` under other names).
 - No cross-function tracking of response objects: dict-style access is only flagged when the
   response is assigned and used in the same function/module scope.
 - No `getattr(openai, ...)` or other dynamic-attribute detection.
@@ -190,11 +202,39 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   problem (whole-file mode resends dependency files), with the installed version, the
   library's requirements as installed, and the repo's exact pins on any of them (pins that
   *can* hold it back; pip's actual resolution is not analysed). A smoke run that cannot start
-  is recorded, not a rejection.
+  is recorded, not a rejection. When the library is not installed at all: declared by neither
+  the original's nor the fix's install plan -> `library_not_declared` (unverified, names the
+  files read and any declaration left out; never sent to the model); declared by the
+  original's only -> `library_removed` (reject); declared for the fix but not installed
+  (markers, extras) -> the dependency message above.
 
 - Dependencies come from static parsing. Requirements computed dynamically in `setup.py`, `-r`
   includes outside the repo root / `requirements/`, and nested packages in monorepos are missed;
   a missing dependency shows up as an import error in the test phase.
+- pixi (`[tool.pixi]` in pyproject.toml, or pixi.toml at the root): `pypi-dependencies` of the
+  top level, every feature, and the targets `linux`, `unix` and `linux-<arch>` of the host
+  (`platform.machine()`: Docker is assumed to run the host's architecture) are installed. Other
+  targets and conda `dependencies` are listed as not installed (conda-only packages: not
+  supported yet, no pip guesses). pixi environments and `pixi.lock` are not read.
+- conda `environment.yml` / `.yaml` (repo root): read with a parser for the YAML subset conda
+  files use (top-level keys, block lists, plain/quoted scalars, comments, one `- pip:` list;
+  flow lists, anchors and multi-line scalars are a parse error, so the file is skipped with a
+  note). Its `pip:` list is installed unless the repo has a pixi manifest (pixi never reads the
+  file); names another source declares are dropped with a note. Its conda list is never
+  installed: "conda-only" when hand-written, "exported" when it has `prefix:` or build strings.
+- Packages known to install only on macOS or Windows (`pyobjc*`, `appnope`, `pywin32`,
+  `pypiwin32`, `pywinpty`, `windows-curses`) are left out when their line has no environment
+  marker. Other platform-specific packages fail the install (no best-effort install yet).
+- Everything left out is listed in the report ("Declared dependencies not installed") and in
+  the trajectory's run summaries (`not_installed`), unless the package is installed anyway
+  (from another source, or by apifix itself, e.g. pytest).
+- `--sandbox-requirements FILE` replaces detection (declared files, lockfile constraints) for
+  the original code and the fix; apifix still adds the build backend's requirements and
+  pytest. For the fix, each package whose detected requirements differ between the original and
+  the fixed tree takes the fix's lines (also a package the fix removed: dropped). Allowed lines:
+  requirements, `--index-url` / `--extra-index-url` / `-i` with an http(s) URL; no includes,
+  editables, local paths, continuation lines or URLs with credentials (the file goes to pip in
+  the networked install container). The trajectory keeps its path, sha256 and lines.
 - Local-path, editable and VCS dependencies (`-e .`, `./libs/x`, Poetry `path`/`git`) are not
   installed. The repo itself is installed offline in the test phase (`pip install --no-deps
   --no-build-isolation -e`), using the build backend from `[build-system] requires`; if that
@@ -265,6 +305,13 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   original file's content (an edit that removes a file's tests or its unittest import does not
   stop it counting as a test file).
 - Tests needing a network service or credentials are recognised by failure-message markers.
+- Missing modules: a failing/erroring baseline test whose full failure text has "No module
+  named 'x'" (the last one) for a module that is neither stdlib nor a repo module (any `.py`
+  stem or directory holding Python files). No passing baseline test plus at least one such
+  module -> `environment_incomplete` (unverified); with passing tests -> `missing_modules`
+  (info). Each module is matched to a declaration by its normalised name or a small import-name
+  table (`dotenv` -> `python-dotenv`, ...); other renamed distributions read as "not declared".
+  Environment reasons are never sent to the model.
 - Flakiness: newly failing tests are rerun once (whole test phase); a regression that fails
   intermittently can pass the rerun and be reported as flaky.
 - When the fixed code's tests never ran (install failed, test phase did not start), there is
@@ -297,13 +344,17 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   sandbox could not run at all, or tests fail while the original code's run failed
   (`unjudged_failures`); nothing the agent edits could change those. The report then suggests
   `apifix verify` on the diff for a later re-check (the baseline is not rerun in the job).
+  Nothing is retried, not even a rejection, when the verification has `environment_incomplete`;
+  the report suggests `apifix verify ... --sandbox-requirements FILE`.
 - Reply budget: `max_tokens` is `--max-output-tokens` in agent mode; in whole-file mode
   `min(--max-output-tokens, 2 * est + 2,048)`, `est` = chars / 3 of the longer of the original
   file and its working-copy version (`whole_file.reply_budget`). A reasoning model whose
   thinking exceeds the margin hits the limit and the file fails (truncated, not nudged).
 - Per-minute token limits (`RequestTooLarge`: a 413 or 429 message with "per minute"/TPM and
   "Limit N, [Used U, ]Requested M"; a 429 only when M > N, else it is waited out): the request
-  is sent once more with `max_tokens = N - (M - max_tokens) - 64` if that leaves at least `est`
+  is sent once more with `max_tokens = N - (M - max_tokens) - max(256, ceil(3% of N))` (the hosted provider
+  counted a resent prompt 79 tokens higher than its first refusal implied) if that leaves at
+  least `est`
   (agent mode: 1,024) and is lower; else, or if refused again, the job stops
   (`provider_error`). Not remembered: the next request starts from its own budget again.
 - `apifix verify`: needs the `git` binary; `git apply` with `GIT_CEILING_DIRECTORIES` and no

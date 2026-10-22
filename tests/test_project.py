@@ -8,12 +8,14 @@ import pytest
 
 from apifix.engine.project import (
     PYTEST_COMMAND,
+    SandboxRequirements,
     build_install_plan,
     ci_env_vars,
     defines_tests,
     detect_python_version,
     detect_tests,
     is_test_file,
+    load_sandbox_requirements,
     pytest_config,
 )
 
@@ -611,3 +613,236 @@ def test_ci_env_vars_without_workflows_or_names(tmp_path):
     assert ci_env_vars(tmp_path, ["OPENAI_API_KEY"]) == {
         "OPENAI_API_KEY": ".github/workflows/a.yml"
     }
+
+
+# --- declared dependencies and --sandbox-requirements ---------------------------------------
+
+
+def test_install_plan_records_where_each_dependency_is_declared(tmp_path):
+    write(
+        tmp_path,
+        {
+            "pyproject.toml": """
+            [project]
+            name = "app"
+            dependencies = ["openai==0.28.1", "Python_Dotenv>=1"]
+            """,
+            "requirements.txt": "openai==0.28.1\nrich\n",
+        },
+    )
+    plan = build_install_plan(tmp_path, "pytest")
+    assert plan.declared == {
+        "openai": ("pyproject.toml", "requirements.txt"),
+        "python-dotenv": ("pyproject.toml",),
+        "rich": ("requirements.txt",),
+    }
+    assert plan.override is None and plan.not_installed == ()
+
+
+def test_load_sandbox_requirements(tmp_path):
+    path = tmp_path / "sandbox-reqs.txt"
+    path.write_text("# mine\nopenai==0.28\n--extra-index-url https://example.invalid/simple\n")
+    req = load_sandbox_requirements(path)
+    assert req.lines == ("openai==0.28", "--extra-index-url https://example.invalid/simple")
+    assert req.count == 1 and len(req.sha256) == 64
+    assert req.label == "--sandbox-requirements sandbox-reqs.txt"
+    (tmp_path / "bad.txt").write_text("-r other.txt\n")
+    with pytest.raises(ValueError, match="bad.txt: line 1: option -r is not allowed"):
+        load_sandbox_requirements(tmp_path / "bad.txt")
+    with pytest.raises(ValueError, match="cannot read --sandbox-requirements"):
+        load_sandbox_requirements(tmp_path / "missing.txt")
+
+
+OVERRIDE = SandboxRequirements(
+    "/home/u/reqs.txt",
+    "0" * 64,
+    ("--extra-index-url https://example.invalid/simple", "openai==0.28", "typer", "demo"),
+)
+PIXI_LIKE = {
+    "pyproject.toml": """
+    [project]
+    name = "demo"
+    dependencies = []
+
+    [build-system]
+    requires = ["hatchling"]
+    build-backend = "hatchling.build"
+    """,
+}
+
+
+def test_override_replaces_detection(tmp_path):
+    repo = write(tmp_path / "repo", {**PIXI_LIKE, "requirements.txt": "flask==2.0\n"})
+    plan = build_install_plan(repo, "pytest", override=OVERRIDE)
+    assert plan.requirements == (
+        "--extra-index-url https://example.invalid/simple",
+        "openai==0.28",
+        "typer",
+        "hatchling",
+        "editables",
+        "pytest",
+    )
+    assert plan.constraints == () and plan.lockfile is None  # requirements.txt is fully pinned
+    assert plan.sources == ("--sandbox-requirements reqs.txt",)
+    assert plan.override == "--sandbox-requirements reqs.txt" and plan.replaced == ()
+    assert plan.declared == {
+        "openai": ("--sandbox-requirements reqs.txt",),
+        "typer": ("--sandbox-requirements reqs.txt",),
+        "demo": ("--sandbox-requirements reqs.txt",),
+    }
+    assert "dependencies from --sandbox-requirements reqs.txt (3 requirement(s))" in plan.notes[0]
+    assert any("self-references to demo dropped" in n for n in plan.notes)
+
+
+def test_override_takes_the_fixs_declaration_for_every_name_the_fix_changed(tmp_path):
+    files = {**PIXI_LIKE, "requirements.txt": "openai==0.28\ntyper\nhttpx==0.27.0\n"}
+    original = write(tmp_path / "original", files)
+    fixed = write(
+        tmp_path / "fixed",
+        {**files, "requirements.txt": "openai>=1.0\ntyper\nrequests>=2\n"},
+    )
+    plan = build_install_plan(fixed, "pytest", override=OVERRIDE, original=original)
+    assert plan.requirements[:4] == (
+        "--extra-index-url https://example.invalid/simple",
+        "typer",  # unchanged by the fix: the user's line stays
+        "openai>=1.0",
+        "requests>=2",
+    )
+    assert "httpx==0.27.0" not in plan.requirements  # removed by the fix, never in the file
+    assert plan.replaced == (
+        "httpx: not listed -> removed by the fix",
+        "openai: openai==0.28 -> openai>=1.0",
+        "requests: not listed -> requests>=2",
+    )
+    assert plan.declared["openai"] == ("requirements.txt",)
+    assert plan.declared["typer"] == ("--sandbox-requirements reqs.txt",)
+    # the original code gets the user's file unchanged
+    base = build_install_plan(original, "pytest", override=OVERRIDE)
+    assert "openai==0.28" in base.requirements and base.replaced == ()
+
+
+# --- pixi and conda environment files ---------------------------------------------------------
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+def test_install_plan_for_a_pixi_project(monkeypatch):
+    monkeypatch.setattr("platform.machine", lambda: "x86_64")
+    plan = build_install_plan(FIXTURES_DIR / "pixi_repo", "pytest")
+    assert plan.requirements == (
+        "openai==0.28",
+        "requests>=2.31",
+        "rich>=13",
+        "httpx<0.28",
+        "pytest>=7",
+        "hatchling",
+        "editables",
+    )
+    assert plan.sources == (
+        "pyproject.toml",
+        "pyproject.toml [tool.pixi.pypi-dependencies]",
+        "pyproject.toml [tool.pixi.target.linux.pypi-dependencies]",
+        "pyproject.toml [tool.pixi.feature.test.pypi-dependencies]",
+    )
+    assert plan.declared["openai"] == ("pyproject.toml [tool.pixi.pypi-dependencies]",)
+    assert plan.notes == (
+        "environment.yml: not installed (the repo has a pixi manifest, which does not read it)",
+    )
+    conda = "conda-only package; not supported yet"
+    assert [(n.name, n.source, n.why) for n in plan.not_installed] == [
+        ("pyobjc-framework-cocoa", "pyproject.toml [tool.pixi.pypi-dependencies]", "macOS only"),
+        ("typer", "pyproject.toml [tool.pixi.dependencies]", conda),
+        ("portaudio", "pyproject.toml [tool.pixi.dependencies]", conda),
+        (
+            "pyobjc-core",
+            "pyproject.toml [tool.pixi.target.osx-arm64.dependencies]",
+            "pixi target osx-arm64; the sandbox runs Linux",
+        ),
+        (
+            "typer",
+            "environment.yml (conda)",
+            "the pixi manifest takes precedence; pixi does not read this file",
+        ),
+    ]  # rich and openai are installed from the pixi pypi table, so they are not listed
+
+
+def test_install_plan_for_a_conda_environment():
+    plan = build_install_plan(FIXTURES_DIR / "conda_env_repo", "pytest")
+    assert plan.requirements == (
+        "openai==0.27.6",
+        "requests>=2.31",
+        'pywin32; sys_platform == "win32"',  # pip skips it by its marker
+        "pytest",
+    )
+    assert plan.sources == ("environment.yml", "environment.yml (pip)")
+    assert [(n.name, n.why) for n in plan.not_installed] == [
+        ("pyobjc-core", "macOS only"),
+        ("numpy", "conda-only package; not supported yet"),
+        ("pandas", "conda-only package; not supported yet"),
+    ]
+
+
+def test_environment_yml_yields_to_other_sources(tmp_path):
+    write(
+        tmp_path,
+        {
+            "requirements.txt": "openai>=1.0\n",
+            "environment.yml": """
+            name: x
+            dependencies:
+              - pip:
+                - openai==0.27.6
+                - rich
+            """,
+        },
+    )
+    plan = build_install_plan(tmp_path, None)
+    assert plan.requirements == ("openai>=1.0", "rich")
+    assert plan.notes == (
+        "environment.yml (pip): openai==0.27.6 not installed (requirements.txt declares openai)",
+    )
+
+
+def test_exported_conda_lists_are_not_installed_but_their_pip_list_is(tmp_path):
+    write(
+        tmp_path,
+        {
+            "environment.yml": """
+            name: x
+            dependencies:
+              - python=3.10.10=h3ba56d0_0_cpython
+              - spotipy=2.23.0=pyhd8ed1ab_0
+              - pip:
+                - openai==0.27.6
+            prefix: /Users/someone/miniforge3/envs/x
+            """,
+        },
+    )
+    plan = build_install_plan(tmp_path, None)
+    assert plan.requirements == ("openai==0.27.6",)
+    assert [(n.name, n.why) for n in plan.not_installed] == [
+        ("spotipy", "exported conda environment (build strings or prefix:); not installed")
+    ]
+
+
+def test_unreadable_environment_yml_is_skipped_with_a_note(tmp_path):
+    write(tmp_path, {"environment.yml": "dependencies: [openai]\n"})
+    plan = build_install_plan(tmp_path, None)
+    assert plan.requirements == () and plan.sources == ()
+    assert plan.notes == ("environment.yml: could not parse (ValueError); skipped",)
+
+
+def test_packages_apifix_installs_itself_are_not_listed_as_left_out(tmp_path):
+    write(
+        tmp_path,
+        {
+            "pyproject.toml": """
+            [tool.pixi.dependencies]
+            pytest = ">=7"
+            typer = "*"
+            """,
+        },
+    )
+    plan = build_install_plan(tmp_path, "pytest")
+    assert "pytest" in plan.requirements
+    assert [n.name for n in plan.not_installed] == ["typer"]

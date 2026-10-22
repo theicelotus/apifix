@@ -1,0 +1,38 @@
+[project]
+name = "voicebot"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64"]
+
+[tool.pixi.dependencies]
+python = ">=3.11,<3.13"
+typer = ">=0.9,<0.10"
+rich = ">=13"
+portaudio = "*"
+
+[tool.pixi.target.osx-arm64.dependencies]
+pyobjc-core = ">=10"
+
+[tool.pixi.pypi-dependencies]
+openai = "==0.28"
+requests = ">=2.31"
+rich = ">=13"
+pyobjc-framework-cocoa = "*"
+voicebot = { path = ".", editable = true }
+
+[tool.pixi.target.linux.pypi-dependencies]
+httpx = "<0.28"
+
+[tool.pixi.target.osx-arm64.pypi-dependencies]
+openai = { version = "==0.27.8" }
+
+[tool.pixi.feature.test.pypi-dependencies]
+pytest = ">=7"

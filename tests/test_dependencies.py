@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import textwrap
+from pathlib import Path
 
 import pytest
 
@@ -8,11 +9,18 @@ from apifix.engine.dependencies import (
     allows,
     build_system_requires,
     dependency_file_problem,
+    distribution_candidates,
     entirely_below,
+    install_requirements,
     is_dependency_file,
+    parse_conda_environment,
     parse_dependency_file,
     parse_version,
+    platform_only,
     requirements_from_file,
+    sandbox_pixi_targets,
+    sandbox_requirement_lines,
+    sandbox_requirements_problem,
 )
 from apifix.engine.scanner import scan
 
@@ -108,7 +116,7 @@ def test_pyproject_pep621_and_poetry():
         (3, True),
         (6, True),
         (10, True),
-        (10, True),  # same key name: located at its first occurrence
+        (13, True),  # same key name: located inside its own table
     ]
 
 
@@ -281,3 +289,315 @@ def test_structured_dependency_files_must_parse():
     assert dependency_file_problem("setup.py", "setup(\n").startswith("SyntaxError")
     problem = dependency_file_problem("setup.cfg", "install_requires = openai\n")
     assert problem.startswith("MissingSectionHeaderError")
+
+
+# --- --sandbox-requirements files -----------------------------------------------------------
+
+
+def test_sandbox_requirements_accept_requirements_and_index_options():
+    text = textwrap.dedent(
+        """\
+        # for djgpt
+        --extra-index-url https://download.pytorch.org/whl/cpu
+        --index-url=https://pypi.org/simple
+        -i https://pypi.org/simple
+        openai==0.28  # the old library
+        typer>=0.9,<0.10
+        rich; python_version >= "3.8"
+        torch @ https://example.invalid/torch-2.1.0-cp311-none-linux_x86_64.whl
+        """
+    )
+    assert sandbox_requirements_problem(text) is None
+    assert sandbox_requirement_lines(text) == [
+        "--extra-index-url https://download.pytorch.org/whl/cpu",
+        "--index-url=https://pypi.org/simple",
+        "-i https://pypi.org/simple",
+        "openai==0.28",
+        "typer>=0.9,<0.10",
+        'rich; python_version >= "3.8"',
+        "torch @ https://example.invalid/torch-2.1.0-cp311-none-linux_x86_64.whl",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("text", "problem"),
+    [
+        ("-r other.txt\n", "option -r is not allowed"),
+        ("-c constraints.txt\n", "option -c is not allowed"),
+        ("-e .\n", "option -e is not allowed"),
+        ("--find-links /wheels\n", "option --find-links is not allowed"),
+        ("--index-url /local/dir\n", "--index-url needs an http(s) URL"),
+        ("--index-url https://user:token@pypi.example/simple\n", "credentials"),
+        ("pkg @ https://token@example.invalid/pkg.whl\n", "credentials"),
+        ("./libs/local_pkg\n", "local paths"),
+        ("openai==0.28 \\\n", "continuation"),
+        ("openai=0.28\n", "line 1 is not a valid requirement"),
+        ("# nothing\n\n", "no requirements"),
+        ("--extra-index-url https://download.pytorch.org/whl/cpu\n", "no requirements"),
+    ],
+)
+def test_sandbox_requirements_problems(text, problem):
+    found = sandbox_requirements_problem(text)
+    assert found is not None and problem in found
+
+
+def test_distribution_candidates():
+    assert distribution_candidates("openai") == ("openai",)
+    assert distribution_candidates("dotenv.main") == ("dotenv", "python-dotenv")
+    assert distribution_candidates("PIL") == ("pil", "pillow")
+    assert distribution_candidates("speech_recognition") == (
+        "speech-recognition",
+        "speechrecognition",
+    )
+
+
+# --- pixi ---------------------------------------------------------------------------------------
+
+PIXI_FIXTURE = Path(__file__).parent / "fixtures" / "pixi_repo"
+CONDA_FIXTURE = Path(__file__).parent / "fixtures" / "conda_env_repo"
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("pixi.toml", True),
+        ("sub/pixi.toml", True),
+        ("environment.yml", True),
+        ("envs/environment.yaml", True),
+        ("Environment.YML", True),
+        ("environment-dev.yml", False),
+        (".pre-commit-config.yaml", False),
+    ],
+)
+def test_pixi_and_conda_files_are_dependency_files(path, expected):
+    assert is_dependency_file(path) is expected
+
+
+def test_pixi_pypi_dependencies_are_declared_in_every_table_at_their_own_lines():
+    text = (PIXI_FIXTURE / "pyproject.toml").read_text()
+    deps = parse_dependency_file("pyproject.toml", text)
+    lines = text.splitlines()
+    openai = [(d.line, d.clauses) for d in deps if d.name == "openai"]
+    assert openai == [(25, (("==", "0.28"),)), (35, (("==", "0.27.8"),))]
+    assert lines[24] == 'openai = "==0.28"'
+    assert lines[34] == 'openai = { version = "==0.27.8" }'
+    names = [d.name for d in deps]
+    # conda tables are not pip requirements; the local path entry has no version
+    assert "typer" not in names and "portaudio" not in names
+    assert {"requests", "httpx", "pytest", "pyobjc-framework-cocoa", "voicebot"} <= set(names)
+
+
+def test_standalone_pixi_toml():
+    text = textwrap.dedent(
+        """\
+        [workspace]
+        platforms = ["linux-64"]
+
+        [dependencies]
+        python = "3.11.*"
+        numpy = ">=1.26"
+
+        [pypi-dependencies]
+        openai = "~=0.28.0"
+
+        [target.linux-64.pypi-dependencies]
+        uvloop = "*"
+
+        [target.linux-aarch64.pypi-dependencies]
+        aarch-only = "*"
+
+        [feature.dev.target.unix.pypi-dependencies]
+        pytest = ">=7"
+        """
+    )
+    (dep,) = [d for d in parse_dependency_file("pixi.toml", text) if d.name == "openai"]
+    assert dep.line == 9 and entirely_below(dep.clauses, "1.0")
+    x86 = sandbox_pixi_targets("x86_64")
+    reqs, left_out = install_requirements("pixi.toml", text, x86)
+    assert reqs == [
+        ("openai~=0.28.0", "pixi.toml [pypi-dependencies]"),
+        ("uvloop", "pixi.toml [target.linux-64.pypi-dependencies]"),
+        ("pytest>=7", "pixi.toml [feature.dev.target.unix.pypi-dependencies]"),
+    ]
+    assert [(n.name, n.why) for n in left_out] == [
+        ("numpy", "conda-only package; not supported yet"),
+        ("aarch-only", "pixi target linux-aarch64; the sandbox runs Linux"),
+    ]
+    arm = install_requirements("pixi.toml", text, sandbox_pixi_targets("arm64"))[0]
+    assert ("aarch-only", "pixi.toml [target.linux-aarch64.pypi-dependencies]") in arm
+    assert requirements_from_file("pixi.toml", text)[0] == "openai~=0.28.0"
+
+
+def test_sandbox_pixi_targets():
+    assert sandbox_pixi_targets("x86_64") == {"linux", "unix", "linux-64"}
+    assert sandbox_pixi_targets("aarch64") == {"linux", "unix", "linux-aarch64"}
+    assert sandbox_pixi_targets("ppc64le") == {"linux", "unix", "linux-ppc64le"}
+
+
+def test_pixi_install_requirements_from_the_fixture():
+    text = (PIXI_FIXTURE / "pyproject.toml").read_text()
+    reqs, left_out = install_requirements("pyproject.toml", text, sandbox_pixi_targets("x86_64"))
+    assert [r for r, _ in reqs] == [
+        "openai==0.28",
+        "requests>=2.31",
+        "rich>=13",
+        "pyobjc-framework-cocoa",  # filtered later, by the install plan (macOS only)
+        "httpx<0.28",
+        "pytest>=7",
+    ]
+    assert {(n.name, n.source) for n in left_out} == {
+        ("typer", "pyproject.toml [tool.pixi.dependencies]"),
+        ("rich", "pyproject.toml [tool.pixi.dependencies]"),
+        ("portaudio", "pyproject.toml [tool.pixi.dependencies]"),
+        ("pyobjc-core", "pyproject.toml [tool.pixi.target.osx-arm64.dependencies]"),
+        ("openai", "pyproject.toml [tool.pixi.target.osx-arm64.pypi-dependencies]"),
+    }
+
+
+PIXI_EDIT = """\
+[project]
+name = "x"
+
+[tool.pixi.pypi-dependencies]
+{line}
+"""
+
+
+@pytest.mark.parametrize(
+    ("line", "problem"),
+    [
+        ('openai = ">=1.0,<2"', None),
+        ('openai = "*"', None),
+        ('openai = { version = ">=1.0", extras = ["datalib"] }', None),
+        ('app = { path = ".", editable = true }', None),
+        ('openai = ">=1.0,"', "invalid version '>=1.0,'"),
+        ('openai = "1.0"', "invalid version '1.0'"),
+        ("openai = 1", "invalid version 1"),
+        ('openai = { verison = ">=1" }', "unknown key(s) verison"),
+    ],
+)
+def test_strict_check_of_pixi_pypi_dependencies(line, problem):
+    found = dependency_file_problem("pyproject.toml", PIXI_EDIT.format(line=line))
+    if problem is None:
+        assert found is None
+    else:
+        assert found == (
+            f"pyproject.toml [tool.pixi.pypi-dependencies] {line.split()[0]}: {problem}"
+        )
+
+
+def test_strict_check_covers_pixi_features_and_targets():
+    text = '[feature.gpu.target.linux-64.pypi-dependencies]\nopenai = "=1.0"\n'
+    assert dependency_file_problem("pixi.toml", text) == (
+        "pixi.toml [feature.gpu.target.linux-64.pypi-dependencies] openai: invalid version '=1.0'"
+    )
+
+
+# --- conda environment files ----------------------------------------------------------------
+
+
+def test_conda_environment_pip_list_is_declared_with_lines():
+    text = (CONDA_FIXTURE / "environment.yml").read_text()
+    deps = parse_dependency_file("environment.yml", text)
+    assert [(d.name, d.line, d.col) for d in deps] == [
+        ("openai", 10, 9),
+        ("requests", 11, 9),
+        ("pyobjc-core", 12, 9),
+        ("pywin32", 13, 9),
+    ]
+    reqs, left_out = install_requirements("environment.yml", text)
+    assert [r for r, _ in reqs] == [
+        "openai==0.27.6",
+        "requests>=2.31",
+        "pyobjc-core==10.1",
+        'pywin32; sys_platform == "win32"',
+    ]
+    assert {source for _, source in reqs} == {"environment.yml (pip)"}
+    assert [(n.name, n.source, n.why) for n in left_out] == [
+        ("numpy", "environment.yml (conda)", "conda-only package; not supported yet"),
+        ("pandas", "environment.yml (conda)", "conda-only package; not supported yet"),
+    ]
+
+
+def test_conda_environment_yaml_subset():
+    text = textwrap.dedent(
+        """\
+        ---
+        # comment
+        name: "my env"  # trailing comment
+        channels: [conda-forge]
+        """
+    )
+    with pytest.raises(ValueError, match="unsupported YAML at line 4"):
+        parse_conda_environment(text)
+    env = parse_conda_environment(
+        textwrap.dedent(
+            """\
+            name: 'it''s'
+            variables:
+              OPENAI_LOG: debug
+            dependencies:
+            - python=3.11
+            - "numpy >=1.24"
+            - pip:
+              - openai==0.28  # not a comment#inside
+              - 'rich'
+            """
+        )
+    )
+    assert env.conda == (("python=3.11", 5, 3), ("numpy >=1.24", 6, 3))
+    assert env.pip == (("openai==0.28", 8, 5), ("rich", 9, 5))
+    assert not env.exported
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        ("dependencies: [a, b]\n", "dependencies must be a block list"),
+        ("dependencies:\n  - pip: [openai]\n", "unsupported mapping under dependencies"),
+        ("dependencies:\n  - a\n    - b\n", "inconsistent indentation under dependencies"),
+        ("dependencies:\n  - pip:\n    - a\n      - b\n", "inconsistent indentation in the pip"),
+        ("dependencies:\n\t- a\n", "tab indentation at line 2"),
+        ("  - a\n", "content before any key"),
+        ("dependencies:\n  - &anchor a\n", "unsupported YAML at line 2"),
+        ("dependencies:\n  - 'a\n", "unterminated quoted string at line 2"),
+        ("name\n", "expected a top-level key at line 1"),
+        ("dependencies:\n  plain: x\n", "expected a list item under dependencies"),
+    ],
+)
+def test_conda_environment_unsupported_input_raises_with_the_line(text, message):
+    with pytest.raises(ValueError, match=message):
+        parse_conda_environment(text)
+
+
+def test_exported_conda_environments_are_recognised():
+    exported = "name: x\ndependencies:\n  - zlib=1.2.13=h03a7124_4\n  - python=3.10.10\n"
+    assert parse_conda_environment(exported).exported
+    assert parse_conda_environment("name: x\nprefix: /opt/conda/envs/x\n").exported
+    _, left_out = install_requirements("environment.yml", exported)
+    assert [(n.name, n.why) for n in left_out] == [
+        ("zlib", "exported conda environment (build strings or prefix:); not installed")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("text", "problem"),
+    [
+        ("dependencies:\n  - numpy>=1.24\n  - pip:\n    - openai>=1.0,<2\n", None),
+        ("dependencies:\n  - pip:\n    - openai>=1.0,\n", "line 3 is not a valid pip requirement"),
+        ("dependencies:\n  - numpy;x\n", "line 2 is not a valid conda package spec"),
+        ("dependencies: [numpy]\n", "ValueError: dependencies must be a block list (line 1)"),
+    ],
+)
+def test_strict_check_of_conda_environments(text, problem):
+    found = dependency_file_problem("environment.yml", text)
+    assert found is None if problem is None else (found is not None and problem in found)
+
+
+def test_platform_only_packages():
+    assert platform_only("pyobjc") == "macOS only"
+    assert platform_only("PyObjC-Framework-Cocoa") == "macOS only"
+    assert platform_only("appnope") == "macOS only"
+    assert platform_only("pywin32") == "Windows only"
+    assert platform_only("pyobjc-ish") == "macOS only"  # the pyobjc-* family
+    assert platform_only("objc") is None and platform_only("requests") is None
