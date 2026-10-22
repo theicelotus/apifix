@@ -245,3 +245,59 @@ def test_coverage_flag_in_main(env, monkeypatch):
     )
     assert driver.main(["test", "--coverage", "--", "x"]) == 0
     assert seen == {"c": True}
+
+
+# --- install: download figures --------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("line", "key", "size"),
+    [
+        ("  Downloading lxml-4.9.2-cp311-cp311-manylinux.whl (7.2 MB)", "downloaded", 7_200_000),
+        ("  Using cached six-1.16.0-py2.py3-none-any.whl (11 kB)", "cached", 11_000),
+        ("Downloading https://files.example/x-1.0.tar.gz (1.5MB)", "downloaded", 1_500_000),
+        ("  Downloading tiny-1.0-py3-none-any.whl (912 bytes)", "downloaded", 912),
+        ("  Downloading python_dotenv-1.0.0-py3-none-any.whl.metadata (21 kB)", None, 0),
+        ("Collecting requests==2.28.2", None, 0),
+    ],
+)
+def test_count_file_line(line, key, size):
+    stats = {"downloaded": 0, "downloaded_bytes": 0, "cached": 0, "cached_bytes": 0}
+    driver.count_file_line(line, stats)
+    if key is None:
+        assert set(stats.values()) == {0}
+    else:
+        assert (stats[key], stats[key + "_bytes"]) == (1, size)
+
+
+def test_install_passes_pip_output_through_and_reports_figures(tmp_path, monkeypatch, capsys):
+    deps = tmp_path / "deps"
+    deps.mkdir()
+    monkeypatch.setattr(driver, "DEPS", str(deps))
+
+    def fake_venv(cmd, **kw):  # a "python" that prints what pip would and exits 3
+        bin_dir = Path(cmd[-1]) / "bin"
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "python").write_text(
+            "#!/bin/sh\n"
+            "echo 'Collecting six'\n"
+            "echo '  Downloading six-1.16.0-py2.py3-none-any.whl.metadata (1.8 kB)'\n"
+            "echo '  Downloading six-1.16.0-py2.py3-none-any.whl (11 kB)'\n"
+            "echo '  Using cached lxml-4.9.2-cp311-manylinux.whl (7.2 MB)'\n"
+            "exit 3\n"
+        )
+        (bin_dir / "python").chmod(0o755)
+
+    monkeypatch.setattr(driver.subprocess, "check_call", fake_venv)
+    assert driver.install(False) == 3
+    out = capsys.readouterr().out
+    assert "  Downloading six-1.16.0-py2.py3-none-any.whl (11 kB)\n" in out  # unchanged
+    marker = out.strip().splitlines()[-1]
+    assert marker.startswith(driver.INSTALL_STATS_MARKER)
+    stats = json.loads(marker[len(driver.INSTALL_STATS_MARKER) :])
+    assert stats == {
+        "downloaded": 1,
+        "downloaded_bytes": 11_000,
+        "cached": 1,
+        "cached_bytes": 7_200_000,
+    }

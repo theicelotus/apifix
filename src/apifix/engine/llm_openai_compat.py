@@ -42,6 +42,7 @@ from apifix.engine.llm import (
     LLMResponse,
     Message,
     ModelInfo,
+    RequestTooLarge,
     StopReason,
     ToolCall,
     ToolSpec,
@@ -66,6 +67,10 @@ RATE_LIMIT_NOTE = "rate limited by the server"
 _DAILY_LIMIT = re.compile(
     r"per day|\b(?:RPD|TPD)\b|daily|insufficient_quota|exceeded your current quota", re.I
 )
+# A per-minute token limit that one request exceeds on its own, e.g. the hosted provider's "tokens per minute
+# (TPM): Limit 8000, Requested 9265" (429s may also say "Used 5000, ").
+_PER_MINUTE = re.compile(r"per minute|\bTPM\b", re.I)
+_LIMIT_REQUESTED = re.compile(r"Limit:? (\d+),\s*(?:Used:? \d+,\s*)?Requested:? (\d+)", re.I)
 _TRY_AGAIN = re.compile(r"try again in ((?:\d+(?:\.\d+)?(?:ms|h|m|s))+)", re.I)
 _DURATION_PART = re.compile(r"(\d+(?:\.\d+)?)(ms|h|m|s)")
 _DURATION_UNIT_S = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
@@ -273,7 +278,15 @@ class OpenAICompatLLM:
         except LLMError:
             available = []
         listed = f" Models on {self.endpoint}: {', '.join(available)}." if available else ""
+        if not self.local:  # hardware is irrelevant for a hosted model
+            return f"{problem}.{listed or ' Check the model id against the provider list.'}"
         return f"{problem}.{listed} Starting points by hardware: {MODEL_SUGGESTIONS}."
+
+    def _suggestions(self) -> str:
+        """What to try instead of a model that cannot make tool calls."""
+        if not self.local:
+            return "Use a tool-capable model, or --edit-mode whole-file (no tools)."
+        return f"Use a tool-capable model. {MODEL_SUGGESTIONS}"
 
     # --- HTTP -------------------------------------------------------------------------------
 
@@ -336,6 +349,10 @@ class OpenAICompatLLM:
         cannot help: a daily / quota limit, a wait over RATE_LIMIT_MAX_WAIT_S, or no retries
         left. Waits are not failures: the agent only sees the eventual reply."""
         message = self._server_message(data)
+        too_large = per_minute_overflow(message)
+        if too_large is not None and too_large[1] > too_large[0]:
+            # This request alone exceeds the per-minute limit: no wait would let it through.
+            raise self._too_large(429, message, *too_large)
         asked = server_wait_s(resp.headers, message)
         shown = f" ({message})" if message else ""
         after = f"; the server says to try again in {_format_wait(asked)}" if asked else ""
@@ -382,6 +399,9 @@ class OpenAICompatLLM:
     def _error(self, status: int, data: Any, *, max_tokens: int | None = None) -> LLMError:
         message = self._server_message(data) or "(no error message)"
         low = message.lower()
+        overflow = per_minute_overflow(message)
+        if status in (413, 429) and overflow is not None:
+            return self._too_large(status, message, *overflow, max_tokens=max_tokens)
         if status == 413 or "request too large" in low:
             reserved = (
                 f" This request allows for up to {max_tokens:,} reply tokens, which some "
@@ -397,8 +417,8 @@ class OpenAICompatLLM:
             )
         if "does not support tools" in low or ("tool" in low and "not support" in low):
             return LLMError(
-                f"model {self.model} does not support tool calls ({message}). Use a "
-                f"tool-capable model. {MODEL_SUGGESTIONS}"
+                f"model {self.model} does not support tool calls ({message}). "
+                + self._suggestions()
             )
         if "context length" in low or "context window" in low or "too many tokens" in low:
             return LLMError(f"the prompt exceeds the server's context window: {message}")
@@ -414,6 +434,23 @@ class OpenAICompatLLM:
         if status in (401, 403):
             return LLMError(f"HTTP {status} from {self.endpoint}: {message} (check the API key)")
         return LLMError(f"HTTP {status} from {self.endpoint}: {message}")
+
+    def _too_large(
+        self, status: int, message: str, limit: int, requested: int, max_tokens: int | None = None
+    ) -> RequestTooLarge:
+        reserved = (
+            f" ({max_tokens:,} of them the reply tokens this request allows for)"
+            if max_tokens
+            else ""
+        )
+        return RequestTooLarge(
+            f"HTTP {status} from {self.endpoint}: {message}. The request needs "
+            f"{requested:,} tokens{reserved}, more than the server's per-minute limit of "
+            f"{limit:,}. Lower --max-output-tokens or --max-file-bytes, or use a model with a "
+            "higher limit",
+            limit=limit,
+            requested=requested,
+        )
 
     # --- requests ---------------------------------------------------------------------------
 
@@ -593,8 +630,8 @@ class OpenAICompatLLM:
             if looks_like_json and self.strict_tool_calls:
                 detail += " Text-format tool calls are disabled by --strict-tool-calls."
             raise LLMError(
-                f"model {self.model} did not make a tool call when asked to.{detail} Use a "
-                f"tool-capable model. {MODEL_SUGGESTIONS}"
+                f"model {self.model} did not make a tool call when asked to.{detail} "
+                + self._suggestions()
             )
         self._read_context_window()
 
@@ -761,6 +798,15 @@ def count_text_tool_calls(text: str, tools: Sequence[ToolSpec]) -> int:
 
 
 # --- rate limits ------------------------------------------------------------------------------
+
+
+def per_minute_overflow(message: str) -> tuple[int, int] | None:
+    """(limit, requested) when a server message states a per-minute token limit with the
+    request's size ("tokens per minute (TPM): Limit 8000, Requested 9265"), else None."""
+    match = _LIMIT_REQUESTED.search(message)
+    if match is None or not _PER_MINUTE.search(message):
+        return None
+    return int(match.group(1)), int(match.group(2))
 
 
 def parse_duration(text: str) -> float | None:

@@ -25,10 +25,18 @@ from apifix.engine.agent import (
     system_prompt,
     tool_call_example,
 )
-from apifix.engine.llm import LLMError, LLMResponse, Message, ModelInfo, ToolCall, Usage
+from apifix.engine.llm import (
+    LLMError,
+    LLMResponse,
+    Message,
+    ModelInfo,
+    RequestTooLarge,
+    ToolCall,
+    Usage,
+)
 from apifix.engine.llm_openai_compat import TEXT_CALLS_NOTE
 from apifix.engine.migrations import get_migration
-from apifix.engine.sandbox import PhaseResult, SandboxResult
+from apifix.engine.sandbox import DownloadStats, PhaseResult, SandboxResult
 from apifix.engine.scanner import scan
 from apifix.engine.test_results import FileCoverage
 from tests.integration.tiny_repo import ORIGINAL as TINY
@@ -130,8 +138,10 @@ class FakeLLM:
     requests: list[list[Message]] = field(default_factory=list)
     systems: list[str] = field(default_factory=list)
     tools_seen: list[list[str]] = field(default_factory=list)
+    max_tokens_seen: list[int] = field(default_factory=list)
 
     def complete(self, *, system, messages, tools, max_tokens, temperature):
+        self.max_tokens_seen.append(max_tokens)
         self.requests.append(list(messages))
         self.systems.append(system)
         self.tools_seen.append([t.name for t in tools])
@@ -1767,3 +1777,177 @@ def test_failed_smoke_check_implicates_dependency_files():
     assert _dependency_problem("requirements.txt", verification(smoke))
     other = Reason("newly_failing", "reject", "1 test fails now")
     assert not _dependency_problem("requirements.txt", verification(other))
+
+
+# --- reply budget and per-minute token limits -------------------------------------------------
+
+
+def budget(text: str, cap: int = 16_000) -> int:
+    return min(cap, 2 * -(-len(text) // 3) + 2048)
+
+
+def too_large(limit: int, requested: int) -> RequestTooLarge:
+    message = f"HTTP 413 from x: tokens per minute (TPM): Limit {limit}, Requested {requested}"
+    return RequestTooLarge(message, limit=limit, requested=requested)
+
+
+REQS_OLD = ORIGINAL["requirements.txt"]
+
+
+def test_whole_file_reply_budget_follows_the_file(repo):
+    llm = FakeLLM(list(GOOD))
+    result = wf(repo, llm)
+    expected = [budget(REQS_OLD), budget(APP_OLD), budget(TESTS_OLD)]
+    assert llm.max_tokens_seen == expected
+    (attempt,) = result.trajectory["attempts"]
+    assert [f["max_tokens"] for f in attempt["files"]] == expected
+    assert [r["max_tokens"] for r in attempt["responses"]] == expected
+    # capped by --max-output-tokens
+    llm = FakeLLM(list(GOOD))
+    wf(repo, llm, max_output_tokens=2100)
+    assert llm.max_tokens_seen == [budget(REQS_OLD), 2100, 2100]
+
+
+def test_whole_file_reply_budget_counts_the_previous_version(repo):
+    grown = APP_NEW + "\n".join(f"# note {i}" for i in range(400)) + "\n"
+    llm = FakeLLM(
+        [GOOD[0], block(grown), GOOD[2], block(APP_NEW), GOOD[2]],
+    )
+    sandbox = JudgingSandbox()
+    verdicts = iter(["broken", "broken"])  # attempt 1 and its flaky rerun
+
+    def judge_twice(tree):
+        if tree != repo and next(verdicts, "fine") == "broken":
+            return run((T_ASK, "passed"), (T_STRIP, "failed", "boom"))
+        return judge(tree)
+
+    sandbox.judge = judge_twice
+    wf(repo, llm, sandbox)
+    # attempt 2 resends app.py: its budget comes from the longer, previous version
+    assert llm.max_tokens_seen[3] == budget(grown)
+
+
+def test_request_over_the_per_minute_limit_is_sent_again_with_fewer_reply_tokens(repo):
+    first = budget(REQS_OLD)
+    llm = FakeLLM([too_large(3000, 2000 + first), *GOOD])
+    result = wf(repo, llm)
+    assert result.outcome == "verified"
+    lowered = 3000 - 2000 - 64
+    assert llm.max_tokens_seen[:3] == [first, lowered, budget(APP_OLD)]  # per request
+    response = result.trajectory["attempts"][0]["responses"][0]
+    assert (response["max_tokens"], response["max_tokens_lowered_from"]) == (lowered, first)
+    note = (
+        "1 request(s) refused by the server's per-minute token limit (3,000) were sent again "
+        "with fewer reply tokens (max_tokens lowered to fit)"
+    )
+    assert note in result.trajectory["job"]["notes"]
+    assert f"- Note: {note}" in result.report_markdown
+
+
+def test_hosted_run_numbers_fit_after_one_retry(tmp_path):
+    # backend/testapp.py of the run was 5,529 bytes; its prompt counted 3,265 tokens
+    padding = "\n" + "# padding\n" * ((5529 - len(TESTS_OLD)) // 10)
+    tests = TESTS_OLD + padding
+    repo = write_tree(tmp_path / "repo", {**ORIGINAL, "tests/test_app.py": tests})
+    first = budget(tests, 6000)
+    assert first == 5734  # 3,265 + 5,734 > 8,000: refused
+    llm = FakeLLM([GOOD[0], GOOD[1], too_large(8000, 3265 + first), block(TESTS_NEW + padding)])
+    wf(repo, llm, max_output_tokens=6000)
+    assert llm.max_tokens_seen[2:] == [first, 8000 - 3265 - 64]
+
+
+def test_request_that_cannot_fit_stops_the_job(repo):
+    need = -(-len(APP_OLD) // 3)
+    llm = FakeLLM([GOOD[0], too_large(1000, 990 + budget(APP_OLD))])
+    result = wf(repo, llm)
+    assert result.outcome == "aborted"
+    assert result.reason.startswith("provider_error: HTTP 413 from x")
+    assert "The prompt alone is ~990 tokens; lowering max_tokens to fit would leave no reply" in (
+        result.reason
+    )
+    assert f"less than the reply needs (~{need:,})" in result.reason
+    assert len(llm.max_tokens_seen) == 2
+
+
+def test_a_second_refusal_stops_the_job(repo):
+    first = budget(REQS_OLD)
+    llm = FakeLLM([too_large(3000, 2000 + first), too_large(3000, 3100)])
+    result = wf(repo, llm)
+    assert result.outcome == "aborted"
+    assert f"(already sent again with max_tokens lowered from {first:,} to 936)" in result.reason
+
+
+def test_agent_mode_request_is_lowered_once_and_later_requests_use_the_maximum(repo):
+    llm = FakeLLM([too_large(10_000, 4000 + 16_000), tools(FIX_APP, FIX_REQS, FIX_TESTS), done()])
+    result = go(repo, llm)
+    assert result.outcome == "verified"
+    assert llm.max_tokens_seen == [16_000, 10_000 - 4000 - 64, 16_000]
+
+
+def test_agent_mode_needs_room_for_a_reply(repo):
+    llm = FakeLLM([too_large(5000, 4500 + 16_000)])  # 436 tokens would be left
+    result = go(repo, llm)
+    assert result.outcome == "aborted" and "less than the reply needs (~1,024)" in result.reason
+
+
+# --- no baseline ------------------------------------------------------------------------------
+
+
+def test_failures_without_a_baseline_are_unverified_and_not_retried(repo):
+    down = run(status="timeout", reason="dependency install exceeded 900s")
+    broken_app = edit("app.py", APP_OLD, APP_NEW + "# BREAK\n")
+    llm = FakeLLM([tools(broken_app, FIX_REQS, FIX_TESTS), done()])  # one attempt only
+    result = go(repo, llm, JudgingSandbox(baseline=down))
+    assert result.outcome == "unverified" and result.attempts == 1
+    v = result.verification
+    assert {r.code for r in v.reasons} >= {"no_baseline", "unjudged_failures"}
+    assert "regression" not in {r.code for r in v.reasons}
+    report = result.report_markdown
+    assert report.startswith("# apifix fix: Not verified (not enough evidence)\n")
+    assert "To check it again later without the LLM: `apifix verify " in report
+    assert "--migration openai-v1 --diff fix.diff`" in report
+
+
+def test_download_figures_reach_the_report_and_trajectory(repo):
+    stats = iter([DownloadStats(3, 3_000_000, 0, 0), DownloadStats(1, 500_000, 2, 2_500_000)])
+
+    def with_downloads(tree):
+        result = judge(tree)
+        install = PhaseResult("install", "ok", "python:3.11-slim", "bridge", [])
+        install.downloads = next(stats)
+        result.install_attempts, result.pip_cache = [install], True
+        return result
+
+    llm = FakeLLM([tools(FIX_APP, FIX_REQS, FIX_TESTS), done()])
+    result = go(repo, llm, JudgingSandbox(judge=with_downloads))
+    assert (
+        "- Dependency downloads (pip cache on): baseline: 3 files downloaded (3.0 MB), 0 from "
+        "the pip cache (0.0 MB); attempt 1: 1 file downloaded (0.5 MB), 2 from the pip cache "
+        "(2.5 MB)"
+    ) in result.report_markdown
+    baseline = result.trajectory["baseline"]
+    assert baseline["pip_cache"] is True
+    assert baseline["install_attempts"][0]["downloads"] == {
+        "downloaded": 3,
+        "downloaded_bytes": 3_000_000,
+        "cached": 0,
+        "cached_bytes": 0,
+    }
+
+
+def test_restoring_the_best_attempt_keeps_crlf_line_endings(tmp_path):
+    files = {**ORIGINAL, "app.py": APP_OLD.replace("\n", "\r\n")}
+    repo = tmp_path / "repo"
+    for rel, text in files.items():
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_bytes(text.encode())
+
+    def regressing(tree):
+        if tree == repo.resolve():
+            return judge(tree)
+        return run((T_ASK, "passed"), (T_STRIP, "failed", "boom"))
+
+    result = wf(repo, FakeLLM(list(GOOD)), JudgingSandbox(judge=regressing), max_retries=0)
+    assert result.outcome == "rejected"  # the best attempt is restored before the diff
+    assert result.diff == result.trajectory["attempts"][0]["diff"]
+    assert '+client = openai.OpenAI(api_key="test")\r\n' in result.diff

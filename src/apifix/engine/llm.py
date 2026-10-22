@@ -27,6 +27,17 @@ class LLMError(RuntimeError):
     """The provider failed (network, auth, rate limit after retries, bad request, ...)."""
 
 
+class RequestTooLarge(LLMError):
+    """The server refused one request as larger than its per-minute token limit, which it
+    counts as prompt plus the reply tokens the request allows for (`max_tokens`). `limit` and
+    `requested` are the server's figures; a request with fewer reply tokens may fit."""
+
+    def __init__(self, message: str, *, limit: int, requested: int) -> None:
+        super().__init__(message)
+        self.limit = limit
+        self.requested = requested
+
+
 @dataclass(frozen=True)
 class ToolSpec:
     name: str

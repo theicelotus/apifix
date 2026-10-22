@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from apifix.engine.diffing import FileChange, changed_lines, diff_trees
+import subprocess
+
+from apifix.engine.diffing import FileChange, changed_lines, diff_trees, unified_diff
 
 
 def test_changed_lines():
@@ -58,3 +60,16 @@ def test_unified_diff_applies_with_git(tmp_path):
     assert {p.name: p.read_text() for p in work.iterdir()} == {
         p.name: p.read_text() for p in fixed.iterdir()
     }
+
+
+def test_crlf_files_keep_their_line_endings_and_the_diff_applies(tmp_path):
+    original, fixed = tmp_path / "a", tmp_path / "b"
+    for root, body in ((original, "x = 1\r\ny = 2\r\n"), (fixed, "x = 1\r\ny = 3\r\n")):
+        root.mkdir()
+        (root / "app.py").write_bytes(body.encode())
+    (change,) = diff_trees(original, fixed)
+    assert change.changed_lines == (2,)
+    diff = unified_diff(original, fixed)
+    assert "-y = 2\r\n+y = 3\r\n" in diff
+    subprocess.run(["git", "apply", "-"], input=diff.encode(), cwd=original, check=True)
+    assert (original / "app.py").read_bytes() == (fixed / "app.py").read_bytes()

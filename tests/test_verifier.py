@@ -586,6 +586,76 @@ def test_missing_baseline_is_weak(trees):
     assert v.verdict == "verified_weak"
 
 
+# The resume-analyzer run: the baseline's install timed out, and four tests that need files the
+# repo does not ship fail on every version.
+INSTALL_TIMEOUT = run(status="timeout", reason="dependency install exceeded 900s")
+NEEDS_FILES = run(
+    (T_ASK, "passed"),
+    (T_STRIP, "failed", "FileNotFoundError: [Errno 2] No such file: 'resumes/resume.pdf'"),
+    ("tests.test_app::test_upload", "failed", "FileNotFoundError: 'resumes/x.pdf'"),
+    coverage=FULL_COVERAGE,
+)
+
+
+def test_without_a_baseline_failing_tests_are_not_regressions(trees):
+    original, fixed = trees({})
+    sandbox = FakeSandbox(INSTALL_TIMEOUT, [NEEDS_FILES])
+    v = verify(original, fixed, "openai-v1", sandbox=sandbox)
+    assert v.verdict == "unverified", v.reasons
+    assert not codes(v) & {"regression", "regression_error", "collection_error", "deleted_test"}
+    assert v.delta.newly_failing == [] and v.delta.new_tests == []
+    failing = ["tests.test_app::test_strips", "tests.test_app::test_upload"]
+    assert v.delta.failing_without_baseline == failing
+    r = reason(v, "unjudged_failures")
+    assert r.severity == "unverified" and list(r.tests) == failing
+    assert r.message.startswith("2 test(s) fail on the fixed code, but the original code's tests")
+    assert "(dependency install exceeded 900s)" in r.message
+    assert "not counted as regressions" in r.message
+    assert "no_baseline" in codes(v)
+    assert v.rerun is None and sandbox.last_session.results == []  # no flaky rerun either
+    assert v.to_dict()["tests"]["failing_without_baseline"] == failing
+    md = v.report_markdown()
+    assert md.startswith("## Verification: Unverified (not enough evidence)\n")
+    assert "### Failing tests (no baseline to compare with)" in md
+    assert "- `tests.test_app::test_upload`" in md
+    # the model is not shown these as regressions to fix
+    assert "Failure output" not in "\n".join(feedback_lines(v))
+
+
+def test_a_baseline_whose_test_phase_crashed_is_not_compared_either(trees):
+    original, fixed = trees({})
+    crashed = run(status="error", reason="pytest exited 2 without a report")
+    crashed.test = PhaseResult("test", "failed", "python:3.11-slim", "none", [], exit_code=2)
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(crashed, [NEEDS_FILES]))
+    assert v.verdict == "unverified"
+    assert "regression" not in codes(v) and "unjudged_failures" in codes(v)
+    assert v.delta.baseline_available is False
+
+
+def test_without_a_baseline_a_collection_error_is_not_a_rejection(trees):
+    original, fixed = trees({})
+    broken = run(("tests.test_app", "error", "ImportError: no module named x"), (T_ASK, "passed"))
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(INSTALL_TIMEOUT, [broken]))
+    assert v.verdict == "unverified"
+    assert v.delta.failing_without_baseline == ["tests.test_app"]
+    assert v.delta.broken_modules == []
+
+
+def test_without_a_baseline_other_problems_still_reject(trees):
+    original, fixed = trees({"app.py": APP_OLD})  # call sites left unmigrated
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(INSTALL_TIMEOUT, [NEEDS_FILES]))
+    assert v.verdict == "rejected"
+    assert "incomplete_migration" in codes(v) and "regression" not in codes(v)
+
+
+def test_no_test_files_in_the_original_is_a_usable_baseline():
+    none = run(status="unverified", reason="no test files found")
+    none.test = None
+    d = compare_runs(none, run(("m::new", "failed")))
+    assert d.baseline_available is True
+    assert d.newly_failing == ["m::new"] and d.failing_without_baseline == []
+
+
 def test_fixed_timeout_is_rejected(trees):
     original, fixed = trees({})
     slow = run(status="timeout", reason="tests exceeded 600s")

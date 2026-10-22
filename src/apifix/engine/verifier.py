@@ -91,6 +91,9 @@ class TestDelta:
     new_tests: list[str] = field(default_factory=list)
     no_signal_external: list[str] = field(default_factory=list)
     no_signal_preexisting: list[str] = field(default_factory=list)
+    # No usable baseline: tests that fail or error on the fixed code (collection errors as their
+    # module), which cannot be compared with anything and so are never regressions.
+    failing_without_baseline: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -249,15 +252,45 @@ def run_summary(run: SandboxResult) -> dict:
                 "image": p.image,
                 "duration_s": round(p.duration_s, 3),
             }
+            | ({"downloads": asdict(p.downloads)} if p.downloads else {})
             | ({"output": install_output(p)} if p.status != "ok" else {})
             for p in run.install_attempts
         ],
+        "pip_cache": run.pip_cache,
         "env_placeholders": list(run.env_placeholders),
         "notes": list(run.notes),
         "import_paths": list(run.import_paths),
         **({"smoke": asdict(run.smoke)} if run.smoke else {}),
         "duration_s": round(run.duration_s, 3),
     }
+
+
+def _megabytes(n: int) -> str:
+    return f"{n / 1_000_000:,.1f} MB"
+
+
+def download_summary(run: SandboxResult) -> str | None:
+    """What a run's dependency installs fetched (all attempts), e.g. "31 files downloaded
+    (24.1 MB), 2 from the pip cache (1.2 MB)"; None when the driver reported nothing."""
+    stats = [p.downloads for p in run.install_attempts if p.downloads is not None]
+    if not stats:
+        return None
+    down, down_b = sum(s.downloaded for s in stats), sum(s.downloaded_bytes for s in stats)
+    hit, hit_b = sum(s.cached for s in stats), sum(s.cached_bytes for s in stats)
+    text = f"{down} file{'' if down == 1 else 's'} downloaded ({_megabytes(down_b)})"
+    if run.pip_cache:
+        text += f", {hit} from the pip cache ({_megabytes(hit_b)})"
+    return text
+
+
+def downloads_line(runs: Sequence[tuple[str, SandboxResult]]) -> str | None:
+    """One report line for labelled runs ("baseline", "attempt 1", ...); None if no run has
+    download figures."""
+    parts = [f"{label}: {text}" for label, run in runs if (text := download_summary(run))]
+    if not parts:
+        return None
+    cached = any(run.pip_cache for _, run in runs)
+    return f"- Dependency downloads (pip cache {'on' if cached else 'off'}): {'; '.join(parts)}"
 
 
 # --- per-test comparison --------------------------------------------------------------------
@@ -283,11 +316,26 @@ def is_external_failure(message: str) -> bool:
     return any(marker in message for marker in EXTERNAL_MARKERS)
 
 
+def baseline_usable(baseline: SandboxResult) -> bool:
+    """Is the original code's run something to compare with? Not after an `error` or `timeout`:
+    an install failure never starts the tests, and a crash, OOM kill or unreadable report
+    leaves no per-test results. ("No test files" is a usable baseline: zero tests.)"""
+    return baseline.status not in ("error", "timeout")
+
+
 def compare_runs(
     baseline: SandboxResult, fixed: SandboxResult, rerun: SandboxResult | None = None
 ) -> TestDelta:
-    delta = TestDelta(baseline_available=baseline.test is not None)
+    delta = TestDelta(baseline_available=baseline_usable(baseline))
     if fixed.test is None:  # the fixed code's tests never ran (install failed, ...): no signal
+        return delta
+    if not delta.baseline_available:
+        # Nothing to compare with: a failure may be the fix's or may have been there before.
+        delta.failing_without_baseline = sorted(
+            _collection_module(t) if _is_collection_error(t, fixed.runner) else t.id
+            for t in fixed.tests
+            if t.outcome in ("failed", "error")
+        )
         return delta
     before = {t.id: t for t in baseline.tests}
     after = {t.id: t for t in fixed.tests}
@@ -431,18 +479,32 @@ def _ids(ids: list[str]) -> tuple[str, ...]:
     return tuple(sorted(ids))
 
 
-def _run_reasons(baseline: SandboxResult, fixed: SandboxResult) -> list[Reason]:
+def _run_reasons(baseline: SandboxResult, fixed: SandboxResult, delta: TestDelta) -> list[Reason]:
     if fixed.status not in ("error", "timeout"):
-        if baseline.status in ("error", "timeout"):
-            return [
+        if baseline_usable(baseline):
+            return []
+        reasons = [
+            Reason(
+                "no_baseline",
+                "weak",
+                f"the original code's test run failed ({baseline.reason}), so regressions "
+                "and deleted tests could not be checked",
+            )
+        ]
+        failing = delta.failing_without_baseline
+        if failing:
+            reasons.append(
                 Reason(
-                    "no_baseline",
-                    "weak",
-                    f"the original code's test run failed ({baseline.reason}), so regressions "
-                    "and deleted tests could not be checked",
+                    "unjudged_failures",
+                    "unverified",
+                    f"{len(failing)} test(s) fail on the fixed code, but the original code's "
+                    f"tests did not run ({baseline.reason}), so apifix cannot tell whether "
+                    "the fix broke them or they failed before; they are not counted as "
+                    "regressions",
+                    _ids(failing),
                 )
-            ]
-        return []
+            )
+        return reasons
     if baseline.status in ("error", "timeout"):
         return [
             Reason(
@@ -817,7 +879,7 @@ def verify(
     old_errors = {e.file for e in before_scan.parse_errors}
     new_errors = sorted(e.file for e in after_scan.parse_errors if e.file not in old_errors)
     reasons = (
-        _run_reasons(baseline, fixed_run)
+        _run_reasons(baseline, fixed_run, delta)
         + _delta_reasons(delta, edits)
         + _edit_reasons(edits, delta)
         + _scan_reasons(after_scan.findings, new_errors)
@@ -847,7 +909,7 @@ _VERDICT_TEXT = {
     "verified": "Verified",
     "verified_weak": "Verified, with weak evidence",
     "rejected": "Rejected",
-    "unverified": "Unverified (no usable tests)",
+    "unverified": "Unverified (not enough evidence)",
 }
 
 
@@ -940,6 +1002,15 @@ def _report(v: Verification) -> str:
             "These fail with and without the fix, so they are not counted as passes.",
             "",
         ] + _bullets([f"`{t}`: {why}" for t, why in no_signal])
+        out.append("")
+    if d.failing_without_baseline:
+        out += [
+            "### Failing tests (no baseline to compare with)",
+            "",
+            "These fail on the fixed code. The original code's tests did not run, so it is "
+            "unknown whether they failed before the fix too.",
+            "",
+        ] + _bullets([f"`{t}`" for t in d.failing_without_baseline])
         out.append("")
     if d.flaky:
         out += ["### Flaky tests", ""] + _bullets(

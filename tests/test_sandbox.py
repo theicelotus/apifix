@@ -16,10 +16,15 @@ from apifix.engine.models import SmokeCheck
 from apifix.engine.project import TestPlan
 from apifix.engine.sandbox import (
     CONTAINER_ENV,
+    PIP_CACHE_MARKER,
     TEST_PHASE_ENV,
+    DownloadStats,
     Sandbox,
     SandboxConfig,
     container_user,
+    default_pip_cache_dir,
+    parse_install_stats,
+    prepare_pip_cache,
     run_sandbox,
 )
 from apifix.engine.test_results import TestCounts
@@ -429,6 +434,26 @@ def test_transient_install_failure_is_retried_once(repo, stderr):
     assert "dependency install failed (network or unknown cause); retried once" in result.notes
 
 
+def test_no_release_found_counts_as_a_network_failure(repo):
+    # what pip prints when the index could not be reached, though it reads like a bad pin
+    stderr = (
+        "ERROR: Could not find a version that satisfies the requirement openai==0.28.1 "
+        "(from versions: none)\nERROR: No matching distribution found for openai==0.28.1"
+    )
+    docker = FakeDocker(install=[exited(1, stderr=stderr), ok()], test=pytest_run(passed=1))
+    result = run_sandbox(repo, docker=docker)
+    assert result.status == "passed" and result.install_retried is True
+
+
+def test_a_version_that_does_not_exist_is_not_retried(repo):
+    stderr = (
+        "ERROR: Could not find a version that satisfies the requirement openai==9.9 (from "
+        "versions: 0.1.0, 1.0.0)\nERROR: No matching distribution found for openai==9.9"
+    )
+    result = run_sandbox(repo, docker=FakeDocker(install=[exited(1, stderr=stderr)]))
+    assert result.status == "error" and result.install_retried is False
+
+
 def test_transient_install_failure_is_retried_only_once(repo):
     flaky = exited(1, stderr="ReadTimeoutError: HTTPSConnectionPool(host='pypi.org')")
     docker = FakeDocker(install=[flaky, flaky])
@@ -728,3 +753,99 @@ def test_no_smoke_phase_when_the_install_failed(flat_service):
     docker = FakeDocker(install=[exited(1, stderr="ResolutionImpossible")] * 4)
     result = Sandbox(docker=docker).run(flat_service, smoke=SMOKE)
     assert result.smoke is None and all(c.phase != "smoke" for c in docker.calls)
+
+
+# --- persistent pip cache -------------------------------------------------------------------
+
+
+def stats_line(**counts) -> str:
+    data = {"downloaded": 0, "downloaded_bytes": 0, "cached": 0, "cached_bytes": 0, **counts}
+    return "APIFIX_INSTALL_STATS " + json.dumps(data) + "\n"
+
+
+def test_pip_cache_is_off_by_default(repo):
+    docker = FakeDocker(test=pytest_run(passed=1))
+    result = run_sandbox(repo, docker=docker)
+    install = docker.calls[0]
+    assert "/pipcache" not in install.mounts
+    assert env_of(install)["PIP_NO_CACHE_DIR"] == "1"
+    assert result.pip_cache is False
+
+
+def test_pip_cache_is_mounted_in_the_install_phase_only(repo, tmp_path):
+    cache = tmp_path / "cache" / "pip"
+    config = SandboxConfig(pip_cache_dir=cache)
+    smoke = SmokeCheck("openai", "import openai", "import openai\n")
+    docker = FakeDocker(test=pytest_run(passed=1))
+    result = Sandbox(config, docker).run(repo, smoke=smoke)
+    install, smoke_call, test = docker.calls
+    assert install.mounts["/pipcache"] == (cache.resolve(), "rw,z")
+    env = env_of(install)
+    assert env["PIP_CACHE_DIR"] == "/pipcache"
+    assert "PIP_NO_CACHE_DIR" not in env  # pip treats any value as "no cache"
+    for call in (smoke_call, test):
+        assert "/pipcache" not in call.mounts
+        assert "PIP_CACHE_DIR" not in env_of(call)
+        assert call.network == "none"
+    assert (cache / PIP_CACHE_MARKER).is_file()
+    assert result.pip_cache is True
+
+
+def test_pip_cache_reused_by_every_install_attempt(repo, tmp_path):
+    flaky = exited(1, stderr="ReadTimeoutError: HTTPSConnectionPool(host='pypi.org')")
+    docker = FakeDocker(install=[flaky, ok()], test=pytest_run(passed=1))
+    Sandbox(SandboxConfig(pip_cache_dir=tmp_path / "c"), docker).run(repo)
+    installs = [c for c in docker.calls if c.phase == "install"]
+    assert len(installs) == 2 and all("/pipcache" in c.mounts for c in installs)
+
+
+def test_a_directory_apifix_did_not_create_is_never_mounted(repo, tmp_path):
+    foreign = tmp_path / "home"
+    (foreign / "notes.txt").parent.mkdir()
+    (foreign / "notes.txt").write_text("mine")
+    docker = FakeDocker(test=pytest_run(passed=1))
+    result = Sandbox(SandboxConfig(pip_cache_dir=foreign), docker).run(repo)
+    assert "/pipcache" not in docker.calls[0].mounts
+    assert result.pip_cache is False and result.status == "passed"
+    assert any("was not created by apifix" in n for n in result.notes)
+    assert not (foreign / PIP_CACHE_MARKER).exists()
+
+
+def test_prepare_pip_cache(tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert prepare_pip_cache(empty) == (empty.resolve(), "")  # an empty dir is adopted
+    assert prepare_pip_cache(empty) == (empty.resolve(), "")  # and reused
+    (empty / "http").mkdir()
+    assert prepare_pip_cache(empty)[0] == empty.resolve()  # has the marker
+    file = tmp_path / "file"
+    file.write_text("x")
+    assert prepare_pip_cache(file)[0] is None
+    # a symlink is judged by what it points at
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "x").write_text("x")
+    (tmp_path / "link").symlink_to(tmp_path / "other")
+    path, why = prepare_pip_cache(tmp_path / "link")
+    assert path is None and str(tmp_path / "other") in why
+
+
+def test_default_pip_cache_dir(monkeypatch, tmp_path):
+    monkeypatch.setenv("APIFIX_PIP_CACHE", str(tmp_path / "explicit"))
+    assert default_pip_cache_dir() == tmp_path / "explicit"
+    monkeypatch.delenv("APIFIX_PIP_CACHE")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    assert default_pip_cache_dir() == tmp_path / "xdg" / "apifix" / "pip"
+    monkeypatch.delenv("XDG_CACHE_HOME")
+    assert default_pip_cache_dir() == Path.home() / ".cache" / "apifix" / "pip"
+
+
+def test_install_download_figures_are_recorded(repo):
+    line = stats_line(downloaded=2, downloaded_bytes=7_300_000, cached=1, cached_bytes=11_000)
+    docker = FakeDocker(install=[ok(stdout="Collecting six\n" + line)], test=pytest_run(passed=1))
+    result = run_sandbox(repo, docker=docker)
+    assert result.install_attempts[0].downloads == DownloadStats(2, 7_300_000, 1, 11_000)
+
+
+@pytest.mark.parametrize("stdout", ["", "APIFIX_INSTALL_STATS not json\n", stats_line()[:-10]])
+def test_missing_or_broken_download_figures(stdout):
+    assert parse_install_stats(stdout) is None

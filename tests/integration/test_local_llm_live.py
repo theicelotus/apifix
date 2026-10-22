@@ -20,7 +20,7 @@ from apifix.engine.agent import AgentConfig, fix
 from apifix.engine.docker import DockerCLI
 from apifix.engine.llm import LLMError, Usage
 from apifix.engine.llm_openai_compat import DEFAULT_BASE_URL, OpenAICompatLLM
-from apifix.engine.sandbox import Sandbox, SandboxConfig
+from apifix.engine.sandbox import Sandbox, SandboxConfig, default_pip_cache_dir
 from tests.integration.tiny_repo import ORIGINAL, make_repo
 
 BASE_URL = os.environ.get("APIFIX_BASE_URL", DEFAULT_BASE_URL)
@@ -62,7 +62,14 @@ def _run_fix(tmp_path, edit_mode: str):
         repo,
         "openai-v1",
         llm=llm(),
-        sandbox=Sandbox(SandboxConfig(install_timeout_s=600, test_timeout_s=180, memory="1g")),
+        sandbox=Sandbox(
+            SandboxConfig(
+                install_timeout_s=600,
+                test_timeout_s=180,
+                memory="1g",
+                pip_cache_dir=default_pip_cache_dir(),
+            )
+        ),
         config=AgentConfig(
             max_cost_usd=0.0,
             max_retries=2,

@@ -16,12 +16,25 @@ from apifix.engine.cleanup import cleanup
 from apifix.engine.docker import DockerCLI
 from apifix.engine.migrations import get_migration
 from apifix.engine.project import TestPlan
-from apifix.engine.sandbox import WORKSPACE_PREFIX, Sandbox, SandboxConfig, run_sandbox
+from apifix.engine.sandbox import (
+    WORKSPACE_PREFIX,
+    Sandbox,
+    SandboxConfig,
+    default_pip_cache_dir,
+    run_sandbox,
+)
 
 _usable, _why = DockerCLI().available()
 pytestmark = [pytest.mark.docker, pytest.mark.skipif(not _usable, reason=_why or "no docker")]
 
-CONFIG = SandboxConfig(install_timeout_s=300, test_timeout_s=120, memory="1g", cpus=1.0)
+# The CLI's persistent pip cache, so repeated suite runs do not download everything again.
+CONFIG = SandboxConfig(
+    install_timeout_s=300,
+    test_timeout_s=120,
+    memory="1g",
+    cpus=1.0,
+    pip_cache_dir=default_pip_cache_dir(),
+)
 
 
 def make_repo(root: Path, files: dict[str, str]) -> Path:
@@ -300,12 +313,33 @@ def test_smoke_check_reports_versions_and_limiting_pins(tmp_path):
     assert "typing_extensions==4.5.0" in smoke.pins and "httpx==0.28.1" in smoke.pins
 
 
+def test_pip_cache_is_reused_by_the_next_install(tmp_path):
+    """A fresh cache: the first install downloads, the second takes the same files from the
+    cache. The test phase still has no network (the security tests run with a cache too)."""
+    repo = make_repo(
+        tmp_path / "repo",
+        {"requirements.txt": "six==1.16.0\n", "tests/test_ok.py": "def test_ok():\n    pass\n"},
+    )
+    config = SandboxConfig(
+        install_timeout_s=300, test_timeout_s=120, pip_cache_dir=tmp_path / "pip-cache"
+    )
+    first, second = Sandbox(config).run(repo), Sandbox(config).run(repo)
+    assert first.status == second.status == "passed", (first.reason, second.reason)
+    assert first.pip_cache and second.pip_cache
+    one, two = first.install_attempts[-1].downloads, second.install_attempts[-1].downloads
+    assert one is not None and one.downloaded >= 2  # six and pytest at least
+    assert two is not None and two.downloaded == 0 and two.cached == one.downloaded
+    assert two.cached_bytes == one.downloaded_bytes
+
+
 def test_timeout_kills_and_removes_the_container(tmp_path, no_leftover_containers):
     repo = make_repo(
         tmp_path / "repo",
         {"tests/test_slow.py": "import time\n\ndef test_slow():\n    time.sleep(600)\n"},
     )
-    config = SandboxConfig(install_timeout_s=300, test_timeout_s=10)
+    config = SandboxConfig(
+        install_timeout_s=300, test_timeout_s=10, pip_cache_dir=default_pip_cache_dir()
+    )
     result = run_sandbox(repo, config)
     assert result.status == "timeout"
     no_leftover_containers()

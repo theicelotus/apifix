@@ -42,6 +42,10 @@ FEEDBACK_PIP_CHARS = 1_500  # dependency files: the tail of pip's output when th
 PREVIOUS_DIFF_CHARS = 3_000
 PREVIOUS_DIFF_CONTEXT = 1
 MIN_LINES_FOR_LENGTH_CHECK = 20
+# Reply budget (max_tokens) for rewriting a file: chars / 3 over-estimates the tokens of code,
+# which is the safe side here; see reply_budget for the margin.
+REPLY_CHARS_PER_TOKEN = 3
+REPLY_MARGIN_TOKENS = 2_048
 
 ParseOutcome = Literal["ok", "no_block", "several_blocks", "truncated"]
 
@@ -87,6 +91,20 @@ def select_files(repo: Path, findings: list[Finding], max_bytes: int) -> FileSel
 def must_change(path: str, findings: list[Finding]) -> bool:
     """Files with a [certain] finding must change; [likely]-only ones may legitimately not."""
     return any(f.file == path and f.confidence == CERTAIN for f in findings)
+
+
+def file_tokens(*versions: str) -> int:
+    """Estimated tokens of a file: of its longest version (the original, or the working copy's
+    after an earlier attempt)."""
+    return -(-max(len(v) for v in versions) // REPLY_CHARS_PER_TOKEN)
+
+
+def reply_budget(tokens: int, cap: int) -> int:
+    """`max_tokens` for a request that rewrites a file of about `tokens` tokens: the file twice
+    (a rewrite can grow, and reasoning models spend reply tokens thinking before they answer)
+    plus REPLY_MARGIN_TOKENS, at most `cap`. Free tiers count this reservation against their
+    per-minute token limit, so it is not simply the maximum."""
+    return min(cap, 2 * tokens + REPLY_MARGIN_TOKENS)
 
 
 def context_candidates(path: str, files: list[str], root: Path | None = None) -> list[str]:

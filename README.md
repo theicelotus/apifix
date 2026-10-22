@@ -14,6 +14,7 @@ apifix scan path/to/repo --migration openai-v1          # human-readable
 apifix scan path/to/repo --migration openai-v1 --json   # machine-readable
 ANTHROPIC_API_KEY=... apifix fix path/to/repo --migration openai-v1 --max-cost 5
 apifix fix path/to/repo --migration openai-v1 --provider openai-compat --model qwen2.5-coder:14b
+apifix verify path/to/repo --migration openai-v1 --diff apifix-out/<run>/fix.diff  # no LLM
 apifix cleanup [--dry-run]                              # recover after a crash
 ```
 
@@ -23,6 +24,17 @@ apifix cleanup [--dry-run]                              # recover after a crash
 or a usage error. Model prices used for `--max-cost` can be overridden with `--prices FILE`
 (TOML); check them against Anthropic's pricing page.
 
+`apifix verify` re-checks a saved diff (e.g. a previous run's `fix.diff`, or one written by
+hand) without any LLM call: it applies the diff to a copy of the repo with `git apply` and runs
+the same baseline and verification as `fix`, writing the same four files. Use it when a run
+could not be judged, for example because the original code's dependency install failed on a
+slow network. Diffs that do not apply, reach outside the repo or create symlinks are refused.
+
+If the original code's tests cannot run (its install failed or timed out), tests that fail on
+the fixed code are not counted as regressions: they may have failed before too. The verdict is
+then "unverified" (or "verified, with weak evidence" when every test passes), and the report
+lists the failing tests and suggests `apifix verify` for a later re-check.
+
 Tests run with pytest in the sandbox, which also runs unittest tests. Test files are found by
 name (`test*.py`, `*_test.py`, anything under `tests/`) or by content (imports unittest or
 pytest and defines `Test*` classes or `test_*` functions) and passed to pytest explicitly. When
@@ -31,6 +43,14 @@ that directory goes on `PYTHONPATH`. After the fixed code's dependencies are ins
 smoke check makes sure the new library actually works with them (openai: create a client). If
 it fails, the fix is rejected with the installed versions and the pins that can hold the
 library back (e.g. `typing_extensions==4.5.0` forcing an old openai).
+
+Dependency installs share a pip cache (`~/.cache/apifix/pip`, or `$APIFIX_PIP_CACHE`), so a
+package downloaded once is reused by later runs, and the baseline and each attempt no longer
+download everything again. Only the install phase sees it; the test phase still has no
+network. The report says how much each run downloaded and took from the cache.
+`--no-pip-cache` turns it off. The cache is filled by install containers, which run
+third-party packages' build scripts, so a malicious package could leave files there that a
+later run installs; the repo's own code never runs with the cache or the network.
 
 ## Free local models (Ollama, LM Studio, vLLM)
 
@@ -155,10 +175,13 @@ model (see https://console.example.com/settings/limits). On HTTP 429 apifix wait
 the server asks (`Retry-After`, or "try again in 7.5s"), or backs off 2, 4, 8 ... 60 s, and
 retries: up to 6 times per request, each wait at most 2 minutes. The waits are not failures;
 the report notes how many there were. A daily or quota limit stops the job at once with the
-server's message. Each request also counts the reply tokens it allows for (16,000 by default)
-against the per-minute token limit on some servers. If requests are refused as too large
-(HTTP 413), lower `--max-output-tokens` (a whole file needs roughly its size / 3 tokens) or
-`--max-file-bytes`.
+server's message. Some servers also count the reply tokens a request allows for against the
+per-minute token limit. In whole-file mode apifix sizes that allowance from the file being
+rewritten (about twice its size / 3 tokens, plus 2,048 for models that reason first; at most
+`--max-output-tokens`). When a request is still refused as larger than the per-minute limit
+("Limit 8000, Requested 9265"), it is sent once more with the allowance lowered to fit, as long
+as that leaves room for the file; otherwise the job stops and says why. Lower
+`--max-file-bytes` or use a model with a higher limit then.
 
 `apifix cleanup` removes sandbox containers and temp dirs that an interrupted run (crash,
 kill, power loss) left behind. Runs that are still in progress are not touched: each one holds

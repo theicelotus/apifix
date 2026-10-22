@@ -27,8 +27,10 @@ class FileChange:
 
 
 def read_text(path: Path) -> str | None:
+    """The file's text with its line endings as they are (CRLF stays CRLF, so diffs apply)."""
     try:
-        return path.read_text(encoding="utf-8")
+        with path.open(encoding="utf-8", newline="") as f:
+            return f.read()
     except (OSError, UnicodeDecodeError):
         return None
 

@@ -14,7 +14,7 @@ import pytest
 from apifix.engine.agent import AgentConfig, fix
 from apifix.engine.docker import DockerCLI
 from apifix.engine.llm import get_llm
-from apifix.engine.sandbox import Sandbox, SandboxConfig
+from apifix.engine.sandbox import Sandbox, SandboxConfig, default_pip_cache_dir
 from tests.integration.tiny_repo import ORIGINAL, make_repo
 
 _docker, _why = DockerCLI().available()
@@ -25,7 +25,13 @@ pytestmark = [
     pytest.mark.skipif(not _docker, reason=_why or "no docker"),
 ]
 
-SANDBOX = SandboxConfig(install_timeout_s=600, test_timeout_s=180, memory="1g", cpus=1.0)
+SANDBOX = SandboxConfig(
+    install_timeout_s=600,
+    test_timeout_s=180,
+    memory="1g",
+    cpus=1.0,
+    pip_cache_dir=default_pip_cache_dir(),
+)
 
 
 def test_live_fix_of_the_tiny_repo(tmp_path):

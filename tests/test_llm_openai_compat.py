@@ -12,7 +12,16 @@ from dataclasses import dataclass, field
 import pytest
 
 from apifix.engine.agent_tools import TOOLS as AGENT_TOOLS
-from apifix.engine.llm import LLMError, Message, ModelInfo, ToolCall, ToolResult, ToolSpec, Usage
+from apifix.engine.llm import (
+    LLMError,
+    Message,
+    ModelInfo,
+    RequestTooLarge,
+    ToolCall,
+    ToolResult,
+    ToolSpec,
+    Usage,
+)
 from apifix.engine.llm_openai_compat import (
     MAX_RESPONSE_BYTES,
     TEXT_CALLS_NOTE,
@@ -26,6 +35,7 @@ from apifix.engine.llm_openai_compat import (
     is_local_host,
     parse_duration,
     parse_text_tool_call,
+    per_minute_overflow,
     server_wait_s,
     to_openai,
     urllib_transport,
@@ -257,6 +267,35 @@ def test_unknown_model_lists_the_servers_models():
     assert "Models on http://localhost:11434/v1: llama3.1:8b, qwen2.5-coder:14b" in str(exc.value)
     assert "Starting points by hardware" in str(exc.value)
     assert http.requests[1].url == "http://localhost:11434/v1/models"
+
+
+def test_unknown_hosted_model_lists_no_hardware(monkeypatch):
+    monkeypatch.setenv("APIFIX_LLM_API_KEY", "gsk_x")
+    models = HTTPResponse(200, json.dumps({"data": [{"id": "openai/gpt-oss-120b"}]}).encode())
+    http = FakeHTTP([error(404, "The model `nope` does not exist"), models])
+    llm = OpenAICompatLLM("nope", base_url=HOSTED, transport=http, sleep=lambda s: None)
+    with pytest.raises(LLMError) as exc:
+        complete(llm)
+    text = str(exc.value)
+    assert f"Models on {HOSTED}: openai/gpt-oss-120b." in text
+    assert "hardware" not in text and "GPU" not in text and "qwen2.5-coder" not in text
+
+
+def test_unknown_hosted_model_without_a_model_list():
+    http = FakeHTTP([error(404, "model not found"), HTTPResponse(404, b"")])
+    llm = OpenAICompatLLM("nope", base_url=HOSTED, transport=http, sleep=lambda s: None)
+    with pytest.raises(LLMError) as exc:
+        complete(llm)
+    assert str(exc.value).endswith("Check the model id against the provider list.")
+    assert "GPU" not in str(exc.value)
+
+
+def test_hosted_model_without_tool_support_suggests_whole_file_mode():
+    http = FakeHTTP([error(400, "this model does not support tools")])
+    llm = OpenAICompatLLM("m", base_url=HOSTED, transport=http, sleep=lambda s: None)
+    with pytest.raises(LLMError) as exc:
+        complete(llm)
+    assert "--edit-mode whole-file" in str(exc.value) and "GPU" not in str(exc.value)
 
 
 def test_context_overflow_error():
@@ -729,13 +768,59 @@ def test_request_too_large_names_the_limits():
         "your message size and try again."
     )
     llm, http, waits = make_timed(limited(message, status=413), base_url=HOSTED, models=FREE)
-    with pytest.raises(LLMError) as exc:
+    with pytest.raises(RequestTooLarge) as exc:
         complete(llm)
     text = str(exc.value)
     assert text.startswith(f"HTTP 413 from {HOSTED}: Request too large")
-    assert "up to 1,000 reply tokens" in text  # complete() asks for max_tokens=1000
+    # complete() asks for max_tokens=1000
+    assert "needs 18,000 tokens (1,000 of them the reply tokens this request allows" in text
+    assert "per-minute limit of 6,000" in text
     assert "--max-output-tokens or --max-file-bytes" in text
+    assert (exc.value.limit, exc.value.requested) == (6000, 18000)
     assert waits == [] and len(http.requests) == 1
+
+
+def test_413_without_stated_limits_is_a_plain_error():
+    llm, _, _ = make_timed(limited("Request too large", status=413), base_url=HOSTED, models=FREE)
+    with pytest.raises(LLMError) as exc:
+        complete(llm)
+    assert not isinstance(exc.value, RequestTooLarge)
+    assert "up to 1,000 reply tokens, which some servers count" in str(exc.value)
+
+
+def test_429_for_a_request_over_the_per_minute_limit_is_not_waited_out():
+    # Waiting cannot help: the request alone needs more than a minute's allowance.
+    message = "Rate limit reached on tokens per minute (TPM): Limit 8000, Used 0, Requested 9265"
+    llm, http, waits = make_timed(limited(message, retry_after="2"), base_url=HOSTED, models=FREE)
+    with pytest.raises(RequestTooLarge) as exc:
+        complete(llm)
+    assert (exc.value.limit, exc.value.requested) == (8000, 9265)
+    assert str(exc.value).startswith(f"HTTP 429 from {HOSTED}: Rate limit reached")
+    assert waits == [] and len(http.requests) == 1
+
+
+def test_429_that_fits_after_a_wait_is_waited_out():
+    message = (
+        "Rate limit reached on tokens per minute (TPM): Limit 8000, Used 6000, Requested 3000. "
+        "Please try again in 7.5s."
+    )
+    llm, _, waits = make_timed(limited(message), reply("ok"), base_url=HOSTED, models=FREE)
+    assert complete(llm).text == "ok"
+    assert waits == [7.5]
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("on tokens per minute (TPM): Limit 8000, Requested 9265, please", (8000, 9265)),
+        ("tokens per minute (TPM): Limit 6000, Used 5000, Requested 1500.", (6000, 1500)),
+        ("TPM: Limit: 100, Requested: 120", (100, 120)),
+        ("tokens per day (TPD): Limit 100000, Requested 120000", None),  # not per minute
+        ("Request too large", None),
+    ],
+)
+def test_per_minute_overflow(message, expected):
+    assert per_minute_overflow(message) == expected
 
 
 def test_key_echoed_by_the_server_is_scrubbed(monkeypatch):

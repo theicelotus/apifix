@@ -5,7 +5,12 @@ apifix fix <path> --migration openai-v1 [--model M] [--max-cost USD] [--out DIR]
     [--edit-mode agent|whole-file] [--max-file-bytes N]
 apifix fix <path> --migration openai-v1 --provider openai-compat --model M [--base-url URL]
     [--strict-tool-calls] [--api-key-env NAME] [--request-timeout S] [--max-output-tokens N]
+apifix verify <path> --migration openai-v1 --diff FILE [--out DIR]
+                                 apply a saved diff to a copy and verify it (no LLM)
 apifix cleanup [--dry-run]      remove containers/temp dirs left by interrupted runs
+
+fix and verify keep a pip cache for the sandbox's dependency installs
+($APIFIX_PIP_CACHE, else ~/.cache/apifix/pip); --no-pip-cache turns it off.
 """
 
 from __future__ import annotations
@@ -98,6 +103,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_fix.add_argument("--max-retries", type=int, default=3)
     p_fix.add_argument("--out", help="output directory (default: ./apifix-out/<timestamp>)")
+    p_verify = sub.add_parser(
+        "verify", help="apply a saved diff to a copy of the repo and verify it (no LLM)"
+    )
+    p_verify.add_argument("path", help="local repo directory (never modified)")
+    p_verify.add_argument("--migration", required=True, choices=available_migrations())
+    p_verify.add_argument(
+        "--diff", required=True, help="unified diff to apply (e.g. a previous run's fix.diff)"
+    )
+    p_verify.add_argument("--out", help="output directory (default: ./apifix-out/<timestamp>)")
+    for p in (p_fix, p_verify):
+        p.add_argument(
+            "--no-pip-cache",
+            action="store_true",
+            help="download every dependency again instead of using apifix's pip cache",
+        )
     p_clean = sub.add_parser(
         "cleanup",
         help="remove apifix containers and temp dirs left behind by crashed or killed runs",
@@ -107,6 +127,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "fix":
         return _fix(args)
+    if args.command == "verify":
+        return _verify(args)
     if args.command == "cleanup":
         report = cleanup(DockerCLI(), dry_run=args.dry_run)
         print(_cleanup_text(report))
@@ -125,10 +147,55 @@ def main(argv: list[str] | None = None) -> int:
     return EXIT_FINDINGS if result.findings else EXIT_CLEAN
 
 
+def _sandbox(args: argparse.Namespace):
+    from apifix.engine.sandbox import Sandbox, SandboxConfig, default_pip_cache_dir
+
+    cache = None if args.no_pip_cache else default_pip_cache_dir()
+    return Sandbox(SandboxConfig(pip_cache_dir=cache))
+
+
+def _out_dir(args: argparse.Namespace) -> Path:
+    out = Path(args.out or Path("apifix-out") / datetime.now().strftime("%Y%m%d-%H%M%S"))
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _write_outputs(
+    out: Path, diff: str, report: str, verification: dict | None, trajectory: dict
+) -> None:
+    (out / "fix.diff").write_text(diff, newline="")  # CRLF lines of CRLF files stay
+    (out / "report.md").write_text(report)
+    (out / "verification.json").write_text(json.dumps(verification, indent=2) + "\n")
+    (out / "trajectory.json").write_text(json.dumps(trajectory, indent=2) + "\n")
+
+
+def _verify(args: argparse.Namespace) -> int:
+    from apifix.engine.verify_diff import VerifyError, verify_diff
+
+    if args.path.startswith(("http://", "https://", "git@")):
+        print("apifix: GitHub URLs are not supported yet; clone locally first", file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        result = verify_diff(args.path, args.migration, args.diff, sandbox=_sandbox(args))
+    except VerifyError as exc:
+        print(f"apifix: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    out = _out_dir(args)
+    _write_outputs(
+        out,
+        result.diff,
+        result.report_markdown,
+        result.verification.to_dict(),
+        result.trajectory,
+    )
+    print(result.reason)
+    print(f"no LLM used; wrote fix.diff, report.md, verification.json, trajectory.json to {out}")
+    return EXIT_CLEAN if result.outcome in ("verified", "verified_weak") else EXIT_FINDINGS
+
+
 def _fix(args: argparse.Namespace) -> int:
     from apifix.engine.agent import AgentConfig, fix
     from apifix.engine.llm import LLMError, get_llm
-    from apifix.engine.sandbox import Sandbox
 
     if args.path.startswith(("http://", "https://", "git@")):
         print("apifix: GitHub URLs are not supported yet; clone locally first", file=sys.stderr)
@@ -178,18 +245,14 @@ def _fix(args: argparse.Namespace) -> int:
             edit_mode=args.edit_mode,
             **limits,
         )
-        result = fix(args.path, args.migration, llm=llm, sandbox=Sandbox(), config=config)
+        result = fix(args.path, args.migration, llm=llm, sandbox=_sandbox(args), config=config)
     except (LLMError, ValueError) as exc:
         print(f"apifix: {exc}", file=sys.stderr)
         return EXIT_USAGE
 
-    out = Path(args.out or Path("apifix-out") / datetime.now().strftime("%Y%m%d-%H%M%S"))
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "fix.diff").write_text(result.diff)
-    (out / "report.md").write_text(result.report_markdown)
+    out = _out_dir(args)
     verification = result.verification.to_dict() if result.verification else None
-    (out / "verification.json").write_text(json.dumps(verification, indent=2) + "\n")
-    (out / "trajectory.json").write_text(json.dumps(result.trajectory, indent=2) + "\n")
+    _write_outputs(out, result.diff, result.report_markdown, verification, result.trajectory)
     print(f"{result.outcome}: {result.reason}")
     print(
         f"{result.attempts} attempt(s), {result.usage.total:,} tokens, ${result.cost_usd:.2f}; "

@@ -1,7 +1,9 @@
 """Run a repo's tests in Docker, in two phases.
 
 1. Install (network on): only a generated requirements file is visible; the repo's own code is
-   not, so nothing from the repo runs while the network is up.
+   not, so nothing from the repo runs while the network is up. An optional persistent pip
+   cache (`SandboxConfig.pip_cache_dir`) is mounted here and nowhere else, so packages
+   downloaded once are reused by later runs.
 2. Test (``--network none``): the repo copy is installed offline (editable, falling back to
    PYTHONPATH) and its tests run against the read-only dependencies from phase 1.
 
@@ -58,6 +60,12 @@ InstallMethod = Literal["editable", "pythonpath"]
 
 DRIVER = Path(__file__).with_name("sandbox_driver.py")
 SMOKE_MARKER = "APIFIX_SMOKE_RESULT "  # sandbox_driver.SMOKE_MARKER
+INSTALL_STATS_MARKER = "APIFIX_INSTALL_STATS "  # sandbox_driver.INSTALL_STATS_MARKER
+PIP_CACHE_MOUNT = "/pipcache"
+# Created in a pip cache dir that apifix made. Only such a dir is mounted (bind mounts are
+# relabeled for SELinux), never an arbitrary existing directory.
+PIP_CACHE_MARKER = ".apifix-pip-cache"
+PIP_CACHE_ENV = "APIFIX_PIP_CACHE"
 NO_PROJECT = "no pyproject.toml or setup.py"  # sandbox_driver.NO_PROJECT
 CONTAINER_LABEL = "apifix=1"
 WORKSPACE_LABEL = "apifix.workspace"  # container label: the host workspace it mounts
@@ -114,6 +122,9 @@ NETWORK_ERROR_MARKERS = (
     "SSLError",
     "HTTP error 429",
     "HTTP error 5",
+    # pip found no release at all, which is what an unreachable index looks like too (also
+    # printed for a misspelt name, which then costs one retry)
+    "(from versions: none)",
 )
 # pip output that means the requirements themselves are wrong: never retried as transient.
 REQUIREMENT_ERROR_MARKERS = (
@@ -143,6 +154,61 @@ class SandboxConfig:
     default_python: str = DEFAULT_PYTHON
     image_repo: str = "python"
     max_install_attempts: int = 4
+    # Persistent pip cache shared by install phases (None: off). See default_pip_cache_dir().
+    pip_cache_dir: Path | None = None
+
+
+def default_pip_cache_dir() -> Path:
+    """$APIFIX_PIP_CACHE, else $XDG_CACHE_HOME/apifix/pip, else ~/.cache/apifix/pip."""
+    explicit = os.environ.get(PIP_CACHE_ENV)
+    if explicit:
+        return Path(explicit).expanduser()
+    base = os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
+    return Path(base) / "apifix" / "pip"
+
+
+def prepare_pip_cache(path: Path) -> tuple[Path | None, str]:
+    """The cache dir to mount, created (with PIP_CACHE_MARKER) if needed; or None and why not.
+    A non-empty dir without the marker was not made by apifix and is never mounted."""
+    try:
+        path = path.expanduser().resolve()
+        if path.exists():
+            if not path.is_dir():
+                return None, f"pip cache {path} is not a directory; not used"
+            if not (path / PIP_CACHE_MARKER).is_file() and any(path.iterdir()):
+                return None, (
+                    f"pip cache {path} was not created by apifix (no {PIP_CACHE_MARKER} in "
+                    "it); not used"
+                )
+        path.mkdir(parents=True, exist_ok=True)
+        (path / PIP_CACHE_MARKER).touch()
+        if os.getuid() == 0:  # containers run as nobody: let it write the cache
+            path.chmod(0o777)
+    except OSError as exc:
+        return None, f"pip cache {path} is not usable ({exc}); not used"
+    return path, ""
+
+
+@dataclass(frozen=True)
+class DownloadStats:
+    """What one install's pip fetched: distribution files downloaded vs taken from the cache."""
+
+    downloaded: int = 0
+    downloaded_bytes: int = 0
+    cached: int = 0
+    cached_bytes: int = 0
+
+
+def parse_install_stats(stdout: str) -> DownloadStats | None:
+    """The driver's INSTALL_STATS_MARKER line (the last one), or None if there is none."""
+    line = next(
+        (ln for ln in reversed(stdout.splitlines()) if ln.startswith(INSTALL_STATS_MARKER)), None
+    )
+    try:
+        data = json.loads(line[len(INSTALL_STATS_MARKER) :]) if line else None
+        return DownloadStats(**{k: int(data[k]) for k in DownloadStats.__dataclass_fields__})
+    except (ValueError, TypeError, KeyError):
+        return None
 
 
 @dataclass
@@ -157,6 +223,7 @@ class PhaseResult:
     stderr: str = ""
     duration_s: float = 0.0
     constraints_applied: bool | None = None  # install phase only
+    downloads: DownloadStats | None = None  # install phase only, when the driver reported it
 
 
 @dataclass
@@ -200,6 +267,7 @@ class SandboxResult:
     # Repo dirs put on PYTHONPATH in the test phase (TestPlan.import_paths).
     import_paths: list[str] = field(default_factory=list)
     smoke: SmokeResult | None = None
+    pip_cache: bool = False  # the install phase used the persistent pip cache
 
 
 @dataclass(frozen=True)
@@ -250,7 +318,10 @@ def container_args(
     ]  # fmt: skip
     if workspace is not None:
         args += ["--label", f"{WORKSPACE_LABEL}={workspace}"]
-    for key, value in {**CONTAINER_ENV, **(extra_env or {})}.items():
+    env = {**CONTAINER_ENV, **(extra_env or {})}
+    if "PIP_CACHE_DIR" in env:  # pip treats any value of PIP_NO_CACHE_DIR as "no cache"
+        del env["PIP_NO_CACHE_DIR"]
+    for key, value in env.items():
         args += ["--env", f"{key}={value}"]
     for m in mounts:
         args += ["--volume", m.arg()]
@@ -379,6 +450,14 @@ class Sandbox:
         image = f"{self.config.image_repo}:{result.python_version}-slim"
         use_constraints = bool(plan.constraints)
         known = (*BUILD_ERROR_MARKERS, *RESOLUTION_ERROR_MARKERS, *REQUIREMENT_ERROR_MARKERS)
+        cache, env = None, None
+        if self.config.pip_cache_dir is not None:
+            cache, why = prepare_pip_cache(self.config.pip_cache_dir)
+            if cache is None:
+                result.notes.append(why)
+            else:
+                env = {"PIP_CACHE_DIR": PIP_CACHE_MOUNT}
+                result.pip_cache = True
         for _ in range(self.config.max_install_attempts):
             ws.reset_deps()
             command = ["python", "/apifix/driver.py", "install"]
@@ -389,8 +468,11 @@ class Sandbox:
                 Mount(ws.deps, "/deps", writable=True),
                 Mount(ws.tooling, "/apifix", writable=False),
             ]
-            phase = self._phase("install", image, "bridge", command, mounts, None, ws.root)
+            if cache is not None:
+                mounts.append(Mount(cache, PIP_CACHE_MOUNT, writable=True))
+            phase = self._phase("install", image, "bridge", command, mounts, None, ws.root, env)
             phase.constraints_applied = use_constraints
+            phase.downloads = parse_install_stats(phase.stdout)
             result.install_attempts.append(phase)
             result.image = image
 
@@ -581,7 +663,7 @@ class Sandbox:
             config=self.config,
             user=self.user,
             workdir=workdir,
-            extra_env={**TEST_PHASE_ENV, **(env or {})} if name == "test" else None,
+            extra_env={**TEST_PHASE_ENV, **(env or {})} if name == "test" else env,
             workspace=workspace,
         )
         timeout = self.config.install_timeout_s if name == "install" else self.config.test_timeout_s

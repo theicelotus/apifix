@@ -13,6 +13,7 @@ from apifix.engine.verifier import feedback_lines
 from apifix.engine.whole_file import (
     MIN_LINES_FOR_LENGTH_CHECK,
     PREVIOUS_DIFF_CHARS,
+    REPLY_MARGIN_TOKENS,
     as_file,
     check_candidate,
     check_retry_message,
@@ -20,10 +21,12 @@ from apifix.engine.whole_file import (
     error_key,
     fence_for,
     file_prompt,
+    file_tokens,
     join_errors,
     must_change,
     parse_code_block,
     previous_version_note,
+    reply_budget,
     select_context,
     select_files,
     system_prompt,
@@ -536,3 +539,19 @@ def test_dependency_feedback_has_problems_but_no_test_output():
     assert "boom" in python and "Hint: A hint." in python
     assert "- [reject] regression: tests fail (tests: t0)" in deps
     assert "boom" not in deps and "Hint" not in deps
+
+
+# --- reply budget -----------------------------------------------------------------------------
+
+
+def test_file_tokens_take_the_longest_version_and_round_up():
+    assert file_tokens("abcd") == 2  # 4 chars / 3 per token, rounded up
+    assert file_tokens("a" * 30, "a" * 3000) == 1000
+
+
+def test_reply_budget_is_twice_the_file_plus_a_margin_and_capped():
+    assert reply_budget(1000, 16_000) == 2000 + REPLY_MARGIN_TOKENS
+    assert reply_budget(0, 16_000) == REPLY_MARGIN_TOKENS
+    assert reply_budget(9000, 16_000) == 16_000
+    # the the hosted provider run: a 4,229-byte app.py took 3,298 reply tokens with gpt-oss-120b
+    assert reply_budget(file_tokens("x" * 4229), 16_000) > 3298

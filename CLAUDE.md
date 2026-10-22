@@ -33,6 +33,8 @@ src/apifix/
                       `--request-timeout`, `--api-key-env`;
                       `--edit-mode agent|whole-file`, `--max-file-bytes`,
                       `--max-output-tokens`),
+                      `apifix verify <path> --migration openai-v1 --diff FILE [--out]`,
+                      (`fix`/`verify`: `--no-pip-cache`),
                       `apifix cleanup [--dry-run]`
   api/                FastAPI app (later)
   worker/             background jobs (later)
@@ -53,7 +55,8 @@ src/apifix/
     sandbox.py        two-phase Docker run (install with network, test without); sessions
                       install once and run tests repeatedly; optional coverage; one retry of
                       an install that failed transiently; test-phase env placeholders; the
-                      migration's post-install smoke check (no network, no repo code)
+                      migration's post-install smoke check (no network, no repo code);
+                      persistent pip cache (install phase only) and download figures
     sandbox_driver.py runs INSIDE containers (Python 3.8+ compatible, stdlib only)
     docker.py         DockerClient protocol + `docker` CLI implementation (bounded output)
     cleanup.py        removes containers / temp workspaces left by crashed or killed runs
@@ -72,7 +75,10 @@ src/apifix/
                       tool calls written as reply text (`--strict-tool-calls` disables)
     agent_tools.py    the model's tools: read_file, list_files, search, edit_file (no shell)
     agent.py          fix loop: propose -> verify (cached baseline) -> feed reasons back ->
-                      retry; limits; JSON trajectory; diff + report; both edit modes
+                      retry; limits; JSON trajectory; diff + report; both edit modes; per-request
+                      reply budget, one retry with fewer reply tokens on a per-minute limit
+    verify_diff.py    `apifix verify`: `git apply` a saved diff to a copy, same baseline +
+                      verify() as fix, no LLM; same output files
     whole_file.py     whole-file mode (no tools, one file per request): file selection, prompts,
                       code-block parsing, pre-apply checks (syntax, dependency file, changed,
                       abbreviation, undefined names, mock targets)
@@ -213,10 +219,25 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   apifix created are ever mounted.
 - Third-party sdists still execute their own build scripts during the networked install phase
   (that is what installing them means). The repo's own code never does.
-- Each run reinstalls dependencies from scratch (no caching between runs yet).
+- pip cache (`SandboxConfig.pip_cache_dir`; off in the library, on in the CLI:
+  `$APIFIX_PIP_CACHE`, else `$XDG_CACHE_HOME/apifix/pip`, else `~/.cache/apifix/pip`;
+  `--no-pip-cache`): mounted read-write at `/pipcache` in install containers only
+  (`PIP_CACHE_DIR`, and no `PIP_NO_CACHE_DIR`, whose any value disables the cache). Only a dir
+  apifix created (marker `.apifix-pip-cache`; an empty dir is adopted) is mounted, since
+  `:z` relabels it; otherwise the run goes without a cache and notes why. The venv itself is
+  still rebuilt per run (pip still installs; only downloads are saved). Install containers run
+  third-party build scripts with the cache writable, so a malicious package can plant files
+  that later runs (other repos too) install; same trust as a user's own pip cache, documented.
+  Nothing evicts old entries: delete the dir to reclaim space.
+- Download figures: the driver counts pip's `Downloading <file> (<size>)` / `Using cached
+  <file> (<size>)` lines (not `.metadata`) and prints one `APIFIX_INSTALL_STATS` line
+  (`PhaseResult.downloads`, summed per run in the report). Sizes are pip's rounded figures;
+  files pip reports differently (local wheel-cache hits for built sdists) are not counted.
 - A failed install is retried once (same settings) when pip's output has a network marker
-  (`NewConnectionError`, `ReadTimeoutError`, `HTTP error 5xx/429`, ...) or no recognised marker
-  at all; requirement, resolution and build errors are not. Each failed install phase keeps
+  (`NewConnectionError`, `ReadTimeoutError`, `HTTP error 5xx/429`, `(from versions: none)`,
+  ...) or no recognised marker at all; requirement, resolution and build errors are not.
+  `(from versions: none)` is also what a misspelt package name gives, which then costs one
+  retry. Each failed install phase keeps
   the last 4,000 characters of its output in the trajectory (`install_attempts[].output`), and
   `install_retried` / the report say when a retry happened.
 - Env placeholders: a variable a migration names (`ci_env_placeholders`) gets a placeholder in
@@ -248,6 +269,12 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   intermittently can pass the rerun and be reported as flaky.
 - When the fixed code's tests never ran (install failed, test phase did not start), there is
   no per-test comparison: the run error rejects, and no test is reported deleted.
+- No usable baseline (the original's run is `error`/`timeout`: install failed, test phase
+  crashed or was killed; "no test files" is usable, as zero tests): no per-test comparison
+  either. Failing/erroring tests of the fix (collection errors as their module) go into
+  `failing_without_baseline`, never into regressions; reasons `no_baseline` (weak) plus
+  `unjudged_failures` (unverified) when any test fails, so the verdict is `unverified` (or
+  `verified_weak` if all pass), unless an independent reason rejects. No flaky rerun.
 - Changed-line coverage is line coverage of the test process only (no subprocesses). Changed
   files the tests never imported count non-blank, non-comment lines as unexecuted. A repo's own
   coverage/pytest-cov configuration can interfere with the `coverage run` wrapper.
@@ -266,8 +293,23 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
 - Edits are exact string replacements in existing Python and dependency files. The agent
   cannot create, rename or delete files, so migrations that need a new module (e.g. a shared
   client factory) must put it in an existing file.
-- `verified_weak` stops the loop. `unverified` is not retried when the repo has no tests or the
-  sandbox could not run at all; nothing the agent edits could change those.
+- `verified_weak` stops the loop. `unverified` is not retried when the repo has no tests, the
+  sandbox could not run at all, or tests fail while the original code's run failed
+  (`unjudged_failures`); nothing the agent edits could change those. The report then suggests
+  `apifix verify` on the diff for a later re-check (the baseline is not rerun in the job).
+- Reply budget: `max_tokens` is `--max-output-tokens` in agent mode; in whole-file mode
+  `min(--max-output-tokens, 2 * est + 2,048)`, `est` = chars / 3 of the longer of the original
+  file and its working-copy version (`whole_file.reply_budget`). A reasoning model whose
+  thinking exceeds the margin hits the limit and the file fails (truncated, not nudged).
+- Per-minute token limits (`RequestTooLarge`: a 413 or 429 message with "per minute"/TPM and
+  "Limit N, [Used U, ]Requested M"; a 429 only when M > N, else it is waited out): the request
+  is sent once more with `max_tokens = N - (M - max_tokens) - 64` if that leaves at least `est`
+  (agent mode: 1,024) and is lower; else, or if refused again, the job stops
+  (`provider_error`). Not remembered: the next request starts from its own budget again.
+- `apifix verify`: needs the `git` binary; `git apply` with `GIT_CEILING_DIRECTORIES` and no
+  user/system git config, so it never looks above the copy and refuses paths outside it.
+  Symlink modes (120000) are refused; changes only in dirs the walker skips (venvs, build,
+  .git) are "changed no file". Binary patches apply but get no line-level checks.
 - Suspicious-edit checks are syntactic (imports, call names after alias resolution, literal
   shapes). Indirect calls (`getattr(os, "system")`), code in non-Python files and exfiltration
   through allowed libraries are not detected. A small set of I/O-free stdlib modules
@@ -378,7 +420,8 @@ Hardware for local models (4-bit quantised; add a few GB of KV cache for a 32k c
 | 48 GB+ GPU or 64 GB+ Mac | `llama3.3:70b` (~40 GB) | Best local quality |
 
 The same suggestions are in `MODEL_SUGGESTIONS` (`llm_openai_compat.py`), which the missing-model
-and no-tool-support errors print; keep the two in sync.
+and no-tool-support errors print for local endpoints (hosted ones get the server's model list,
+or "use a tool-capable model, or --edit-mode whole-file"); keep the two in sync.
 
 Known limitations:
 - "Local" (cost $0, no third-party notice) means loopback, private-network IPs, `localhost` and
@@ -410,7 +453,9 @@ Known limitations:
   are not read, and nothing paces requests before the server refuses one.
 - HTTP 413 / "request too large" gets an error naming `--max-output-tokens` and
   `--max-file-bytes` (some free tiers count the requested `max_tokens`, 16,000 by default,
-  against their per-minute token limit). Server error messages have the API key replaced by
+  against their per-minute token limit). When the message states the per-minute limit and the
+  request's size, it is a `RequestTooLarge` the agent may retry once with fewer reply tokens
+  (see Known limitations (agent)). Server error messages have the API key replaced by
   `[API key]` before they reach errors.
 - Every request sends `User-Agent: apifix/<version>` and `Accept: application/json` (the hosted provider's
   firewall answers urllib's default `Python-urllib/3.x` with a bare 403). A 403 from a hosted

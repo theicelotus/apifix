@@ -27,7 +27,15 @@ from apifix.engine.agent_tools import TOOLS, EditRecord, Workspace
 from apifix.engine.code_checks import STDLIB_IMPORTS, import_table, module_roots
 from apifix.engine.dependencies import is_dependency_file
 from apifix.engine.diffing import diff_trees, read_text, unified_diff
-from apifix.engine.llm import LLMClient, LLMError, LLMResponse, Message, ToolResult, Usage
+from apifix.engine.llm import (
+    LLMClient,
+    LLMError,
+    LLMResponse,
+    Message,
+    RequestTooLarge,
+    ToolResult,
+    Usage,
+)
 from apifix.engine.migrations import Migration, get_migration
 from apifix.engine.models import Finding
 from apifix.engine.project import ci_env_vars
@@ -36,6 +44,7 @@ from apifix.engine.scanner import scan
 from apifix.engine.verifier import (
     Verification,
     VerifierConfig,
+    downloads_line,
     feedback_lines,
     run_summary,
     verify,
@@ -50,10 +59,12 @@ from apifix.engine.whole_file import (
     context_candidates,
     error_key,
     file_prompt,
+    file_tokens,
     join_errors,
     must_change,
     parse_code_block,
     previous_version_note,
+    reply_budget,
     select_context,
     select_files,
     verification_feedback,
@@ -69,6 +80,12 @@ MAX_FEEDBACK_REASONS = 40
 ONE_CALL_NUDGE = "Send exactly one tool call per reply."
 NO_CALL_NUDGE = "You can't see files directly. Call a tool, for example read_file, to get them."
 _RANK = {"verified": 3, "verified_weak": 2, "unverified": 1, "rejected": 0}
+# A request refused by a per-minute token limit is sent once more with fewer reply tokens if
+# at least this many remain (whole-file mode: the file's estimated size instead), keeping this
+# many tokens below the limit (the server counts the prompt itself).
+AGENT_MIN_REPLY_TOKENS = 1_024
+TOKEN_LIMIT_SLACK = 64
+LOWERED_NOTE = "sent again with fewer reply tokens"
 
 
 @dataclass(frozen=True)
@@ -289,6 +306,7 @@ class _Job:
         self.llm_seconds = 0.0
         self.sandbox_seconds = 0.0
         self.baseline_seconds = 0.0
+        self.lowered_requests = 0  # requests retried with fewer reply tokens (RequestTooLarge)
 
     # --- budget -----------------------------------------------------------------------------
 
@@ -301,9 +319,9 @@ class _Job:
                 chars += sum(len(str(b)) for b in m.provider_blocks)
         return chars // CHARS_PER_TOKEN
 
-    def _check_budget_before_call(self, messages: list[Message]) -> None:
+    def _check_budget_before_call(self, messages: list[Message], max_tokens: int) -> None:
         c = self.config
-        projected_tokens = self._estimate_input_tokens(messages) + c.max_output_tokens
+        projected_tokens = self._estimate_input_tokens(messages) + max_tokens
         if self.usage.total + projected_tokens > c.max_tokens_per_job:
             raise _Abort(
                 "token_limit",
@@ -313,7 +331,7 @@ class _Job:
         if c.max_cost_usd is not None:
             worst = Usage(
                 input_tokens=self._estimate_input_tokens(messages),
-                output_tokens=c.max_output_tokens,
+                output_tokens=max_tokens,
             )
             projected = self.llm.cost(worst) or 0.0
             if self.cost + projected > c.max_cost_usd:
@@ -337,19 +355,37 @@ class _Job:
 
     # --- one attempt ------------------------------------------------------------------------
 
-    def _call_llm(self, attempt: Attempt, messages: list[Message] | None = None) -> LLMResponse:
-        """One request; the reply is appended to `messages` (default: the agent conversation)."""
+    def _call_llm(
+        self,
+        attempt: Attempt,
+        messages: list[Message] | None = None,
+        *,
+        max_tokens: int | None = None,
+        need_tokens: int = AGENT_MIN_REPLY_TOKENS,
+    ) -> LLMResponse:
+        """One request; the reply is appended to `messages` (default: the agent conversation).
+        `max_tokens` defaults to the configured maximum. A request over the server's per-minute
+        token limit is sent once more with max_tokens lowered to fit, if that leaves at least
+        `need_tokens` for the reply."""
         messages = self.messages if messages is None else messages
-        self._check_budget_before_call(messages)
+        max_tokens = max_tokens or self.config.max_output_tokens
+        self._check_budget_before_call(messages, max_tokens)
+        lowered_from: int | None = None
         start = time.monotonic()
         try:
-            response = self.llm.complete(
-                system=self.system,
-                messages=messages,
-                tools=self.tools,
-                max_tokens=self.config.max_output_tokens,
-                temperature=self.config.temperature,
-            )
+            while True:
+                try:
+                    response = self.llm.complete(
+                        system=self.system,
+                        messages=messages,
+                        tools=self.tools,
+                        max_tokens=max_tokens,
+                        temperature=self.config.temperature,
+                    )
+                    break
+                except RequestTooLarge as exc:
+                    fit = self._fitting_max_tokens(exc, max_tokens, need_tokens, lowered_from)
+                    lowered_from, max_tokens = max_tokens, fit
         except LLMError as exc:
             raise _Abort("provider_error", str(exc)) from exc
         finally:
@@ -373,7 +409,9 @@ class _Job:
                 "cost_usd": round(cost or 0.0, 6),
                 "tool_calls": len(response.tool_calls),
                 "duration_s": round(duration, 3),
+                "max_tokens": max_tokens,
             }
+            | ({"max_tokens_lowered_from": lowered_from} if lowered_from else {})
             | ({"refusal": response.refusal} if response.refusal else {})
         )
         messages.append(
@@ -387,6 +425,34 @@ class _Job:
         )
         self._check_budget_after_call()
         return response
+
+    def _fitting_max_tokens(
+        self, exc: RequestTooLarge, max_tokens: int, need: int, lowered_from: int | None
+    ) -> int:
+        """max_tokens that makes a refused request fit the server's per-minute limit (it counts
+        the prompt plus max_tokens), or raise LLMError when one retry cannot help."""
+        if lowered_from is not None:
+            raise LLMError(
+                f"{exc} (already sent again with max_tokens lowered from {lowered_from:,} to "
+                f"{max_tokens:,})"
+            )
+        prompt = exc.requested - max_tokens  # the server's count of the prompt itself
+        fit = exc.limit - prompt - TOKEN_LIMIT_SLACK
+        if fit >= max_tokens:  # the server's figure does not include the reply allowance
+            raise LLMError(str(exc))
+        if fit < need:
+            left = f"{max(fit, 0):,} reply tokens" if fit > 0 else "no reply tokens"
+            raise LLMError(
+                f"{exc}. The prompt alone is ~{prompt:,} tokens; lowering max_tokens to fit "
+                f"would leave {left}, less than the reply needs (~{need:,})"
+            )
+        self.lowered_requests += 1
+        self.llm.notes[:] = [n for n in self.llm.notes if LOWERED_NOTE not in n]
+        self.llm.notes.append(
+            f"{self.lowered_requests} request(s) refused by the server's per-minute token limit "
+            f"({exc.limit:,}) were {LOWERED_NOTE} (max_tokens lowered to fit)"
+        )
+        return fit
 
     def _converse(self, attempt: Attempt) -> None:
         calls = 0
@@ -513,6 +579,8 @@ class _Job:
             text, reason = self.wf_previous[path]
             previous = previous_version_note(path, original, text, reason)
         dependency = is_dependency_file(path)
+        tokens = file_tokens(original, self._read(self.work, path))
+        max_tokens = reply_budget(tokens, self.config.max_output_tokens)
         prompt = file_prompt(
             path,
             original,
@@ -531,6 +599,7 @@ class _Job:
             "context_left_out": left_out,
             "previous_version_sent": bool(previous),
             "change_required": required,
+            "max_tokens": max_tokens,
             "replies": [],
             "accepted": False,
             "error": "",
@@ -538,7 +607,7 @@ class _Job:
         retries = 0
         candidate: str | None = None
         while True:
-            response = self._call_llm(attempt, messages)
+            response = self._call_llm(attempt, messages, max_tokens=max_tokens, need_tokens=tokens)
             if response.stop_reason == "refusal":
                 raise _Abort("refusal", f"the model declined the request ({response.refusal})")
             parsed = parse_code_block(response.text, truncated=response.stop_reason == "max_tokens")
@@ -654,7 +723,7 @@ class _Job:
             if ch.kind == "modified":
                 shutil.copyfile(self.repo / ch.path, self.work / ch.path)
         for path, text in snapshot.items():
-            (self.work / path).write_text(text, encoding="utf-8")
+            (self.work / path).write_text(text, encoding="utf-8", newline="")
 
     # --- the loop ---------------------------------------------------------------------------
 
@@ -754,13 +823,15 @@ class _Job:
 
     def _retryable(self, v: Verification) -> bool:
         """Rejections are retried. An unverified result is retried unless no edit can change
-        it: the repo has no tests, or the sandbox could not run at all."""
+        it: the repo has no tests, the sandbox could not run at all, or tests fail on the fix
+        while the original code's run failed (no edit produces the missing baseline)."""
         if v.verdict == "rejected":
             return True
         assert self.baseline is not None
         if self.baseline.status == "unverified":
             return False
-        return not any(r.code == "sandbox_unavailable" for r in v.reasons)
+        final = {"sandbox_unavailable", "unjudged_failures"}
+        return not any(r.code in final for r in v.reasons)
 
     def best_attempt(self) -> Attempt | None:
         verified = [a for a in self.attempts if a.verification is not None]
@@ -877,7 +948,7 @@ def report_markdown(
         "verified": "Verified",
         "verified_weak": "Verified, with weak evidence",
         "rejected": "Not verified (rejected)",
-        "unverified": "Not verified (no usable tests)",
+        "unverified": "Not verified (not enough evidence)",
         "aborted": "Aborted",
         "no_findings": "Nothing to migrate",
     }[result_outcome]
@@ -935,6 +1006,11 @@ def report_markdown(
             f"- Dependency install retried once after a failure that looked transient: "
             f"{', '.join(retried)}"
         )
+    runs = [("baseline", job.baseline)] if job.baseline is not None else []
+    runs += [(f"attempt {a.number}", a.verification.fixed) for a in job.attempts if a.verification]
+    downloads = downloads_line(runs)
+    if downloads:
+        lines.append(downloads)
     if job.whole_file:
         for a in job.attempts:
             for f in a.files:
@@ -955,6 +1031,12 @@ def report_markdown(
                 )
                 lines.append(f"- Attempt {a.number} ({a.result}): {files}{kept}")
     lines += [f"- Note: {n}" for n in job.llm.notes]
+    if chosen and chosen.verification and not chosen.verification.delta.baseline_available:
+        lines.append(
+            "- The original code's tests did not run, so this fix could not be compared with "
+            "them. To check it again later without the LLM: `apifix verify "
+            f"{job.repo} --migration {job.migration.name} --diff fix.diff`"
+        )
     lines.append("")
     if chosen and chosen.verification:
         lines.append(chosen.verification.report_markdown())

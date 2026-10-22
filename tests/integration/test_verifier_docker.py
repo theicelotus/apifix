@@ -10,14 +10,20 @@ from pathlib import Path
 import pytest
 
 from apifix.engine.docker import DockerCLI
-from apifix.engine.sandbox import Sandbox, SandboxConfig
+from apifix.engine.sandbox import Sandbox, SandboxConfig, default_pip_cache_dir
 from apifix.engine.verifier import verify
 from tests.integration.tiny_repo import ORIGINAL, make_repo
 
 _usable, _why = DockerCLI().available()
 pytestmark = [pytest.mark.docker, pytest.mark.skipif(not _usable, reason=_why or "no docker")]
 
-CONFIG = SandboxConfig(install_timeout_s=600, test_timeout_s=180, memory="1g", cpus=1.0)
+CONFIG = SandboxConfig(
+    install_timeout_s=600,
+    test_timeout_s=180,
+    memory="1g",
+    cpus=1.0,
+    pip_cache_dir=default_pip_cache_dir(),
+)
 
 GOOD_APP = """\
     import openai

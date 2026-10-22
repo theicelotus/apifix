@@ -1,7 +1,9 @@
 """Runs INSIDE sandbox containers, under the target repo's Python (3.8+): keep it 3.8-compatible
 and stdlib-only. The host never imports this module; it is copied into the container.
 
-    driver.py install [--constraints]   network on;  sees /manifest and /deps only
+    driver.py install [--constraints]   network on;  sees /manifest and /deps only (and the
+                                        pip cache, if one is mounted); ends with one
+                                        INSTALL_STATS_MARKER line (downloads vs cache hits)
     driver.py test [--coverage] [--path DIR]... -- <cmd...>
                                         network off; /deps read-only, /work = repo copy;
                                         each DIR (repo-relative) goes on PYTHONPATH
@@ -15,6 +17,7 @@ network, no deps). If that fails, the repo is put on PYTHONPATH instead.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -29,6 +32,12 @@ MAX_LOG = 8000
 NO_PROJECT = "no pyproject.toml or setup.py"
 SMOKE_CHECK = "/apifix/smoke_check.py"
 SMOKE_MARKER = "APIFIX_SMOKE_RESULT "
+INSTALL_STATS_MARKER = "APIFIX_INSTALL_STATS "
+# pip's "Downloading x.whl (7.2 MB)" / "Using cached x.whl (7.2 MB)" (older pip: a URL, "7.2MB")
+_FILE_LINE = re.compile(
+    r"^\s*(Downloading|Using cached) (\S+) \((\d+(?:\.\d+)?) ?(bytes|kB|MB|GB)\)"
+)
+_UNITS = {"bytes": 1, "kB": 1000, "MB": 1000**2, "GB": 1000**3}
 
 
 def _site_dirs(python):
@@ -53,9 +62,26 @@ def install(use_constraints):
     if use_constraints:
         cmd += ["-c", MANIFEST + "/constraints.txt"]
     print("[apifix] " + " ".join(cmd), file=sys.stderr, flush=True)
-    rc = subprocess.call(cmd, env=env)
+    stats = {"downloaded": 0, "downloaded_bytes": 0, "cached": 0, "cached_bytes": 0}
+    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE)
+    for raw in proc.stdout:  # passed through unchanged, counted on the way
+        sys.stdout.buffer.write(raw)
+        sys.stdout.buffer.flush()
+        count_file_line(raw.decode("utf-8", "replace"), stats)
+    rc = proc.wait()
     shutil.rmtree(tmp, ignore_errors=True)
+    print(INSTALL_STATS_MARKER + json.dumps(stats), flush=True)
     return rc
+
+
+def count_file_line(line, stats):
+    """Count one distribution file pip downloaded or took from its cache (not .metadata)."""
+    m = _FILE_LINE.match(line)
+    if not m or m.group(2).endswith(".metadata"):
+        return
+    key = "downloaded" if m.group(1) == "Downloading" else "cached"
+    stats[key] += 1
+    stats[key + "_bytes"] += int(float(m.group(3)) * _UNITS[m.group(4)])
 
 
 def _write_results(data):
