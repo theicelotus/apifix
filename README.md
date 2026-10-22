@@ -116,6 +116,50 @@ endpoint needs a price in the `--prices` TOML file (use 0 for a free tier) or
 repository code will be sent to that third-party server. **Some hosted free tiers may use
 submitted data for training**: check the provider's terms before sending private code.
 
+## Fast testing with a hosted free tier
+
+Hosted free tiers answer in seconds where a 7B model on a CPU takes most of an hour. the hosted provider's
+endpoint is OpenAI-compatible. **Free tiers may use submitted requests for training: only send
+public code.**
+
+1. Create an API key at https://console.example.com/keys and put it in `APIFIX_LLM_API_KEY` (or
+   any variable, named with `--api-key-env NAME`). The key is only sent over https, and never
+   appears in the trajectory, report or error messages.
+2. Give the model a price of 0, so the cost limit stays on for every other model. Save as
+   e.g. `~/.config/apifix/prices.toml`, one table per model you use:
+
+   ```toml
+   [models."llama-3.3-70b-versatile"]
+   input = 0
+   output = 0
+   cache_read = 0
+   cache_write = 0
+   ```
+
+3. List the current models (they change often) and run:
+
+```
+export APIFIX_LLM_API_KEY=...
+export APIFIX_PRICES=~/.config/apifix/prices.toml       # or --prices FILE
+curl -s https://api.example.com/openai/v1/models -H "Authorization: Bearer $APIFIX_LLM_API_KEY" \
+    | python3 -c 'import json,sys; print("\n".join(sorted(m["id"] for m in json.load(sys.stdin)["data"])))'
+apifix fix path/to/repo --migration openai-v1 --provider openai-compat \
+    --base-url https://api.example.com/openai/v1 --model llama-3.3-70b-versatile \
+    --edit-mode whole-file --max-output-tokens 6000
+```
+
+`--no-cost-limit` works too, but turns the limit off for that run whatever the model costs.
+
+Rate limits: free tiers allow a few dozen requests and a few thousand tokens per minute per
+model (see https://console.example.com/settings/limits). On HTTP 429 apifix waits as long as
+the server asks (`Retry-After`, or "try again in 7.5s"), or backs off 2, 4, 8 ... 60 s, and
+retries: up to 6 times per request, each wait at most 2 minutes. The waits are not failures;
+the report notes how many there were. A daily or quota limit stops the job at once with the
+server's message. Each request also counts the reply tokens it allows for (16,000 by default)
+against the per-minute token limit on some servers. If requests are refused as too large
+(HTTP 413), lower `--max-output-tokens` (a whole file needs roughly its size / 3 tokens) or
+`--max-file-bytes`.
+
 `apifix cleanup` removes sandbox containers and temp dirs that an interrupted run (crash,
 kill, power loss) left behind. Runs that are still in progress are not touched: each one holds
 a lock that the operating system releases when the process dies. Use `--dry-run` to see what

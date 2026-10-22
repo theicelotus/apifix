@@ -4,7 +4,7 @@ apifix scan <path> --migration openai-v1 [--json]
 apifix fix <path> --migration openai-v1 [--model M] [--max-cost USD] [--out DIR]
     [--edit-mode agent|whole-file] [--max-file-bytes N]
 apifix fix <path> --migration openai-v1 --provider openai-compat --model M [--base-url URL]
-    [--strict-tool-calls]
+    [--strict-tool-calls] [--api-key-env NAME] [--request-timeout S] [--max-output-tokens N]
 apifix cleanup [--dry-run]      remove containers/temp dirs left by interrupted runs
 """
 
@@ -60,6 +60,12 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         help="seconds to wait for one LLM reply (default 600; openai-compat on a local "
         "endpoint: 3600)",
+    )
+    p_fix.add_argument(
+        "--max-output-tokens",
+        type=int,
+        help="reply tokens each LLM request allows for (default 16000); lower it when a hosted "
+        "free tier counts them against a per-minute token limit",
     )
     p_fix.add_argument(
         "--edit-mode",
@@ -139,6 +145,9 @@ def _fix(args: argparse.Namespace) -> int:
     if args.request_timeout is not None and args.request_timeout <= 0:
         print("apifix: --request-timeout must be positive", file=sys.stderr)
         return EXIT_USAGE
+    if args.max_output_tokens is not None and args.max_output_tokens <= 0:
+        print("apifix: --max-output-tokens must be positive", file=sys.stderr)
+        return EXIT_USAGE
     options = {
         key: value
         for key, value in (
@@ -155,12 +164,19 @@ def _fix(args: argparse.Namespace) -> int:
         if notice:
             print(notice, file=sys.stderr)
         max_cost = None if args.no_cost_limit else args.max_cost
-        whole_file = {"whole_file_max_bytes": args.max_file_bytes} if args.max_file_bytes else {}
+        limits = {
+            key: value
+            for key, value in (
+                ("whole_file_max_bytes", args.max_file_bytes),
+                ("max_output_tokens", args.max_output_tokens),
+            )
+            if value is not None
+        }
         config = AgentConfig(
             max_cost_usd=max_cost,
             max_retries=args.max_retries,
             edit_mode=args.edit_mode,
-            **whole_file,
+            **limits,
         )
         result = fix(args.path, args.migration, llm=llm, sandbox=Sandbox(), config=config)
     except (LLMError, ValueError) as exc:

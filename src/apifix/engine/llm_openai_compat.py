@@ -5,7 +5,11 @@ hosted free tiers. Plain stdlib HTTP, no SDK.
   table (TOML); token and tool-call limits apply either way.
 - An optional API key comes from the host environment (``APIFIX_LLM_API_KEY`` or a variable
   named with ``api_key_env``). It is never sent over plain http to a remote host and never
-  appears in errors, notes or the trajectory.
+  appears in errors, notes or the trajectory (server error messages are scrubbed of it).
+- Rate limits (HTTP 429, e.g. hosted free tiers) are waited out inside the provider, as long as
+  the server says (``Retry-After``, ``retry-after-ms`` or "try again in 7.5s") or with
+  exponential backoff, so the agent sees a slow request rather than a failure. Daily / quota
+  limits and waits longer than ``RATE_LIMIT_MAX_WAIT_S`` stop the job with a clear error.
 - ``preflight()`` checks that the model really makes tool calls before the job spends time on a
   sandbox install, and (for Ollama) reads the runtime context window so a too-small one fails
   loudly instead of silently truncating the prompt.
@@ -18,6 +22,7 @@ hosted free tiers. Plain stdlib HTTP, no SDK.
 
 from __future__ import annotations
 
+import email.utils
 import ipaddress
 import json
 import os
@@ -27,7 +32,7 @@ import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -49,6 +54,17 @@ API_KEY_ENV = "APIFIX_LLM_API_KEY"
 MAX_RESPONSE_BYTES = 20_000_000
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 RETRY_DELAYS_S = (1.0, 4.0)
+# HTTP 429: waits per request when the server gives no hint; the longest single wait accepted.
+RATE_LIMIT_BACKOFF_S = (2.0, 4.0, 8.0, 16.0, 32.0, 60.0)
+RATE_LIMIT_MAX_WAIT_S = 120.0
+RATE_LIMIT_NOTE = "rate limited by the server"
+# A 429 for a daily or account quota: waiting minutes would not help.
+_DAILY_LIMIT = re.compile(
+    r"per day|\b(?:RPD|TPD)\b|daily|insufficient_quota|exceeded your current quota", re.I
+)
+_TRY_AGAIN = re.compile(r"try again in ((?:\d+(?:\.\d+)?(?:ms|h|m|s))+)", re.I)
+_DURATION_PART = re.compile(r"(\d+(?:\.\d+)?)(ms|h|m|s)")
+_DURATION_UNIT_S = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
 # Seconds to wait for one reply. Local models on CPU can need far longer than hosted ones for a
 # whole file (prompt evaluation plus several thousand output tokens at a few tokens a second).
 LOCAL_TIMEOUT_S = 3600.0
@@ -100,6 +116,7 @@ class HTTPRequest:
 class HTTPResponse:
     status: int
     body: bytes
+    headers: Mapping[str, str] = field(default_factory=dict)  # names lower-cased
 
 
 class ConnectFailed(Exception):
@@ -127,15 +144,19 @@ def urllib_transport(req: HTTPRequest) -> HTTPResponse:
     )
     try:
         with _OPENER.open(request, timeout=req.timeout_s) as resp:
-            return HTTPResponse(resp.status, _read_bounded(resp))
+            return HTTPResponse(resp.status, _read_bounded(resp), _lower_keys(resp.headers))
     except urllib.error.HTTPError as exc:
-        return HTTPResponse(exc.code, _read_bounded(exc))
+        return HTTPResponse(exc.code, _read_bounded(exc), _lower_keys(exc.headers))
     except urllib.error.URLError as exc:  # raised while connecting / sending (incl. timeouts)
         raise ConnectFailed(str(exc.reason)) from exc
     except TimeoutError as exc:  # waiting for or reading the reply
         raise RequestTimedOut(str(exc) or "timed out") from exc
     except ConnectionError as exc:
         raise ConnectFailed(str(exc) or type(exc).__name__) from exc
+
+
+def _lower_keys(headers: Any) -> dict[str, str]:
+    return {str(k).lower(): str(v) for k, v in (headers or {}).items()}
 
 
 def _read_bounded(stream: Any) -> bytes:
@@ -205,6 +226,8 @@ class OpenAICompatLLM:
         self.context_window: int | None = None
         self._requests = 0
         self._usage_estimated = False
+        self.rate_limit_waits = 0
+        self.rate_limit_wait_s = 0.0
 
         self._key = os.environ.get(api_key_env) or None
         if self._key and parts.scheme == "http" and not self.local:
@@ -268,6 +291,7 @@ class OpenAICompatLLM:
             self.timeout_s,
         )
         delays = list(RETRY_DELAYS_S) if retry else []
+        backoff = list(RATE_LIMIT_BACKOFF_S) if retry else []
         while True:
             try:
                 resp = self.transport(req)
@@ -276,7 +300,9 @@ class OpenAICompatLLM:
                     self.sleep(delays.pop(0))
                     continue
                 hint = " (is Ollama running? `ollama serve`)" if self.local else ""
-                raise LLMError(f"no server at {self.endpoint}{hint}: {exc}") from None
+                raise LLMError(
+                    f"no server at {self.endpoint}{hint}: {self._scrub(str(exc))}"
+                ) from None
             except RequestTimedOut:
                 # Not retried: the server is up but slow, and a retry would wait just as long.
                 raise LLMError(
@@ -285,22 +311,82 @@ class OpenAICompatLLM:
                     "slow or CPU-only machine can take longer). Raise the limit with "
                     "--request-timeout SECONDS"
                 ) from None
-            if resp.status in RETRY_STATUSES and delays:
-                self.sleep(delays.pop(0))
-                continue
             try:
                 data = json.loads(resp.body.decode("utf-8")) if resp.body else None
             except (UnicodeDecodeError, ValueError):
                 data = None
+            if resp.status == 429 and retry:
+                self._wait_for_rate_limit(resp, data, backoff)
+                continue
+            if resp.status in RETRY_STATUSES and delays:
+                self.sleep(delays.pop(0))
+                continue
             return resp.status, data
 
-    def _error(self, status: int, data: Any) -> LLMError:
+    def _wait_for_rate_limit(self, resp: HTTPResponse, data: Any, backoff: list[float]) -> None:
+        """Sleep as long as the server asks (or the next backoff step), or raise when waiting
+        cannot help: a daily / quota limit, a wait over RATE_LIMIT_MAX_WAIT_S, or no retries
+        left. Waits are not failures: the agent only sees the eventual reply."""
+        message = self._server_message(data)
+        asked = server_wait_s(resp.headers, message)
+        shown = f" ({message})" if message else ""
+        after = f"; the server says to try again in {_format_wait(asked)}" if asked else ""
+        if _DAILY_LIMIT.search(message):
+            raise LLMError(
+                f"daily or quota limit reached on {self.endpoint}{shown}{after}. apifix "
+                "stopped instead of waiting. Try again after the limit resets, or use another "
+                "model (free-tier limits are often per model) or provider"
+            )
+        if asked is not None and asked > RATE_LIMIT_MAX_WAIT_S:
+            raise LLMError(
+                f"rate limited by {self.endpoint}{shown}{after}, longer than apifix waits "
+                f"({RATE_LIMIT_MAX_WAIT_S:,.0f} s). Try again later, or use another model or "
+                "provider"
+            )
+        if not backoff:
+            raise LLMError(
+                f"rate limited by {self.endpoint} {len(RATE_LIMIT_BACKOFF_S) + 1} times in a "
+                f"row for one request{shown}. Try again later, or use another model or provider"
+            )
+        step = backoff.pop(0)
+        wait = max(asked, 1.0) if asked is not None else step
+        self.sleep(wait)
+        self.rate_limit_waits += 1
+        self.rate_limit_wait_s += wait
+        self.notes[:] = [n for n in self.notes if not n.startswith(RATE_LIMIT_NOTE)]
+        self.notes.append(
+            f"{RATE_LIMIT_NOTE} {self.rate_limit_waits} time(s); apifix waited "
+            f"{self.rate_limit_wait_s:,.0f} s in total and retried (request durations include "
+            "the waits)"
+        )
+
+    def _scrub(self, text: str) -> str:
+        """`text` without the API key (some servers echo a rejected key in their message)."""
+        return text.replace(self._key, "[API key]") if self._key else text
+
+    def _server_message(self, data: Any) -> str:
         message = ""
         if isinstance(data, dict):
             err = data.get("error", data.get("message", ""))
             message = err.get("message", "") if isinstance(err, dict) else str(err)
-        message = message[:500] if message else "(no error message)"
+        return self._scrub(message[:500])
+
+    def _error(self, status: int, data: Any, *, max_tokens: int | None = None) -> LLMError:
+        message = self._server_message(data) or "(no error message)"
         low = message.lower()
+        if status == 413 or "request too large" in low:
+            reserved = (
+                f" This request allows for up to {max_tokens:,} reply tokens, which some "
+                "servers count as well."
+                if max_tokens
+                else ""
+            )
+            return LLMError(
+                f"HTTP {status} from {self.endpoint}: {message}. One request is larger than "
+                f"the server accepts (on free tiers, usually the per-minute token limit).{reserved}"
+                " Lower --max-output-tokens or --max-file-bytes, or use a model with a "
+                "higher limit"
+            )
         if "does not support tools" in low or ("tool" in low and "not support" in low):
             return LLMError(
                 f"model {self.model} does not support tool calls ({message}). Use a "
@@ -375,7 +461,7 @@ class OpenAICompatLLM:
             )
         status, data = self._call("POST", "/chat/completions", body)
         if status != 200:
-            raise self._error(status, data)
+            raise self._error(status, data, max_tokens=max_tokens)
         response = self._parse(data, body, tools)
         self._requests += 1
         if self._requests == 1 and not self._usage_estimated:
@@ -657,3 +743,49 @@ def count_text_tool_calls(text: str, tools: Sequence[ToolSpec]) -> int:
     if len(values) >= 2 and all(_call_shape(v, tools) for v in values):
         return len(values)
     return 0
+
+
+# --- rate limits ------------------------------------------------------------------------------
+
+
+def parse_duration(text: str) -> float | None:
+    """Seconds in a Go-style duration ("7.66s", "1m26.4s", "250ms", "2h0m"), else None."""
+    parts = _DURATION_PART.findall(text)
+    if not parts or "".join(n + u for n, u in parts) != text:
+        return None
+    return sum(float(n) * _DURATION_UNIT_S[u] for n, u in parts)
+
+
+def server_wait_s(
+    headers: Mapping[str, str], message: str, now: float | None = None
+) -> float | None:
+    """How long a rate-limited server asks to wait: ``retry-after-ms``, ``Retry-After``
+    (seconds or an HTTP date), or "try again in <duration>" in its message; None if it says
+    nothing usable."""
+    ms = headers.get("retry-after-ms", "").strip()
+    try:
+        if ms:
+            return max(0.0, float(ms) / 1000)
+    except ValueError:
+        pass
+    after = headers.get("retry-after", "").strip()
+    if after:
+        try:
+            return max(0.0, float(after))
+        except ValueError:
+            pass
+        try:
+            when = email.utils.parsedate_to_datetime(after)
+        except (TypeError, ValueError):
+            when = None
+        if when is not None and when.tzinfo is not None:
+            return max(0.0, when.timestamp() - (time.time() if now is None else now))
+    match = _TRY_AGAIN.search(message)
+    return parse_duration(match.group(1)) if match else None
+
+
+def _format_wait(seconds: float) -> str:
+    if seconds < 120:
+        return f"{seconds:,.0f} s" if seconds >= 10 else f"{seconds:,.1f} s"
+    minutes = seconds / 60
+    return f"{minutes:,.0f} min" if minutes < 120 else f"{minutes / 60:,.1f} h"

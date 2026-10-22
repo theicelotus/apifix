@@ -30,8 +30,9 @@ src/apifix/
   cli.py              `apifix scan <path> --migration openai-v1 [--json]`,
                       `apifix fix <path> --migration openai-v1 [--model] [--max-cost] [--out]`,
                       (openai-compat: `--base-url`, `--strict-tool-calls`,
-                      `--request-timeout`;
-                      `--edit-mode agent|whole-file`, `--max-file-bytes`),
+                      `--request-timeout`, `--api-key-env`;
+                      `--edit-mode agent|whole-file`, `--max-file-bytes`,
+                      `--max-output-tokens`),
                       `apifix cleanup [--dry-run]`
   api/                FastAPI app (later)
   worker/             background jobs (later)
@@ -398,6 +399,19 @@ Known limitations:
   the request's total time. A timeout is reported as one ("timed out after N s ... Raise the
   limit with --request-timeout") and is not retried; refused/reset connections are "no
   server" (resets retried twice).
+- HTTP 429: waited out inside the provider (the agent sees one slow request): `retry-after-ms`,
+  `Retry-After` (seconds or HTTP date), or "try again in <Go duration>" in the message, at
+  least 1 s; else backoff 2, 4, 8, 16, 32, 60 s. At most 6 waits per request, each at most
+  120 s (`RATE_LIMIT_MAX_WAIT_S`); a longer requested wait, a 7th 429 or a daily / quota
+  limit (message matches `per day`, `RPD`, `TPD`, `daily`, `insufficient_quota`, `exceeded
+  your current quota`) stops the job (`provider_error`). Only requests that allow retries
+  (chat completions, preflight); model listing and `/api/ps` do not wait. Waits count in
+  request `duration_s`; one job note keeps the running total. Other `x-ratelimit-*` headers
+  are not read, and nothing paces requests before the server refuses one.
+- HTTP 413 / "request too large" gets an error naming `--max-output-tokens` and
+  `--max-file-bytes` (some free tiers count the requested `max_tokens`, 16,000 by default,
+  against their per-minute token limit). Server error messages have the API key replaced by
+  `[API key]` before they reach errors.
 - Tool calls written as text (on unless `--strict-tool-calls`): used only when the server sent
   no structured call and the whole reply is one `{"name", "arguments"}` object (bare, in one
   ```` ```json ```` / ```` ``` ```` fence, or in one `<tool_call>` block) naming an offered tool,

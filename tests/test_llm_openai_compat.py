@@ -23,7 +23,9 @@ from apifix.engine.llm_openai_compat import (
     RequestTimedOut,
     count_text_tool_calls,
     is_local_host,
+    parse_duration,
     parse_text_tool_call,
+    server_wait_s,
     to_openai,
     urllib_transport,
 )
@@ -544,6 +546,170 @@ def test_base_url_from_env(monkeypatch):
     assert http.requests[0].url == "http://localhost:1234/v1/chat/completions"
 
 
+# --- rate limits (HTTP 429) ----------------------------------------------------------------------
+
+HOSTED = "https://api.example.com/openai/v1"
+FREE = {"qwen2.5-coder:7b": ModelInfo(0, 0, 0, 0)}
+
+
+def limited(message="", status=429, **headers):
+    body = json.dumps({"error": {"message": message, "code": "rate_limit_exceeded"}}).encode()
+    return HTTPResponse(status, body, {k.replace("_", "-"): v for k, v in headers.items()})
+
+
+def make_timed(*responses, **kw):
+    """Like make(), recording each wait."""
+    http, waits = FakeHTTP(list(responses)), []
+    llm = OpenAICompatLLM("qwen2.5-coder:7b", transport=http, sleep=waits.append, **kw)
+    return llm, http, waits
+
+
+@pytest.mark.parametrize(
+    ("text", "seconds"),
+    [("7.66s", 7.66), ("1m26.4s", 86.4), ("250ms", 0.25), ("2h0m", 7200.0), ("14m24s", 864.0)],
+)
+def test_parse_duration(text, seconds):
+    assert parse_duration(text) == pytest.approx(seconds)
+
+
+@pytest.mark.parametrize("text", ["", "7", "7.5 s", "s", "1m 2s", "7sx"])
+def test_parse_duration_rejects_other_text(text):
+    assert parse_duration(text) is None
+
+
+@pytest.mark.parametrize(
+    ("headers", "message", "seconds"),
+    [
+        ({"retry-after": "12"}, "", 12.0),
+        ({"retry-after": "1.5"}, "try again in 9s", 1.5),  # the header wins
+        ({"retry-after-ms": "2500", "retry-after": "3"}, "", 2.5),
+        ({"retry-after": "Thu, 01 Jan 2026 00:00:30 GMT"}, "", 30.0),
+        ({}, "Rate limit reached on tokens per minute (TPM). Please try again in 7.66s.", 7.66),
+        ({}, "Please try again in 1m26.4s. Need more tokens?", 86.4),
+        ({"retry-after": "soon"}, "", None),
+        ({}, "slow down", None),
+    ],
+)
+def test_server_wait(headers, message, seconds):
+    now = 1767225600.0  # 2026-01-01 00:00:00 UTC
+    assert server_wait_s(headers, message, now=now) == (
+        None if seconds is None else pytest.approx(seconds)
+    )
+
+
+def test_rate_limit_waits_as_the_server_says_and_retries():
+    llm, http, waits = make_timed(
+        limited("Rate limit reached for model on requests per minute (RPM)", retry_after="2"),
+        limited("Limit 6000, Used 5800, Requested 900. Please try again in 7.5s."),
+        reply("ok"),
+    )
+    assert complete(llm).text == "ok"
+    assert waits == [2.0, 7.5]
+    assert len(http.requests) == 3
+    assert llm.notes[-1].startswith("rate limited by the server 2 time(s); apifix waited 10 s")
+    assert sum(n.startswith("rate limited") for n in llm.notes) == 1  # one note, kept current
+
+
+def test_rate_limit_without_a_hint_backs_off_exponentially_then_stops():
+    llm, http, waits = make_timed(*[limited("slow down") for _ in range(7)], reply("never"))
+    with pytest.raises(LLMError) as exc:
+        complete(llm)
+    assert waits == [2.0, 4.0, 8.0, 16.0, 32.0, 60.0]
+    assert len(http.requests) == 7
+    assert "rate limited by http://localhost:11434/v1 7 times in a row" in str(exc.value)
+    assert "(slow down)" in str(exc.value)
+
+
+def test_a_zero_wait_still_pauses_briefly():
+    llm, _, waits = make_timed(limited(retry_after="0"), reply("ok"))
+    complete(llm)
+    assert waits == [1.0]
+
+
+def test_rate_limit_budget_is_per_request_and_separate_from_server_errors():
+    llm, http, waits = make_timed(
+        error(503, "busy"), limited(retry_after="5"), error(503, "busy"), reply("ok"),
+        limited(retry_after="5"), reply("again"),
+    )  # fmt: skip
+    assert complete(llm).text == "ok"
+    assert complete(llm).text == "again"
+    assert waits == [1.0, 5.0, 4.0, 5.0]
+    assert llm.rate_limit_waits == 2 and llm.rate_limit_wait_s == 10.0
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Rate limit reached for model `llama-3.3-70b-versatile` in organization `org_x` service "
+        "tier `on_demand` on tokens per day (TPD): Limit 100000, Used 99000, Requested 2000. "
+        "Please try again in 14m24s.",
+        "Rate limit reached on requests per day (RPD): Limit 1000, Used 1000, Requested 1. "
+        "Please try again in 1m26.4s.",
+        "You exceeded your current quota, please check your plan and billing details.",
+    ],
+)
+def test_daily_or_quota_limit_stops_with_a_clear_error(message):
+    llm, http, waits = make_timed(limited(message), reply("never"), base_url=HOSTED, models=FREE)
+    with pytest.raises(LLMError) as exc:
+        complete(llm)
+    text = str(exc.value)
+    assert text.startswith(f"daily or quota limit reached on {HOSTED} (")
+    assert "stopped instead of waiting" in text and "another model" in text
+    if "14m24s" in message:
+        assert "the server says to try again in 14 min" in text
+    assert waits == [] and len(http.requests) == 1
+
+
+def test_a_wait_longer_than_apifix_accepts_stops_with_the_time():
+    llm, http, waits = make_timed(limited("busy", retry_after="900"), reply("never"))
+    with pytest.raises(LLMError) as exc:
+        complete(llm)
+    assert "try again in 15 min, longer than apifix waits (120 s)" in str(exc.value)
+    assert waits == [] and len(http.requests) == 1
+
+
+def test_rate_limits_are_also_waited_out_in_preflight():
+    llm, _, waits = make_timed(limited(retry_after="3"), reply("OK"), HTTPResponse(404, b"{}"))
+    llm.preflight(require_tools=False)
+    assert waits == [3.0]
+
+
+def test_listing_models_does_not_wait_on_rate_limits():
+    llm, http, waits = make_timed(limited(retry_after="3"))
+    assert llm.list_models() == []
+    assert waits == [] and len(http.requests) == 1
+
+
+def test_request_too_large_names_the_limits():
+    message = (
+        "Request too large for model `qwen/qwen3-32b` in organization `org_x` service tier "
+        "`on_demand` on tokens per minute (TPM): Limit 6000, Requested 18000, please reduce "
+        "your message size and try again."
+    )
+    llm, http, waits = make_timed(limited(message, status=413), base_url=HOSTED, models=FREE)
+    with pytest.raises(LLMError) as exc:
+        complete(llm)
+    text = str(exc.value)
+    assert text.startswith(f"HTTP 413 from {HOSTED}: Request too large")
+    assert "up to 1,000 reply tokens" in text  # complete() asks for max_tokens=1000
+    assert "--max-output-tokens or --max-file-bytes" in text
+    assert waits == [] and len(http.requests) == 1
+
+
+def test_key_echoed_by_the_server_is_scrubbed(monkeypatch):
+    monkeypatch.setenv("APIFIX_LLM_API_KEY", "gsk_secret_456")
+    for response in (
+        error(401, "Invalid API Key: gsk_secret_456"),
+        limited("quota for key gsk_secret_456 per day"),
+        *[limited("key gsk_secret_456 slow down") for _ in range(7)],
+    ):
+        llm, _, _ = make_timed(response, *[response] * 6, base_url=HOSTED, models=FREE)
+        with pytest.raises(LLMError) as exc:
+            complete(llm)
+        assert "gsk_secret_456" not in str(exc.value) + json.dumps(llm.notes)
+        assert "[API key]" in str(exc.value)
+
+
 # --- the real urllib path, against a local HTTP server ------------------------------------------
 
 
@@ -563,6 +729,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return
         if self.path == "/v1/slow/chat/completions":
             time.sleep(0.5)
+        if self.path == "/v1/limited/chat/completions" and len(_Handler.seen) == 1:
+            data = json.dumps({"error": {"message": "Rate limit reached"}}).encode()
+            self.send_response(429)
+            self.send_header("Retry-After", "4")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         data = reply(None, [tool_call()], finish="tool_calls").body
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -589,6 +763,13 @@ def test_real_http_round_trip(server, monkeypatch):
     assert r.tool_calls[0].input == {"path": "app.py"}
     (path, auth, body) = _Handler.seen[0]
     assert (path, auth, body["model"]) == ("/v1/chat/completions", "Bearer sk-local", "m")
+
+
+def test_real_rate_limit_reads_retry_after(server):
+    waits = []
+    llm = OpenAICompatLLM("m", base_url=f"{server}/v1/limited", sleep=waits.append)
+    assert complete(llm).tool_calls[0].name == "read_file"
+    assert waits == [4.0] and len(_Handler.seen) == 2
 
 
 def test_redirects_are_not_followed(server):

@@ -715,6 +715,57 @@ def test_cli_timeout_alias_and_validation(repo, tmp_path, monkeypatch, capsys):
     assert "--request-timeout must be positive" in capsys.readouterr().err
 
 
+def test_rate_limits_are_waited_out_without_failing_the_attempt(repo, monkeypatch):
+    from apifix.engine.llm_openai_compat import HTTPResponse
+    from apifix.engine.sandbox import Sandbox
+    from tests.test_sandbox import FakeDocker, ok, pytest_run
+
+    canary = "gsk_CANARY_99"
+    monkeypatch.setenv("APIFIX_LLM_API_KEY", canary)
+    waits: list[float] = []
+    llm, seen = openai_compat_llm(tools(FIX_APP, FIX_REQS, FIX_TESTS), done(), sleep=waits.append)
+    message = f"Rate limit reached on tokens per minute (TPM) for {canary}. Try again in 7.5s."
+    limits = [
+        HTTPResponse(429, json.dumps({"error": {"message": message}}).encode()),
+        HTTPResponse(429, b"{}", {"retry-after": "3"}),
+    ]
+    inner, chats = llm.transport, []
+
+    def transport(req):
+        if req.url.endswith("/chat/completions"):
+            chats.append(req)
+            if len(chats) in (2, 3):  # the job's first request (after the preflight ping)
+                return limits.pop(0)
+        return inner(req)
+
+    llm.transport = transport
+    docker = FakeDocker(install=[ok() for _ in range(4)], test=pytest_run(passed=2))
+    result = go(repo, llm, Sandbox(docker=docker), max_cost_usd=0.01)
+    # weak only because the fake sandbox reports no coverage
+    assert (result.outcome, result.attempts) == ("verified_weak", 1)
+    assert waits == [7.5, 3.0]
+    assert len(result.trajectory["attempts"][0]["responses"]) == 2  # one reply per request
+    notes = result.trajectory["job"]["notes"]
+    assert any(n.startswith("rate limited by the server 2 time(s)") for n in notes)
+    assert "rate limited by the server 2 time(s)" in result.report_markdown
+    assert canary not in json.dumps(result.trajectory) + result.report_markdown
+
+
+def test_cli_max_output_tokens(repo, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        "apifix.engine.llm.get_llm",
+        lambda *a, **k: FakeLLM([tools(FIX_APP, FIX_REQS, FIX_TESTS), done()], price=None),
+    )
+    monkeypatch.setattr("apifix.engine.sandbox.Sandbox", lambda *a, **k: JudgingSandbox())
+    out = tmp_path / "out"
+    args = ["fix", str(repo), "--migration", "openai-v1", "--no-cost-limit", "--out", str(out)]
+    assert cli.main([*args, "--max-output-tokens", "6000"]) == 0
+    config = json.loads((out / "trajectory.json").read_text())["job"]["config"]
+    assert config["max_output_tokens"] == 6000
+    assert cli.main([*args, "--max-output-tokens", "0"]) == 2
+    assert "--max-output-tokens must be positive" in capsys.readouterr().err
+
+
 def test_cli_unpriced_hosted_endpoint_is_refused(repo, tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("APIFIX_LLM_API_KEY", raising=False)
     monkeypatch.delenv("APIFIX_PRICES", raising=False)
