@@ -16,6 +16,7 @@ from apifix.engine.llm import LLMError, Message, ModelInfo, ToolCall, ToolResult
 from apifix.engine.llm_openai_compat import (
     MAX_RESPONSE_BYTES,
     TEXT_CALLS_NOTE,
+    USER_AGENT,
     ConnectFailed,
     HTTPRequest,
     HTTPResponse,
@@ -492,6 +493,47 @@ def test_api_key_from_env(monkeypatch):
     assert http.requests[0].headers["Authorization"] == "Bearer sk-other"
 
 
+def test_every_request_sends_user_agent_and_accept():
+    from apifix import __version__
+
+    assert f"apifix/{__version__}" == USER_AGENT
+    llm, http = make(
+        reply("OK"),
+        HTTPResponse(200, json.dumps({"models": []}).encode()),  # /api/ps
+        reply("done"),
+        HTTPResponse(200, json.dumps({"data": [{"id": "m"}]}).encode()),  # /models
+    )
+    llm.preflight(require_tools=False)
+    complete(llm)
+    assert llm.list_models() == ["m"]
+    paths = [r.url.rsplit("11434", 1)[1] for r in http.requests]
+    assert paths == ["/v1/chat/completions", "/api/ps", "/v1/chat/completions", "/v1/models"]
+    for r in http.requests:
+        assert (r.headers["User-Agent"], r.headers["Accept"]) == (USER_AGENT, "application/json")
+
+
+@pytest.mark.parametrize("body", [b"", b"<html><body>Access denied</body></html>", b'"denied"'])
+def test_hosted_403_without_an_api_error_points_at_a_block_not_the_key(monkeypatch, body):
+    monkeypatch.setenv("APIFIX_LLM_API_KEY", "gsk_fine")
+    llm, _ = make(HTTPResponse(403, body), base_url="https://api.example.com/openai/v1")
+    with pytest.raises(LLMError) as exc:
+        complete(llm)
+    text = str(exc.value)
+    assert text.startswith("HTTP 403 from https://api.example.com/openai/v1 with an empty or non-JSON")
+    assert "probably blocked before it reached the API" in text
+    assert "firewall, a region restriction or a blocked client" in text
+    assert "check the API key" not in text and "gsk_fine" not in text
+
+
+def test_403_with_an_api_error_or_from_a_local_server_still_suggests_the_key():
+    hosted, _ = make(error(403, "Invalid API Key"), base_url="https://api.example.com/openai/v1")
+    with pytest.raises(LLMError, match=r"Invalid API Key \(check the API key\)"):
+        complete(hosted)
+    local, _ = make(HTTPResponse(403, b""))
+    with pytest.raises(LLMError, match=r"HTTP 403 .*\(check the API key\)"):
+        complete(local)
+
+
 def test_openai_api_key_is_never_read(monkeypatch):
     monkeypatch.delenv("APIFIX_LLM_API_KEY", raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-must-not-be-used")
@@ -715,6 +757,7 @@ def test_key_echoed_by_the_server_is_scrubbed(monkeypatch):
 
 class _Handler(http.server.BaseHTTPRequestHandler):
     seen: list = []
+    agents: list = []
 
     def log_message(self, *args):
         pass
@@ -722,6 +765,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         body = self.rfile.read(int(self.headers["Content-Length"]))
         _Handler.seen.append((self.path, self.headers.get("Authorization"), json.loads(body)))
+        _Handler.agents.append(self.headers.get("User-Agent"))
         if self.path == "/v1/redirect/chat/completions":
             self.send_response(302)
             self.send_header("Location", "http://example.com/steal")
@@ -752,6 +796,7 @@ def server():
     thread = threading.Thread(target=srv.serve_forever, daemon=True)
     thread.start()
     _Handler.seen = []
+    _Handler.agents = []
     yield f"http://127.0.0.1:{srv.server_address[1]}"
     srv.shutdown()
 
@@ -763,6 +808,7 @@ def test_real_http_round_trip(server, monkeypatch):
     assert r.tool_calls[0].input == {"path": "app.py"}
     (path, auth, body) = _Handler.seen[0]
     assert (path, auth, body["model"]) == ("/v1/chat/completions", "Bearer sk-local", "m")
+    assert _Handler.agents == [USER_AGENT]  # not urllib's default Python-urllib/3.x
 
 
 def test_real_rate_limit_reads_retry_after(server):

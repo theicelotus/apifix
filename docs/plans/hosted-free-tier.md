@@ -50,3 +50,14 @@ Committed with the full `pytest -q --docker` suite not green because of slow PyP
 (3 dependency installs in `tests/integration/test_verifier_docker.py` hit the 600 s limit; one
 smoke-check test failed once and passed alone). The Docker suite still needs a clean rerun
 when the network is faster.
+
+## Later change: User-Agent and blocked 403s
+
+Request: preflight against the hosted provider failed with "HTTP 403 ... (no error message) (check the API
+key)" although the key worked with curl; curl with `-A "Python-urllib/3.12"` also got 403, so
+the server's firewall blocks urllib's default User-Agent. Send `User-Agent: apifix/<version>`
+and `Accept: application/json` on every openai-compat request (chat, model list, `/api/ps`);
+when a hosted endpoint returns 403 with an empty or non-JSON body, say the request was
+probably blocked before reaching the API (firewall, region restriction, blocked client)
+instead of suggesting the key. Tests for the header and the message; fast suite and ruff only
+(the change does not touch the sandbox).

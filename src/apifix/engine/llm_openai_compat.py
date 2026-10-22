@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from apifix import __version__
 from apifix.engine.llm import (
     LLMError,
     LLMResponse,
@@ -51,6 +52,9 @@ from apifix.engine.llm import (
 DEFAULT_BASE_URL = "http://localhost:11434/v1"  # Ollama
 BASE_URL_ENV = "APIFIX_BASE_URL"
 API_KEY_ENV = "APIFIX_LLM_API_KEY"
+# Sent on every request: some hosted endpoints' firewalls block urllib's default
+# "Python-urllib/3.x" with a bare 403.
+USER_AGENT = f"apifix/{__version__}"
 MAX_RESPONSE_BYTES = 20_000_000
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 RETRY_DELAYS_S = (1.0, 4.0)
@@ -274,7 +278,11 @@ class OpenAICompatLLM:
     # --- HTTP -------------------------------------------------------------------------------
 
     def _headers(self) -> dict[str, str]:
-        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": USER_AGENT,
+        }
         if self._key:
             headers["Authorization"] = f"Bearer {self._key}"
         return headers
@@ -396,6 +404,13 @@ class OpenAICompatLLM:
             return LLMError(f"the prompt exceeds the server's context window: {message}")
         if status == 404 and ("model" in low or "not found" in low):
             return LLMError(self._model_help(f"model {self.model!r} not found ({message})"))
+        if status == 403 and not self.local and not isinstance(data, dict):
+            return LLMError(
+                f"HTTP 403 from {self.endpoint} with an empty or non-JSON reply: the request was "
+                "probably blocked before it reached the API (a firewall, a region restriction "
+                "or a blocked client), not refused because of the API key. Check that this "
+                "machine can reach the endpoint"
+            )
         if status in (401, 403):
             return LLMError(f"HTTP {status} from {self.endpoint}: {message} (check the API key)")
         return LLMError(f"HTTP {status} from {self.endpoint}: {message}")

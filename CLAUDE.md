@@ -412,6 +412,11 @@ Known limitations:
   `--max-file-bytes` (some free tiers count the requested `max_tokens`, 16,000 by default,
   against their per-minute token limit). Server error messages have the API key replaced by
   `[API key]` before they reach errors.
+- Every request sends `User-Agent: apifix/<version>` and `Accept: application/json` (the hosted provider's
+  firewall answers urllib's default `Python-urllib/3.x` with a bare 403). A 403 from a hosted
+  endpoint with an empty or non-JSON body is reported as probably blocked before the API
+  (firewall, region, blocked client), not as a key problem; a 403 with a JSON body, or from
+  a local server, still says to check the key.
 - Tool calls written as text (on unless `--strict-tool-calls`): used only when the server sent
   no structured call and the whole reply is one `{"name", "arguments"}` object (bare, in one
   ```` ```json ```` / ```` ``` ```` fence, or in one `<tool_call>` block) naming an offered tool,
