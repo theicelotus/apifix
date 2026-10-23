@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Protocol
 
 from apifix.engine.dependencies import DeclaredDependency
-from apifix.engine.models import Finding, SmokeCheck
+from apifix.engine.models import CompanionPin, Finding, SmokeCheck
 
 
 class Migration(Protocol):
@@ -38,10 +38,21 @@ class Migration(Protocol):
     # Runs in the sandbox after the fixed code's dependencies are installed (no network, no repo
     # code); a failure is reported to the model as a dependency problem. None: no check.
     smoke_check: SmokeCheck | None
+    # The migrated library's distribution name, the version spec apifix writes for a pin its
+    # dependency findings flag (no LLM involved), and, by normalised name, the library's own
+    # requirements whose pins apifix raises in the same files when they allow none of the range.
+    package: str
+    pin_spec: str
+    companion_pins: Mapping[str, CompanionPin]
 
     def job_guide(self, findings: list[Finding], root: Path | None = None) -> tuple[str, list[str]]:
         """The parts of `guide` these findings need, and the ids of those parts. `root`: the
         repo, for recognising test files by content."""
+        ...
+
+    def guide_text(self, part_ids: Iterable[str]) -> str:
+        """The guide's title and the parts `part_ids` (for a request that needs parts the job's
+        system prompt left out)."""
         ...
 
     def check_python(

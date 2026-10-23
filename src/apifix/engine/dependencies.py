@@ -393,10 +393,22 @@ def _from_requirement_list(text: str, reqs: Iterable[object]) -> Iterator[Declar
 # --- per-format parsers ---------------------------------------------------------------------
 
 
+# per-requirement options after a requirement (`--hash=...`, `--config-settings ...`)
+REQUIREMENT_OPTIONS = re.compile(r"\s+--[A-Za-z].*$")
+
+
+def requirement_line(line: str) -> str:
+    """A requirements-file line without its comment, a trailing `\\` (continuation) and
+    per-requirement options, so that `openai==0.28.1 \\` (hashes on the next lines) and
+    `openai==0.28.1 --hash=sha256:...` still read as `openai==0.28.1`."""
+    req = _strip_comment(line).removesuffix("\\").rstrip()
+    return req if req.startswith("-") else REQUIREMENT_OPTIONS.sub("", req)
+
+
 def _parse_requirements(text: str) -> list[DeclaredDependency]:
     deps = []
     for i, line in enumerate(text.splitlines(), 1):
-        stripped = line.strip()
+        stripped = requirement_line(line)
         dep = _from_requirement(stripped, i, len(line) - len(line.lstrip()) + 1)
         if dep:
             deps.append(dep)

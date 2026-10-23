@@ -31,6 +31,18 @@ class SmokeCheck:
     description: str
 
 
+@dataclass(frozen=True)
+class CompanionPin:
+    """What the migrated library needs from one of its own requirements: versions
+    `>= minimum` and `< upper`. A repo pin that allows none of them holds the library back, and
+    apifix raises it to that range; with `keep_major`, to the part of it within the pin's
+    current major version (so code written for that major keeps working)."""
+
+    minimum: str
+    upper: str
+    keep_major: bool = False
+
+
 @dataclass(frozen=True, order=True)
 class Finding:
     """One place in a repo that must change.

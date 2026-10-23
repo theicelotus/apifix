@@ -601,3 +601,18 @@ def test_platform_only_packages():
     assert platform_only("pywin32") == "Windows only"
     assert platform_only("pyobjc-ish") == "macOS only"  # the pyobjc-* family
     assert platform_only("objc") is None and platform_only("requests") is None
+
+
+def test_requirements_with_hashes_and_continuations_are_read():
+    text = (
+        "openai==0.28.1 \\\n"
+        "    --hash=sha256:aaaa \\\n"
+        "    --hash=sha256:bbbb\n"
+        "rich==13.0 --hash=sha256:cccc  # pinned\n"
+        "--require-hashes\n"
+    )
+    deps = parse_dependency_file("requirements.txt", text)
+    assert [(d.name, d.clauses, d.line, d.raw) for d in deps] == [
+        ("openai", (("==", "0.28.1"),), 1, "openai==0.28.1"),
+        ("rich", (("==", "13.0"),), 4, "rich==13.0"),
+    ]

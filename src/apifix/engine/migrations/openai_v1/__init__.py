@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from collections.abc import Iterable
 from pathlib import Path
 
 from apifix.engine.dependencies import DeclaredDependency, entirely_below
@@ -50,9 +51,15 @@ class OpenAIV1Migration:
 
     known_imports = rules.KNOWN_IMPORTS
     mock_responses = rules.MOCK_RESPONSES
+    package = rules.PACKAGE
+    pin_spec = rules.PIN_SPEC
+    companion_pins = rules.COMPANION_PINS
 
     def job_guide(self, findings: list[Finding], root: Path | None = None) -> tuple[str, list[str]]:
         return guide_parts.job_guide(findings, root)
+
+    def guide_text(self, part_ids: Iterable[str]) -> str:
+        return guide_parts.parts_text(part_ids)
 
     def check_python(
         self,

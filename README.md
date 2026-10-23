@@ -46,6 +46,22 @@ library back (e.g. `typing_extensions==4.5.0` forcing an old openai). If the lib
 installed at all because no dependency file apifix reads declares it, the report says that
 instead (verdict "unverified"); if the fix removed its declaration, the fix is rejected.
 
+### Dependency pins
+
+apifix sets the migrated library's pin itself, with no LLM call (`openai>=1.0,<2` for
+openai-v1), in every format it reads: requirements files, `pyproject.toml` (`[project]`,
+dependency groups, Poetry, pixi), `pixi.toml`, `Pipfile`, `setup.py`/`setup.cfg` string
+literals and an `environment.yml` `pip:` list. Only the version is rewritten; names, extras,
+markers, comments, quoting and line endings stay as they were, and every edit is checked by
+parsing the file again. In the same files, pins of openai's own requirements that would hold it
+back are raised to what openai needs (e.g. `typing_extensions==4.5.0` ->
+`typing_extensions>=4.11,<5`; pydantic stays on its major version). The report lists each pin
+apifix set ("apifix set: requirements.txt:3 openai==0.28.1 -> openai>=1.0,<2"). Entries it
+cannot rewrite safely (continuation lines, escaped TOML strings, non-literal `setup.py` values)
+go to the model as before, and the report says why; hash-pinned requirements files are left
+for a manual update. Conda entries and lockfiles are never edited: the report names conda
+entries that would conflict and lockfiles to regenerate.
+
 ### Dependencies in the sandbox
 
 apifix reads `pyproject.toml` (`[project]`, dependency groups, Poetry, and pixi's
@@ -138,7 +154,9 @@ parse as Python (or as a dependency file), differ from the original when it has 
 findings, contain no placeholders such as `# ... rest unchanged`, use no name it never imports
 or defines, and (test files) patch neither a repo-module name that does not exist nor the
 function the test calls; the error names the target to patch instead where it can, and a
-failing file gets it back once. All files are then verified together exactly as in agent mode,
+failing file gets it back once (a fresh request with the rejected version as a diff, not the
+whole rejected file). Dependency files whose only findings are pins apifix set are not sent.
+All files are then verified together exactly as in agent mode,
 and a failed verification starts the next attempt from the original files, with the failing
 test output and each file's previous version as a diff.
 

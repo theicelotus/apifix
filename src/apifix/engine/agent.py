@@ -18,7 +18,7 @@ import math
 import shutil
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -39,6 +39,13 @@ from apifix.engine.llm import (
 )
 from apifix.engine.migrations import Migration, get_migration
 from apifix.engine.models import Finding
+from apifix.engine.pin_edits import (
+    PinFallback,
+    PinFile,
+    fallback_line,
+    pin_line,
+    plan_pin_edits,
+)
 from apifix.engine.project import ci_env_vars
 from apifix.engine.sandbox import Sandbox, SandboxResult
 from apifix.engine.scanner import scan
@@ -58,7 +65,6 @@ from apifix.engine.whole_file import (
     DEFAULT_MAX_BYTES,
     as_file,
     check_candidate,
-    check_retry_message,
     context_candidates,
     error_key,
     file_prompt,
@@ -66,6 +72,7 @@ from apifix.engine.whole_file import (
     join_errors,
     must_change,
     parse_code_block,
+    pins_note,
     previous_version_note,
     reply_budget,
     select_context,
@@ -223,7 +230,13 @@ def tool_call_example(findings: list[Finding]) -> str:
     )
 
 
-def task_prompt(findings: list[Finding]) -> str:
+def task_prompt(
+    findings: list[Finding],
+    pins_set: Sequence[str] = (),
+    manual: Sequence[str] = (),
+) -> str:
+    """`findings`: those the model must handle. `pins_set`: pins apifix already set
+    (pin_line form); `manual`: entries left for a manual update (fallback_line form)."""
     lines = [
         "Migrate this repository. The scanner found these call sites "
         "(file:line, category [confidence]):",
@@ -233,6 +246,19 @@ def task_prompt(findings: list[Finding]) -> str:
         lines.append(f"- {f.file}:{f.line}: {f.category} [{f.confidence}]")
         lines.append(f"    old: {f.old_pattern}")
         lines.append(f"    fix: {f.suggestion}")
+    if pins_set:
+        lines += [
+            "",
+            "Already done by apifix (pins set; change them only if verification reports a "
+            "dependency problem):",
+            *(f"- {line}" for line in pins_set),
+        ]
+    if manual:
+        lines += [
+            "",
+            "Left for a manual update by the user (do not edit these entries):",
+            *(f"- {line}" for line in manual),
+        ]
     files = sorted({f.file for f in findings})
     lines += [
         "",
@@ -317,6 +343,19 @@ class _Job:
         self.sandbox_seconds = 0.0
         self.baseline_seconds = 0.0
         self.lowered_requests = 0  # requests retried with fewer reply tokens (RequestTooLarge)
+        # Dependency pins apifix set itself (pin_edits): the files written into the working
+        # copy, the entries it did not set, the files it never sends (hash-pinned), and the
+        # findings the model still has to handle.
+        self.pin_files: list[PinFile] = []
+        self.pin_fallbacks: list[PinFallback] = []
+        self.manual_files: set[str] = set()
+        self.open_findings: list[Finding] = list(findings)
+        # whole-file: dependency files apifix set completely (not sent unless a verification
+        # implicates them), every file in send order, and the job guide's text
+        self.wf_pinned: list[str] = []
+        self.wf_all: list[str] = []
+        self.wf_guide = ""
+        self.preflight_done = False
 
     # --- budget -----------------------------------------------------------------------------
 
@@ -546,10 +585,9 @@ class _Job:
         accepted (the tree is ready to verify); False when one failed its checks, which ends
         the attempt: that file and the ones after it stay pending for the next attempt."""
         pending = self.wf_pending
-        attempt.kept_files = [p for p in self.wf_files if p not in pending]
+        attempt.kept_files = [p for p in self.wf_all if p not in pending]
         for i, path in enumerate(pending):
             entry, candidate = self._whole_file_request(attempt, path)
-            attempt.files.append(entry)
             if not entry["accepted"]:
                 rest = {p: self.wf_previous[p] for p in pending[i + 1 :] if p in self.wf_previous}
                 self.wf_pending = pending[i:]
@@ -560,12 +598,12 @@ class _Job:
 
     def _after_rejection(self, number: int, v: Verification) -> None:
         """Whole-file: what the next attempt sends. Every file again, from the original with
-        the previous version as a diff, except accepted dependency files the verification did
-        not implicate."""
+        the previous version as a diff, except dependency files (accepted, or set by apifix)
+        the verification did not implicate."""
         self.wf_feedback = verification_feedback(number, v, hints=self.migration.failure_hints)
         self.wf_dependency_feedback = verification_feedback(number, v, dependency_file=True)
         self.wf_pending = [
-            p for p in self.wf_files if not is_dependency_file(p) or _dependency_problem(p, v)
+            p for p in self.wf_all if not is_dependency_file(p) or _dependency_problem(p, v)
         ]
         self.wf_previous = {p: (self._read(self.work, p), "") for p in self.wf_pending}
 
@@ -573,8 +611,12 @@ class _Job:
         return (root / path).read_bytes().decode("utf-8")
 
     def _whole_file_request(self, attempt: Attempt, path: str) -> tuple[dict[str, Any], str | None]:
-        """One file's conversation: the entry for the trajectory, and the last candidate the
-        model returned (None if no reply had a usable code block)."""
+        """One file's requests: the entry for the trajectory (also appended to the attempt, so
+        a request that aborts the job is recorded too), and the last candidate the model
+        returned (None if no reply had a usable code block). A candidate that fails a check is
+        sent back once as a fresh request: the same request with the candidate as a diff
+        against the original and the error, instead of continuing the conversation (which
+        would carry the whole rejected file)."""
         original = self._read(self.repo, path)
         required = must_change(path, self.findings)
         updated = [
@@ -588,20 +630,40 @@ class _Job:
         if path in self.wf_previous:
             text, reason = self.wf_previous[path]
             previous = previous_version_note(path, original, text, reason)
-        dependency = is_dependency_file(path)
         tokens = file_tokens(original, self._read(self.work, path))
         max_tokens = reply_budget(tokens, self.config.max_output_tokens)
-        prompt = file_prompt(
-            path,
-            original,
-            self.findings,
-            summary=self.migration.summary,
-            context=context,
-            required=required,
-            feedback=self.wf_dependency_feedback if dependency else self.wf_feedback,
-            previous=previous,
-        )
-        messages = [Message("user", text=prompt)]
+        guide = self._extra_guide(path)
+
+        def request(previous: str) -> tuple[Message, dict[str, int]]:
+            dependency = is_dependency_file(path)
+            feedback = self.wf_dependency_feedback if dependency else self.wf_feedback
+            prompt = file_prompt(
+                path,
+                original,
+                self.findings,
+                summary=self.migration.summary,
+                context=context,
+                required=required,
+                feedback=feedback,
+                previous=previous,
+                guide=guide,
+            )
+            parts = {
+                "rules": len(self.system) - len(self.wf_guide),
+                "guide": len(self.wf_guide),
+                "file_guide": len(guide),
+                "feedback": len(feedback),
+                "file": len(original),
+                "previous": len(previous),
+                "context": sum(len(text) for _, text in context),
+            }
+            in_prompt = ("file_guide", "feedback", "file", "previous", "context")
+            parts["findings_and_instructions"] = len(prompt) - sum(parts[k] for k in in_prompt)
+            return Message("user", text=prompt), parts
+
+        first, parts = request(previous)
+        messages = [first]
+        sent = [first]  # every message of the file's requests, in order
         entry: dict[str, Any] = {
             "path": path,
             "bytes_sent": own_bytes,
@@ -610,89 +672,115 @@ class _Job:
             "previous_version_sent": bool(previous),
             "change_required": required,
             "max_tokens": max_tokens,
+            "prompt_parts": parts,
             "replies": [],
             "accepted": False,
             "error": "",
         }
+        attempt.files.append(entry)
         retries = 0
         candidate: str | None = None
-        while True:
-            response = self._call_llm(attempt, messages, max_tokens=max_tokens, need_tokens=tokens)
-            if response.stop_reason == "refusal":
-                raise _Abort("refusal", f"the model declined the request ({response.refusal})")
-            parsed = parse_code_block(response.text, truncated=response.stop_reason == "max_tokens")
-            reply: dict[str, Any] = {
-                "response": len(attempt.responses) - 1,
-                "parse": parsed.outcome,
-            }
-            entry["replies"].append(reply)
-            if parsed.outcome != "ok":
-                if (
-                    parsed.outcome != "truncated"
-                    and self._nudges(attempt, "code_block") < self.config.max_code_block_nudges
-                ):
-                    attempt.nudges.append(
-                        {
-                            "kind": "code_block",
-                            "file": path,
-                            "outcome": parsed.outcome,
-                            "response": reply["response"],
-                            "message": CODE_BLOCK_NUDGE,
-                        }
-                    )
-                    messages.append(Message("user", text=CODE_BLOCK_NUDGE))
-                    continue
-                entry["error"] = _PARSE_ERRORS[parsed.outcome]
+        try:
+            while True:
+                response = self._call_llm(
+                    attempt, messages, max_tokens=max_tokens, need_tokens=tokens
+                )
+                sent.append(messages[-1])
+                if response.stop_reason == "refusal":
+                    raise _Abort("refusal", f"the model declined the request ({response.refusal})")
+                parsed = parse_code_block(
+                    response.text, truncated=response.stop_reason == "max_tokens"
+                )
+                reply: dict[str, Any] = {
+                    "response": len(attempt.responses) - 1,
+                    "parse": parsed.outcome,
+                }
+                entry["replies"].append(reply)
+                if parsed.outcome != "ok":
+                    if (
+                        parsed.outcome != "truncated"
+                        and self._nudges(attempt, "code_block") < self.config.max_code_block_nudges
+                    ):
+                        attempt.nudges.append(
+                            {
+                                "kind": "code_block",
+                                "file": path,
+                                "outcome": parsed.outcome,
+                                "response": reply["response"],
+                                "message": CODE_BLOCK_NUDGE,
+                            }
+                        )
+                        messages.append(Message("user", text=CODE_BLOCK_NUDGE))
+                        sent.append(messages[-1])
+                        continue
+                    entry["error"] = _PARSE_ERRORS[parsed.outcome]
+                    break
+                candidate = as_file(parsed.body, original)
+                result = check_candidate(
+                    path,
+                    original,
+                    candidate,
+                    required=required,
+                    read_module=self._working_copy_reader(path, candidate),
+                    library_modules=self.migration.api_modules,
+                    known_imports=self.known_imports,
+                    mock_responses=self.migration.mock_responses,
+                    module_roots=module_roots(
+                        path, self.baseline.import_paths if self.baseline else ()
+                    ),
+                )
+                reply["checks"] = result.checks
+                reply["auto_imports"] = result.auto_imports
+                candidate = result.text
+                if not result.ok:
+                    error = join_errors(result.errors)
+                    history = self.wf_error_history.setdefault(path, [])
+                    current = {error_key(e) for e in result.errors}
+                    keep_fixed = [k for k in history if k not in current]
+                    history += [
+                        k for k in dict.fromkeys(map(error_key, result.errors)) if k not in history
+                    ]
+                    if retries < self.config.max_check_retries_per_file:
+                        retries += 1
+                        note = previous_version_note(path, original, candidate, error, keep_fixed)
+                        retry, retry_parts = request(note)
+                        attempt.nudges.append(
+                            {
+                                "kind": "check_retry",
+                                "file": path,
+                                "error": error,
+                                "keep_fixed": keep_fixed,
+                                "response": reply["response"],
+                                "message": note,
+                                "prompt_parts": retry_parts,
+                            }
+                        )
+                        messages = [retry]
+                        sent.append(retry)
+                        continue
+                    entry["error"] = error
+                    break
+                (self.work / path).write_bytes(candidate.encode("utf-8"))
+                entry["auto_imports"] = result.auto_imports
+                entry["accepted"] = True
+                entry["changed"] = candidate != original
                 break
-            candidate = as_file(parsed.body, original)
-            result = check_candidate(
-                path,
-                original,
-                candidate,
-                required=required,
-                read_module=self._working_copy_reader(path, candidate),
-                library_modules=self.migration.api_modules,
-                known_imports=self.known_imports,
-                mock_responses=self.migration.mock_responses,
-                module_roots=module_roots(
-                    path, self.baseline.import_paths if self.baseline else ()
-                ),
-            )
-            reply["checks"] = result.checks
-            reply["auto_imports"] = result.auto_imports
-            candidate = result.text
-            if not result.ok:
-                error = join_errors(result.errors)
-                history = self.wf_error_history.setdefault(path, [])
-                current = {error_key(e) for e in result.errors}
-                keep_fixed = [k for k in history if k not in current]
-                history += [
-                    k for k in dict.fromkeys(map(error_key, result.errors)) if k not in history
-                ]
-                if retries < self.config.max_check_retries_per_file:
-                    retries += 1
-                    message = check_retry_message(path, error, keep_fixed)
-                    attempt.nudges.append(
-                        {
-                            "kind": "check_retry",
-                            "file": path,
-                            "error": error,
-                            "keep_fixed": keep_fixed,
-                            "response": reply["response"],
-                            "message": message,
-                        }
-                    )
-                    messages.append(Message("user", text=message))
-                    continue
-                entry["error"] = error
-                break
-            (self.work / path).write_bytes(candidate.encode("utf-8"))
-            entry["auto_imports"] = result.auto_imports
-            entry["accepted"] = True
-            entry["changed"] = candidate != original
-            break
-        entry["messages"] = [_message_dict(m) for m in messages]
+        except _Abort as abort:
+            entry["error"] = f"{abort.code}: {abort}"
+            raise _Abort(abort.code, f"{abort} (request for {path})") from abort
+        finally:
+            entry["messages"] = [_message_dict(m) for m in sent]
         return entry, candidate
+
+    def _extra_guide(self, path: str) -> str:
+        """Guide parts a file's request needs that the job's system prompt left out (a
+        dependency file apifix set, resent after a verification implicated it)."""
+        if self.guide_sections is None:
+            return ""
+        own = [f for f in self.findings if f.file == path]
+        _, ids = self.migration.job_guide(own, self.repo)
+        missing = [i for i in ids if i not in self.guide_sections]
+        return self.migration.guide_text(missing) if missing else ""
 
     def _working_copy_reader(self, path: str, candidate: str) -> Callable[[str], str | None]:
         """Repo files as they are now in the working copy (files accepted so far written),
@@ -745,24 +833,24 @@ class _Job:
                 f"no price for model {self.llm.model}: add it to the price table "
                 "(--prices / $APIFIX_PRICES; 0 for a free tier) or pass --no-cost-limit"
             )
+        self._set_pins()
         if self.whole_file:
-            selection = select_files(self.repo, self.findings, self.config.whole_file_max_bytes)
+            selection = select_files(
+                self.repo, self.open_findings, self.config.whole_file_max_bytes
+            )
             self.wf_files, self.wf_skipped = selection.files, selection.skipped
             self.wf_pending = list(self.wf_files)
-            if not self.wf_files:
+            deps = sorted(p for p in (*self.wf_pinned, *self.wf_files) if is_dependency_file(p))
+            self.wf_all = deps + [p for p in self.wf_files if not is_dependency_file(p)]
+            if not self.wf_files and not self.wf_pinned:
                 return "aborted", "no_files: no affected file can be sent (see skipped files)"
             sent = [f for f in self.findings if f.file in self.wf_files]
-            guide, self.guide_sections = self.migration.job_guide(sent, self.repo)
-            self.system = whole_file_system_prompt(self.migration, guide)
-        preflight = getattr(self.llm, "preflight", None)
-        if callable(preflight):
-            try:
-                preflight(require_tools=False) if self.whole_file else preflight()
-            except LLMError as exc:
-                return "aborted", f"preflight: {exc}"
-        if not self.whole_file and self._text_tool_calls():
-            self.system += tool_call_example(self.findings)
-            self.tool_call_example = True
+            self.wf_guide, self.guide_sections = self.migration.job_guide(sent, self.repo)
+            self.system = whole_file_system_prompt(self.migration, self.wf_guide, self._pins_note())
+        if self._needs_llm(first=True):
+            problem = self._preflight()
+            if problem:
+                return "aborted", f"preflight: {problem}"
         start = time.monotonic()
         self.baseline = self.sandbox.run(self.repo, env=self.sandbox_env)
         self.baseline_seconds = time.monotonic() - start
@@ -773,15 +861,21 @@ class _Job:
         for number in range(1, self.config.max_retries + 2):
             attempt = Attempt(number)
             self.attempts.append(attempt)
+            if not self.preflight_done and self._needs_llm(first=number == 1):
+                problem = self._preflight()
+                if problem:
+                    self.attempts.pop()
+                    return "aborted", f"preflight: {problem}"
             try:
                 if self.whole_file:
                     ready = self._whole_file_attempt(attempt)
+                elif number == 1 and not self.open_findings:
+                    ready = True  # only pins, which apifix set: verify them as they are
                 else:
-                    prompt = (
-                        task_prompt(self.findings)
-                        if number == 1
-                        else feedback_prompt(self.attempts[-2])
-                    )
+                    prompt = self._task_prompt()
+                    if number > 1:
+                        feedback = feedback_prompt(self.attempts[-2])
+                        prompt = f"{prompt}\n\n{feedback}" if not self.messages else feedback
                     self.messages.append(Message("user", text=prompt))
                     self._converse(attempt)
                     ready = any(e.accepted for e in attempt.edits)
@@ -818,6 +912,8 @@ class _Job:
                 break
             if self.whole_file:
                 self._after_rejection(number, attempt.verification)
+                if not self.wf_pending:
+                    break  # nothing the model may edit is implicated: another run changes nothing
 
         best = self.best_attempt()
         if best is None:
@@ -831,6 +927,71 @@ class _Job:
             f"{best.number} ({best.result})"
         )
 
+    def _set_pins(self) -> None:
+        """Set the dependency pins apifix can set itself, in the working copy (the baseline
+        runs on the original). Whole-file mode only takes files it can set completely."""
+        plan = plan_pin_edits(self.repo, self.findings, self.migration)
+        self.pin_files = plan.write(self.work, self.whole_file)
+        _, self.pin_fallbacks = plan.applied(self.whole_file)
+        self.manual_files = {f.path for f in plan.files if f.hash_pinned}
+        if self.whole_file:
+            self.wf_pinned = [f.path for f in self.pin_files]
+        done = self._pinned_findings()
+        self.open_findings = [
+            f for f in self.findings if f not in done and f.file not in self.manual_files
+        ]
+
+    def _pinned_findings(self) -> list[Finding]:
+        """Dependency findings apifix handled: in a file whose edits it wrote, at the line of
+        one of its edits, or anywhere in that file when nothing there fell back."""
+        out = []
+        for pin_file in self.pin_files:
+            lines = {e.line for e in pin_file.edits if e.kind == "migration"}
+            out += [
+                f
+                for f in self.findings
+                if f.file == pin_file.path
+                and f.category == "dependency"
+                and (f.line in lines or not pin_file.fallbacks)
+            ]
+        return out
+
+    def _pins_note(self) -> str:
+        files = [f.path for f in self.pin_files if any(e.kind == "migration" for e in f.edits)]
+        if not files:
+            return ""
+        raised = any(e.kind == "companion" for f in self.pin_files for e in f.edits)
+        return pins_note(self.migration.package, self.migration.pin_spec, files, raised)
+
+    def _task_prompt(self) -> str:
+        return task_prompt(
+            self.open_findings,
+            [pin_line(e) for f in self.pin_files for e in f.edits],
+            [fallback_line(b) for b in self.pin_fallbacks if not b.sent],
+        )
+
+    def _needs_llm(self, first: bool) -> bool:
+        """Does this attempt send anything to the model? (Not the first attempt of a job
+        that only had pins, which apifix set.)"""
+        if self.whole_file:
+            return bool(self.wf_pending)
+        return bool(self.open_findings) or not first
+
+    def _preflight(self) -> str | None:
+        """The provider's preflight check (once, before the first request); the problem, or
+        None. Agent mode: models that write tool calls as text get an example call."""
+        self.preflight_done = True
+        preflight = getattr(self.llm, "preflight", None)
+        if callable(preflight):
+            try:
+                preflight(require_tools=False) if self.whole_file else preflight()
+            except LLMError as exc:
+                return str(exc)
+        if not self.whole_file and self._text_tool_calls():
+            self.system += tool_call_example(self.open_findings or self.findings)
+            self.tool_call_example = True
+        return None
+
     def _retryable(self, v: Verification) -> bool:
         """Rejections are retried. An unverified result is retried unless no edit can change
         it: the repo has no tests, the sandbox could not run at all, or tests fail on the fix
@@ -839,6 +1000,8 @@ class _Job:
         need: the next attempt could not be judged either."""
         if any(r.code == "environment_incomplete" for r in v.reasons):
             return False
+        if any(r.code == "incomplete_migration" and r.file in self.manual_files for r in v.reasons):
+            return False  # a hash-pinned file nobody in the job may edit
         if v.verdict == "rejected":
             return True
         assert self.baseline is not None
@@ -869,6 +1032,9 @@ class _Job:
                 "guide_sections": self.guide_sections,
                 "sandbox_env_placeholders": self.ci_env,
                 "sandbox_requirements": sandbox_requirements_record(self.sandbox),
+                "pin_edits": [asdict(e) for f in self.pin_files for e in f.edits],
+                "pin_fallbacks": [asdict(b) for b in self.pin_fallbacks],
+                "pin_notes": [n for f in self.pin_files for n in f.notes],
                 "strict_tool_calls": getattr(self.llm, "strict_tool_calls", None),
                 "tool_call_example": self.tool_call_example,
                 "config": dataclasses.asdict(self.config),
@@ -896,15 +1062,28 @@ class _Job:
 
 
 def _dependency_problem(path: str, v: Verification) -> bool:
-    """Did the verification implicate this dependency file: the install failed, the smoke check
-    failed, or a reason or a remaining finding points at it?"""
+    """Did the verification implicate this dependency file: a reason or a remaining finding
+    points at it, or the install or the smoke check failed and the fixed run's install read the
+    file (environment.yml next to a pixi manifest, say, is not read, so it cannot be the cause).
+    A run that recorded no install sources at all implicates every file."""
     install_failed = v.fixed.status in ("error", "timeout") and "install" in v.fixed.reason
+    install_problem = install_failed or any(
+        r.code in ("smoke_check_failed", "library_removed") for r in v.reasons
+    )
     return (
-        install_failed
-        or any(r.code in ("smoke_check_failed", "library_removed") for r in v.reasons)
+        (install_problem and _install_reads(path, v.fixed))
         or any(r.file == path for r in v.reasons)
         or any(f.file == path for f in v.remaining_findings)
     )
+
+
+def _install_reads(path: str, run: SandboxResult) -> bool:
+    """The run's install read `path` (its sources, or a declaration the install used, e.g.
+    `pyproject.toml [tool.pixi.pypi-dependencies]`)."""
+    sources = [*run.dependency_sources, *(s for where in run.declared.values() for s in where)]
+    if not sources:
+        return True
+    return any(s == path or s.startswith(f"{path} ") for s in sources)
 
 
 _PARSE_ERRORS = {
@@ -1020,6 +1199,9 @@ def report_markdown(
             f"CI sets it (`{workflow}`); the sandbox has no network"
         )
     lines += sandbox_requirements_lines(job.sandbox)
+    lines += [f"- apifix set: {pin_line(e)}" for f in job.pin_files for e in f.edits]
+    lines += [f"- apifix could not set: {fallback_line(b)}" for b in job.pin_fallbacks]
+    lines += [f"- {n}" for f in job.pin_files for n in f.notes]
     retried = _install_retries(job)
     if retried:
         lines.append(

@@ -87,6 +87,9 @@ src/apifix/
                       reply budget, one retry with fewer reply tokens on a per-minute limit
     verify_diff.py    `apifix verify`: `git apply` a saved diff to a copy, same baseline +
                       verify() as fix, no LLM; same output files
+    pin_edits.py      dependency pins apifix sets itself (no LLM): the migration's pin_spec and
+                      raised companion pins, every format, byte-for-byte, checked by re-parsing;
+                      fallbacks with reasons; report lines; conda/lockfile notes
     whole_file.py     whole-file mode (no tools, one file per request): file selection, prompts,
                       code-block parsing, pre-apply checks (syntax, dependency file, changed,
                       abbreviation, undefined names, mock targets)
@@ -161,7 +164,8 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
 ## Known limitations (scanner)
 
 - Dependency pins: pip entries only (pixi `pypi-dependencies` of every table, all platforms;
-  an environment file's `pip:` list). Conda entries (pixi `dependencies`, an environment's conda
+  an environment file's `pip:` list). Requirements-file lines are read without per-requirement
+  options (`--hash=...`) and a trailing `\` (hash-pinned files, as pip-compile writes them). Conda entries (pixi `dependencies`, an environment's conda
   list) are not scanned. Environment files: `environment.yml` / `environment.yaml` only (not
   `environment-dev.yml` or files passed to `conda env create -f` under other names).
 - No cross-function tracking of response objects: dict-style access is only flagged when the
@@ -337,6 +341,9 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   (`AnthropicLLM(fallback=True)`), each response records the model that answered.
 - The pre-call budget check estimates input tokens from characters (~3 per token) and assumes
   no cache discount, so it is conservative and can stop a job slightly before the limit.
+- Pins apifix set itself (pin edits) are not listed as findings: the task prompt has them
+  under "Already done by apifix", and hash-pinned entries under "Left for a manual update"
+  (the model may still edit dependency files; nothing enforces that).
 - Edits are exact string replacements in existing Python and dependency files. The agent
   cannot create, rename or delete files, so migrations that need a new module (e.g. a shared
   client factory) must put it in an existing file.
@@ -375,12 +382,51 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   `trajectory.timing` use wall clock: LLM requests vs the baseline run plus `verify()` calls
   (which include the verifier's own scanning, normally well under a second).
 
+## Known limitations (pin edits)
+
+- `pin_edits.py` runs once per `fix` job, before attempt 1, on the working copy (the baseline
+  uses the original). It edits the entries the migration's `check_dependency` flags, writing
+  `Migration.pin_spec` (openai-v1: `>=1.0,<2`). Only the version spec changes; spacing inside
+  the old spec is not kept (`>= 0.27, < 0.28` becomes `>=1.0,<2`).
+- Each format has its own locator (never the parser's first-occurrence `_locate`): requirements
+  and environment.yml lines, TOML string literals found by trial edit (the decoded document may
+  change at exactly the entry's path), setup.py AST constants (plain one-line literals only),
+  setup.cfg `install_requires` / `[options.extras_require]` lines. The edited file is parsed
+  again: same package names, exactly the intended entries changed, no flagged pin left among
+  them, the strict well-formedness check still passing, and (TOML, setup.py, setup.cfg,
+  environment.yml) nothing else in the document changed. A failure is a fallback.
+- Fallbacks (the file goes to the model, reason in the report): continuation lines, quoted
+  YAML with escapes, escaped or multi-line TOML strings, non-literal setup.py strings, entries
+  no locator places, a failed re-parse check. Hash-pinned requirements files (`--hash`) are
+  never edited or sent: "hash-pinned; update manually", and a job whose remaining finding is in
+  one is not retried (no one in the job may change it). In agent mode the model is told to
+  leave them.
+- Companion pins (`Migration.companion_pins`, openai-v1: typing-extensions, anyio, httpx,
+  pydantic, distro, jiter from openai 1.109.1's metadata): only in files where apifix sets the
+  library's pin, only pins that allow none of the needed range (exact pins outside it, ranges
+  entirely below it, lower bounds at or above its upper bound). Replaced with the library's
+  range for that package; pydantic keeps the pin's major version (`>=1.9,<2` or `>=2,<3`).
+  Packages further down the tree are not raised (an exact `httpcore` pin can then clash with
+  the raised httpx: an install failure, resent to the model).
+- Never edited: conda entries (the report notes companion conda entries that hold the library
+  back, in files apifix edited), lockfiles (the report says to regenerate `poetry.lock`,
+  `pixi.lock`, `uv.lock`, `pdm.lock` or `Pipfile.lock` next to an edited manifest),
+  `requires-python`.
+- Whole-file mode writes only files it can set completely (every pin edited, no other
+  findings); any other file is sent unchanged with all its findings, and its settable pins are
+  listed as "sent whole". Agent mode writes every edit it can and lists the rest as findings.
+- A job whose only findings were pins apifix set runs attempt 1 without the model (no
+  preflight, no request) and verifies; a rejection goes to the model as usual.
+
 ## Known limitations (whole-file mode)
 
 - Recommended for small local models (7B-14B) that cannot drive the tool loop; agent mode stays
   the default and the better choice for capable models.
 - Only files with scanner findings are sent, one per request, each in a fresh conversation.
-  Edits the migration needs elsewhere (a helper module, a conftest) cannot be made.
+  Edits the migration needs elsewhere (a helper module, a conftest) cannot be made. Dependency
+  files apifix set completely (pin edits) are not sent; the system prompt says which pins it
+  set, and the job guide leaves out the Dependencies part when no dependency file is sent (a
+  dependency file resent later gets the missing parts in its own request).
 - The system prompt carries only the guide parts the job's findings need
   (`Migration.job_guide`, selectors in `rules.py`; `job.guide_sections`), chosen once per job
   so it stays identical across requests (servers such as Ollama cache that shared prefix).
@@ -447,16 +493,24 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   that do not parse or have a star import or module `__getattr__`, aliased patch functions
   (`from unittest.mock import patch as p`), `target=` keywords, and attributes deeper than
   the first name (`app.client.missing_attr` passes if `client` exists).
-- A failing candidate gets its error back once in that file's conversation (`check_retry`);
-  a second failure ends the attempt (`check_failed`, not verified). The next attempt resends
-  that file first (the original, with the rejected candidate as a diff and the error) and then
-  the files after it. Several errors where one has an example are sent as a bullet list.
-- A retry message also lists the file's earlier check errors in this job (any attempt) that the
+- A failing candidate gets its error back once (`check_retry`) as a fresh request: the file's
+  request again, with the rejected candidate as a diff against the original and the error (not
+  the conversation, which would carry the whole rejected file). A second failure ends the
+  attempt (`check_failed`, not verified). The next attempt resends that file first (the same
+  form) and then the files after it. Several errors where one has an example are sent as a
+  bullet list. Code-block nudges still continue the conversation.
+- A retry note also lists the file's earlier check errors in this job (any attempt) that the
   current reply does not have, under "Keep these fixed", compared and shown by first line
   without the `line N:` prefix (so the same problem on another line counts as the same).
-- After a failed verification every file except a kept dependency file is resent with the
-  verifier's reasons and failing test output (at most 10 tests, 2,000 characters each, 8,000
-  in total).
+- After a failed verification every Python file is resent with the verifier's reasons and
+  failing test output (at most 10 tests, 2,000 characters each, 8,000 in total). A dependency
+  file (accepted, or set by apifix) is resent only when a reason or remaining finding names
+  it, or the install / smoke check failed and the fixed run's install read it
+  (`dependency_sources` or a used declaration; a run that recorded none implicates all). With
+  nothing to resend, the job stops instead of verifying the same tree again.
+- Every file entry records `prompt_parts` (characters of rules, guide, file guide, feedback,
+  file, previous version, context, findings and instructions); check retries record theirs in
+  the nudge. A request that aborts the job is recorded too, and the abort reason names the file.
 - No new, renamed or deleted files; files must be UTF-8.
 
 ## Local / OpenAI-compatible models

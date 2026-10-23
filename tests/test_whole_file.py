@@ -16,7 +16,6 @@ from apifix.engine.whole_file import (
     REPLY_MARGIN_TOKENS,
     as_file,
     check_candidate,
-    check_retry_message,
     context_candidates,
     error_key,
     fence_for,
@@ -156,17 +155,15 @@ def test_check_candidate_without_a_known_import_still_fails():
     assert reqs.auto_imports == [] and reqs.text == "openai>=1\n"
 
 
-def test_retry_message_lists_problems_to_keep_fixed():
-    message = check_retry_message(
-        "app.py", "line 5: 'OpenAI' is used but never imported or defined", ["'os' is used ..."]
+def test_retry_note_lists_problems_to_keep_fixed():
+    error = "line 5: 'OpenAI' is used but never imported or defined"
+    note = previous_version_note("app.py", "a = 1\n", "a = 2\n", error, ["'os' is used ..."])
+    assert note.startswith(f"Your previous version of app.py was rejected: {error}. Its changes")
+    assert "-a = 1\n+a = 2\n" in note
+    assert note.endswith(
+        "\nKeep these fixed (problems in your earlier replies for this file):\n- 'os' is used ..."
     )
-    assert message == (
-        "The updated app.py was rejected:\n"
-        "line 5: 'OpenAI' is used but never imported or defined\n"
-        "Keep these fixed (problems in your earlier replies for this file):\n"
-        "- 'os' is used ...\n"
-        "Return the complete corrected file in exactly one code block."
-    )
+    assert "Keep these fixed" not in previous_version_note("app.py", "a\n", "b\n", error)
     assert error_key("line 12: 'x' is used\nFor example: ...") == "'x' is used"
 
 
@@ -527,18 +524,16 @@ def test_file_prompt_layout_for_a_later_attempt():
 def test_errors_with_examples_become_a_bullet_list():
     one_line = ["line 1: 'x' is used but never imported or defined", "mock target 'a.b': ..."]
     assert join_errors(one_line) == "; ".join(one_line)
-    assert check_retry_message("t.py", join_errors(one_line)) == (
-        f"The updated t.py was rejected: {'; '.join(one_line)}. Return the complete corrected "
-        "file in exactly one code block."
+    assert previous_version_note("t.py", "a\n", "b\n", join_errors(one_line)).startswith(
+        f"Your previous version of t.py was rejected: {'; '.join(one_line)}. Its changes"
     )
     example = "mock target 'a.b': ...\nFor example:\n    x = 1"
     assert join_errors([example]) == example  # one error: no bullet
     with_example = [one_line[0], example]
     joined = join_errors(with_example)
     assert joined == f"- {one_line[0]}\n- mock target 'a.b': ...\nFor example:\n    x = 1"
-    assert check_retry_message("t.py", joined) == (
-        f"The updated t.py was rejected:\n{joined}\nReturn the complete corrected file in "
-        "exactly one code block."
+    assert previous_version_note("t.py", "a\n", "b\n", joined).startswith(
+        f"Your previous version of t.py was rejected:\n{joined}\nIts changes"
     )
 
 

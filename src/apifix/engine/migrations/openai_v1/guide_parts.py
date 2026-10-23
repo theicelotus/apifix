@@ -4,6 +4,7 @@ Resources table."""
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from pathlib import Path
 
 from apifix.engine.migrations.guide import guide_parts, render_parts, with_sections
@@ -69,3 +70,8 @@ def job_guide(findings: list[Finding], root: Path | None = None) -> tuple[str, l
     ]
     text = render_parts(parts, keep)
     return text, [part for part, _ in PARTS if part in keep]
+
+
+def parts_text(part_ids: Iterable[str]) -> str:
+    """The title and the parts `part_ids` (and their sections), in guide order."""
+    return render_parts(PARTS, set(part_ids))

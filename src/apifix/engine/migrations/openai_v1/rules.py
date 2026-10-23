@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from apifix.engine.models import CERTAIN, LIKELY, Confidence
+from apifix.engine.models import CERTAIN, LIKELY, CompanionPin, Confidence
 
 CLIENT = "client = openai.OpenAI()"
 ASYNC_CLIENT = "client = openai.AsyncOpenAI()"
@@ -175,7 +175,23 @@ JSON_DUMP = "Responses are not JSON-serialisable as-is: use resp.model_dump_json
 
 PACKAGE = "openai"
 FIRST_V1 = "1.0"
-DEPENDENCY = "Pin openai>=1.0 (e.g. openai>=1.0,<2) and migrate call sites"
+PIN_SPEC = ">=1.0,<2"  # what apifix writes for a 0.x pin
+DEPENDENCY = f"Pin openai>=1.0 (e.g. openai{PIN_SPEC}) and migrate call sites"
+
+# openai's own requirements, from the metadata of 1.109.1 (the last release before 2.0; PyPI,
+# checked 2026-10-22). openai 1.0 accepted typing-extensions>=4.5, so an exact older pin makes
+# pip fall back to an old 1.x, which breaks on httpx>=0.28. In files where apifix sets the
+# openai pin, a pin of one of these that allows none of the range is raised to it. pydantic
+# keeps the repo's major version (v1 code stays on v1). sniffio and tqdm are left out: no
+# realistic pin excludes what openai needs.
+COMPANION_PINS: dict[str, CompanionPin] = {
+    "typing-extensions": CompanionPin("4.11", "5"),
+    "anyio": CompanionPin("3.5", "5"),
+    "httpx": CompanionPin("0.23", "1"),
+    "pydantic": CompanionPin("1.9", "3", keep_major=True),
+    "distro": CompanionPin("1.7", "2"),
+    "jiter": CompanionPin("0.4", "1"),
+}
 
 # Guide parts (guide.md `<!-- part: id -->` markers) and when a job's prompt includes them.
 # A selector (categories, keywords) matches a finding whose category is in `categories` (empty:

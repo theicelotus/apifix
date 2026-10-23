@@ -135,8 +135,10 @@ def select_context(
 # --- prompts ----------------------------------------------------------------------------------
 
 
-def system_prompt(migration: Migration, guide: str | None = None) -> str:
-    """`guide`: the job's guide parts (Migration.job_guide); the full guide by default."""
+def system_prompt(migration: Migration, guide: str | None = None, pins: str = "") -> str:
+    """`guide`: the job's guide parts (Migration.job_guide); the full guide by default. `pins`:
+    a note on the dependency pins apifix set itself (pins_note), if any."""
+    note = f"\n{pins}\n" if pins else ""
     return f"""You are apifix's migration assistant. You update one file of a Python \
 repository at a time for a breaking library change: {migration.summary}. A verifier then runs \
 the repository's tests in a network-less sandbox and checks the result.
@@ -154,7 +156,7 @@ imports and mock data to the new API.
 - Reply with the complete updated file in exactly one fenced code block. Include every line, \
 changed or not. Never abbreviate with placeholders such as "# ... rest unchanged" or a bare \
 "...". Text outside the code block is ignored.
-
+{note}
 Migration guide:
 
 {migration.guide if guide is None else guide}"""
@@ -185,13 +187,16 @@ def file_prompt(
     required: bool = True,
     feedback: str = "",
     previous: str = "",
+    guide: str = "",
 ) -> str:
     """One file's request. `text` is the original file. `feedback` (the attempt's verifier
     feedback, the same text for every file of a kind) comes first, so that consecutive
     requests share a prefix a server can cache; `previous` (previous_version_note) follows
-    the file."""
+    the file. `guide`: guide parts this file needs that the system prompt does not have."""
     fence = fence_for(text, *(t for _, t in context))
     lines = [feedback, ""] if feedback else []
+    if guide:
+        lines += ["Migration guide for this file:", "", guide.rstrip(), ""]
     lines += [f"Migrate this file: {path}", f"Breaking change: {summary}", ""]
     lines.append("Scanner findings in this file (line: category [confidence]):")
     for f in findings:
@@ -251,11 +256,36 @@ def verification_feedback(
     return "\n".join([head, "", *body]).rstrip()
 
 
-def previous_version_note(path: str, original: str, previous: str | None, reason: str) -> str:
-    """For a later attempt's request: the model's previous version of `path` as a short diff
-    against the original, and why it failed (`reason`: a check error, or "" when the
-    verifier's feedback above says why). `previous` is None when there was no usable file
-    (e.g. the reply had no code block)."""
+def pins_note(package: str, spec: str, files: Sequence[str], raised: bool = False) -> str:
+    """The whole-file system prompt's note on the dependency pins apifix set itself."""
+    also = f" (and raised pins there that held {package} back)" if raised else ""
+    return (
+        f"apifix has already set the {package} pin ({package}{spec}) in {', '.join(files)}"
+        f"{also}. Do not add or change dependency declarations."
+    )
+
+
+def previous_version_note(
+    path: str,
+    original: str,
+    previous: str | None,
+    reason: str,
+    keep_fixed: Sequence[str] = (),
+) -> str:
+    """For a request that follows a failed one (a check retry, or a later attempt): the
+    model's previous version of `path` as a short diff against the original, and why it failed
+    (`reason`: a check error, or "" when the verifier's feedback above says why). `previous` is
+    None when there was no usable file (e.g. the reply had no code block). `keep_fixed`:
+    problems of earlier replies for this file that this one does not have (error_key form),
+    listed so that fixing one problem does not bring another back."""
+    note = _previous_version(path, original, previous, reason)
+    if keep_fixed:
+        note += "\nKeep these fixed (problems in your earlier replies for this file):\n"
+        note += "\n".join(f"- {k}" for k in keep_fixed)
+    return note
+
+
+def _previous_version(path: str, original: str, previous: str | None, reason: str) -> str:
     if "\n" in reason:  # several errors, or one with an example: on lines of their own
         why = f" was rejected:\n{reason}\n"
     else:
@@ -297,27 +327,6 @@ _LINE_PREFIX = re.compile(r"^line \d+: ")
 def error_key(error: str) -> str:
     """An error's identity across replies: its first line without the `line N: ` prefix."""
     return _LINE_PREFIX.sub("", error.split("\n", 1)[0])
-
-
-def check_retry_message(path: str, error: str, keep_fixed: Sequence[str] = ()) -> str:
-    """Sent in the file's conversation when a candidate fails a check (one retry). `keep_fixed`:
-    problems of earlier replies for this file that this one does not have (error_key form),
-    listed so that fixing one problem does not bring another back."""
-    keep = ""
-    if keep_fixed:
-        keep = "Keep these fixed (problems in your earlier replies for this file):\n" + "\n".join(
-            f"- {k}" for k in keep_fixed
-        )
-    if "\n" in error or keep:  # a bullet list, a message with an example, or keep_fixed
-        lines = [f"The updated {path} was rejected:", error]
-        if keep:
-            lines.append(keep)
-        lines.append("Return the complete corrected file in exactly one code block.")
-        return "\n".join(lines)
-    return (
-        f"The updated {path} was rejected: {error}. Return the complete corrected file in "
-        "exactly one code block."
-    )
 
 
 # --- parsing the reply ------------------------------------------------------------------------
