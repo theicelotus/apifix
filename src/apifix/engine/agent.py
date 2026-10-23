@@ -29,6 +29,12 @@ from apifix.engine.already_migrated import AlreadyMigrated, detect_already_migra
 from apifix.engine.code_checks import STDLIB_IMPORTS, import_table, module_roots
 from apifix.engine.dependencies import is_dependency_file
 from apifix.engine.diffing import diff_trees, read_text, unified_diff
+from apifix.engine.imports import (
+    UndeclaredImport,
+    undeclared_imports,
+    undeclared_record,
+    undeclared_section,
+)
 from apifix.engine.llm import (
     LLMClient,
     LLMError,
@@ -55,6 +61,7 @@ from apifix.engine.verifier import (
     VerifierConfig,
     downloads_line,
     feedback_lines,
+    requirements_override,
     run_summary,
     sandbox_requirements_lines,
     sandbox_requirements_record,
@@ -349,6 +356,8 @@ class _Job:
         # Variables the repo's CI sets that the sandbox's test phase gets placeholders for
         # (name -> workflow file), in the baseline and in every verification.
         self.already_migrated: AlreadyMigrated | None = None
+        # third-party modules the repo imports but declares nowhere (read before the baseline)
+        self.undeclared: list[UndeclaredImport] = []
         self.ci_env = ci_env_vars(repo, migration.ci_env_placeholders)
         self.sandbox_env = {name: migration.ci_env_placeholders[name] for name in self.ci_env}
         # wall-clock seconds: LLM requests, and sandbox work (baseline run, verify() calls)
@@ -876,6 +885,7 @@ class _Job:
             problem = self._preflight()
             if problem:
                 return "aborted", f"preflight: {problem}"
+        self.undeclared = undeclared_imports(self.repo, requirements_override(self.sandbox))
         start = time.monotonic()
         self.baseline = self.sandbox.run(self.repo, env=self.sandbox_env)
         self.baseline_seconds = time.monotonic() - start
@@ -1061,6 +1071,7 @@ class _Job:
                     asdict(self.already_migrated) if self.already_migrated else None
                 ),
                 "sandbox_requirements": sandbox_requirements_record(self.sandbox),
+                "undeclared_imports": undeclared_record(self.undeclared),
                 "pin_edits": [asdict(e) for f in self.pin_files for e in f.edits],
                 "pin_fallbacks": [asdict(b) for b in self.pin_fallbacks],
                 "pin_notes": [n for f in self.pin_files for n in f.notes],
@@ -1320,6 +1331,7 @@ def report_markdown(
             f"{job.repo} --migration {job.migration.name} --diff fix.diff`"
         )
     lines.append("")
+    lines += undeclared_section(job.undeclared)
     if chosen and chosen.verification:
         lines.append(chosen.verification.report_markdown())
     elif result_outcome == "already_migrated" and job.already_migrated:

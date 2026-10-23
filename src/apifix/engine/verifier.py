@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
@@ -23,7 +23,7 @@ from apifix.engine.dependencies import (
 from apifix.engine.diffing import FileChange, diff_trees, read_text
 from apifix.engine.migrations import Migration, get_migration
 from apifix.engine.models import Finding, LibraryTarget
-from apifix.engine.project import NotInstalled, is_test_file
+from apifix.engine.project import NotInstalled, SandboxRequirements, is_test_file
 from apifix.engine.sandbox import PhaseResult, Sandbox, SandboxResult
 from apifix.engine.scanner import scan
 from apifix.engine.scope import tooling_change
@@ -35,7 +35,7 @@ from apifix.engine.tampering import (
     check_test_file,
 )
 from apifix.engine.test_results import TestCaseResult
-from apifix.engine.walk import iter_files
+from apifix.engine.walk import repo_module_names
 
 Verdict = Literal["verified", "verified_weak", "rejected", "unverified"]
 # reject -> rejected; unverified -> unverified; weak -> verified_weak; warn/info: report only.
@@ -338,9 +338,14 @@ def downloads_line(runs: Sequence[tuple[str, SandboxResult]]) -> str | None:
     return f"- Dependency downloads (pip cache {'on' if cached else 'off'}): {'; '.join(parts)}"
 
 
+def requirements_override(sandbox: Sandbox) -> SandboxRequirements | None:
+    """The --sandbox-requirements file a sandbox installs from, if any."""
+    return getattr(getattr(sandbox, "config", None), "requirements_override", None)
+
+
 def sandbox_requirements_record(sandbox: Sandbox) -> dict[str, Any] | None:
     """The --sandbox-requirements file for trajectories (the user's own file: kept whole)."""
-    req = getattr(getattr(sandbox, "config", None), "requirements_override", None)
+    req = requirements_override(sandbox)
     if req is None:
         return None
     return {"path": req.path, "sha256": req.sha256, "lines": list(req.lines)}
@@ -357,7 +362,7 @@ def upgraded_text(upgraded: str, override: str | None) -> str:
 
 def sandbox_requirements_lines(sandbox: Sandbox) -> list[str]:
     """Report line for a --sandbox-requirements file, if one replaced dependency detection."""
-    req = getattr(getattr(sandbox, "config", None), "requirements_override", None)
+    req = requirements_override(sandbox)
     if req is None:
         return []
     return [
@@ -423,8 +428,22 @@ def compare_runs(
     }
     delta.broken_modules = sorted(broken_after - broken_before)
 
+    # A module that fails to collect is one error per run: failing before and after it is an
+    # already-failing test (no signal), and collecting only after the fix is a fix.
+    errors_after = {
+        _collection_module(t): t for t in after.values() if _is_collection_error(t, runner)
+    }
     for test_id, b in before.items():
         if _is_collection_error(b, runner):
+            module = _collection_module(b)
+            f = errors_after.get(module)
+            if f is None:
+                if any(_in_module(t, module) for t in after):  # its tests ran this time
+                    delta.fixed_by_change.append(module)
+            elif is_external_failure(b.message) or is_external_failure(f.message):
+                delta.no_signal_external.append(module)
+            else:
+                delta.no_signal_preexisting.append(module)
             continue
         f = after.get(test_id)
         if f is None:
@@ -985,19 +1004,6 @@ def _not_installed_reason(
     return Reason("library_not_declared", "unverified", message)
 
 
-def repo_module_names(root: Path) -> set[str]:
-    """Names a repo's own code can be imported by at the top level: every Python file's stem
-    and every directory that holds Python files."""
-    names: set[str] = set()
-    for path in iter_files(root):
-        if path.suffix != ".py":
-            continue
-        parts = path.relative_to(root).parts
-        names.add(path.stem)
-        names.update(parts[:-1])
-    return names
-
-
 def _module_detail(module: str, run: SandboxResult) -> str:
     """Where the distribution that provides `module` is declared, and what became of it."""
     for dist in distribution_candidates(module):
@@ -1016,25 +1022,37 @@ def _module_detail(module: str, run: SandboxResult) -> str:
 
 def environment_reasons(baseline: SandboxResult, original: Path) -> list[Reason]:
     """The original code's tests fail because modules are missing from the sandbox's
-    environment (not the repo's own modules, not the stdlib). With no passing test at all
-    that is `environment_incomplete`: nothing the fix does can be judged, and no edit to the
-    code can change it."""
+    environment (not the repo's own modules, not the stdlib). When nothing usable ran besides
+    (no test passed, and none failed for a reason a fix could change: not an import error,
+    not a network or credentials failure) that is
+    `environment_incomplete`: nothing the fix does can be judged, and no edit to the code can
+    change it. Otherwise the missing modules are info, with the test files they block."""
     if not baseline_usable(baseline) or baseline.test is None:
         return []
     local = repo_module_names(original)
     missing: dict[str, list[str]] = {}
+    usable = 0
     for t in baseline.tests:
-        if t.outcome not in ("failed", "error") or not t.missing_module:
-            continue
-        top = t.missing_module.split(".", 1)[0]
-        if top in sys.stdlib_module_names or top in local:
-            continue
-        missing.setdefault(top, []).append(t.id)
+        top = t.missing_module.split(".", 1)[0] if t.missing_module else ""
+        blocked = (
+            t.outcome in ("failed", "error")
+            and top
+            and top not in sys.stdlib_module_names
+            and top not in local
+        )
+        if blocked:
+            missing.setdefault(top, []).append(t.id)
+        elif t.outcome == "passed" or (
+            t.outcome in ("failed", "error")
+            and not t.missing_module  # an import error of any kind is nothing a fix changes
+            and not is_external_failure(t.message)
+        ):
+            usable += 1
     if not missing:
         return []
     details = "; ".join(_module_detail(m, baseline) for m in sorted(missing))
     tests = _ids([t for ids in missing.values() for t in ids])
-    if baseline.counts.passed == 0:
+    if not usable:
         return [
             Reason(
                 "environment_incomplete",
@@ -1045,15 +1063,40 @@ def environment_reasons(baseline: SandboxResult, original: Path) -> list[Reason]
                 tests,
             )
         ]
+    blocks = "; ".join(
+        f"{m} blocks {', '.join(_test_files(ids, original))}" for m, ids in sorted(missing.items())
+    )
     return [
         Reason(
             "missing_modules",
             "info",
             f"some of the original code's tests import modules the sandbox's environment does "
-            f"not have: {details}",
+            f"not have: {details}. {blocks}; the other tests ran",
             tests,
         )
     ]
+
+
+def _test_files(test_ids: Iterable[str], root: Path) -> list[str]:
+    """The test files of runtime test ids (`tests.test_x`, `tests.test_x::test_y`,
+    `tests.test_x.TestA::test_b`): the longest dotted prefix that is a .py file under `root`,
+    else the id's module part as it is."""
+    files: list[str] = []
+    for test_id in test_ids:
+        dotted = test_id.removeprefix("unittest.loader._FailedTest.").split("::", 1)[0]
+        parts = dotted.split(".")
+        found = dotted
+        for n in range(len(parts), 0, -1):
+            rel = "/".join(parts[:n])
+            if (root / f"{rel}.py").is_file():
+                found = f"{rel}.py"
+                break
+            if (root / rel / "__init__.py").is_file():
+                found = f"{rel}/__init__.py"
+                break
+        if found not in files:
+            files.append(found)
+    return files
 
 
 def _evidence_reasons(

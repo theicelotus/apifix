@@ -76,6 +76,8 @@ src/apifix/
     sandbox_driver.py runs INSIDE containers (Python 3.8+ compatible, stdlib only)
     docker.py         DockerClient protocol + `docker` CLI implementation (bounded output)
     cleanup.py        removes containers / temp workspaces left by crashed or killed runs
+    imports.py        third-party imports no dependency file declares ("imported but not
+                      declared"), read before the first sandbox run; report section only
     test_results.py   JUnit / unittest output -> counts + per-test outcomes (+ the module of
                       a "No module named" error, read before messages are clipped)
     diffing.py        original vs fixed tree: changed files, changed lines and hunks
@@ -369,11 +371,21 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
 - Tests needing a network service or credentials are recognised by failure-message markers.
 - Missing modules: a failing/erroring baseline test whose full failure text has "No module
   named 'x'" (the last one) for a module that is neither stdlib nor a repo module (any `.py`
-  stem or directory holding Python files). No passing baseline test plus at least one such
-  module -> `environment_incomplete` (unverified); with passing tests -> `missing_modules`
-  (info). Each module is matched to a declaration by its normalised name or a small import-name
+  stem or directory holding Python files) is blocked. `environment_incomplete` (unverified)
+  when nothing usable ran besides: no baseline test passed, and none failed or errored
+  without a "No module named" and without a network/credentials marker. Otherwise
+  `missing_modules` (info), naming the test files each module blocks (a test id's longest
+  dotted prefix that is a `.py` file in the original repo, else the dotted name). Each module
+  is matched to a declaration by its normalised name or a small import-name
   table (`dotenv` -> `python-dotenv`, ...); other renamed distributions read as "not declared".
   Environment reasons are never sent to the model.
+- Collection errors: pytest runs with `--continue-on-collection-errors`, unless the repo's
+  pytest `addopts` stops at the first failure (`-x`, also in bundles like `-xvs`;
+  `--exitfirst`; `--maxfail N` with N > 0; `--sw` / `--stepwise`), which the test plan notes.
+  A module that fails to collect is one error per run (id: the module). Failing to collect
+  before and after -> `no_signal_preexisting` (or `no_signal_external`); before only, with
+  tests of the module run after -> `fixed_by_change`; after only -> `collection_error`
+  (reject). `PYTEST_ADDOPTS` and plugins that stop sessions are not read.
 - Flakiness: newly failing tests are rerun once (whole test phase); a regression that fails
   intermittently can pass the rerun and be reported as flaky.
 - When the fixed code's tests never ran (install failed, test phase did not start), there is
@@ -395,6 +407,29 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   multi-line string) are always listed. First non-comment line of each side (100 characters),
   at most 15 in the report (`verification.review_by_hand` has all). Fixed-side line numbers; a
   removal is shown at the line that now follows it.
+
+## Known limitations (imported but not declared)
+
+- `imports.py`, once per job from the original repo before the baseline (`fix` and `apifix
+  verify`): first names of absolute imports in every `.py` file the walker yields (code and
+  tests, imports inside functions too), except files under a top-level `docs/` or `doc/` and
+  files that do not parse. Optional imports are skipped: inside a `try` whose handlers catch
+  `ImportError`, `ModuleNotFoundError`, `Exception`, `BaseException` or everything (the
+  handler's own imports count), and under `if TYPE_CHECKING:`. Dynamic imports
+  (`importlib.import_module`, `__import__`) and notebooks are not read.
+- Not listed: stdlib, `__future__`, the repo's own module names (`walk.repo_module_names`),
+  `ALWAYS_INSTALLED` (pytest, setuptools, pip, coverage, ...), and names declared anywhere:
+  every dependency file the walker finds (extras and groups included, also files the install
+  plan does not read), the install plan's declared and left-out names (conda entries), and
+  the --sandbox-requirements lines. A distribution installed only as another package's
+  dependency (PIL via matplotlib) is still listed: it is not declared.
+- Import name -> pip name: `IMPORT_DISTRIBUTIONS` in dependencies.py, else the import name
+  itself (normalised). `google` / `azure` count as declared when any declared name starts
+  with `google-` / `azure-`. An unknown renamed distribution reads as "not declared".
+- Report section "Imported but not declared" (before the verification; at most 5 files per
+  module), trajectory `job.undeclared_imports`. Never installed, never sent to the model, no
+  effect on the verdict. spaCy models and nltk data are not detected (see
+  docs/plans/collection-errors-and-imports.md, "Later").
 
 ## Known limitations (agent)
 

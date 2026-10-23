@@ -63,6 +63,30 @@ def test_a_good_diff_is_verified_without_touching_the_repo(saved):
     assert "## Verification: Verified" in report
 
 
+def test_imports_nothing_declares_are_listed_before_the_verification(saved):
+    original, diff = saved
+    (original / "tools").mkdir()
+    (original / "tools" / "plot.py").write_text("from PIL import Image\nimport nlpaug\n")
+    result = verify_diff(original, "openai-v1", diff, sandbox=FakeSandbox(PASSING, [PASSING]))
+    report = result.report_markdown
+    section = report.index("## Imported but not declared")
+    assert section < report.index("## Verification: Verified")
+    assert "- `nlpaug` (pip: `nlpaug`): tools/plot.py\n" in report
+    assert "- `PIL` (pip: `pillow`): tools/plot.py\n" in report
+    assert result.trajectory["job"]["undeclared_imports"] == [
+        {"module": "nlpaug", "distribution": "nlpaug", "files": ["tools/plot.py"]},
+        {"module": "PIL", "distribution": "pillow", "files": ["tools/plot.py"]},
+    ]
+    assert result.outcome == "verified"  # information only
+
+
+def test_no_section_when_every_import_is_declared(saved):
+    original, diff = saved
+    result = verify_diff(original, "openai-v1", diff, sandbox=FakeSandbox(PASSING, [PASSING]))
+    assert "Imported but not declared" not in result.report_markdown
+    assert result.trajectory["job"]["undeclared_imports"] == []
+
+
 def test_without_a_baseline_failures_leave_it_unverified(saved):
     original, diff = saved
     down = run(status="timeout", reason="dependency install exceeded 900s")

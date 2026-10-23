@@ -1052,6 +1052,81 @@ def test_missing_modules_with_passing_baseline_tests_are_only_info(trees):
     assert r.severity == "info" and "spotipy (not declared" in r.message
 
 
+HEAVY = {"tests/test_heavy.py": "import nlpaug\n\n\ndef test_augment():\n    pass\n"}
+NO_NLPAUG = "ModuleNotFoundError: No module named 'nlpaug'"
+
+
+def test_module_failing_to_collect_before_and_after_is_no_signal_with_its_file(trees):
+    # SuspensePerception: one test file needs undeclared packages; the others still ran
+    original, fixed = trees(HEAVY, {**ORIGINAL, **HEAVY})
+    heavy = ("tests.test_heavy", "error", NO_NLPAUG, "nlpaug")
+    baseline = run((T_ASK, "passed"), (T_STRIP, "passed"), heavy)
+    fixed_run = run((T_ASK, "passed"), (T_STRIP, "passed"), heavy, coverage=FULL_COVERAGE)
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(baseline, [fixed_run]))
+    assert v.delta.no_signal_preexisting == ["tests.test_heavy"]
+    assert v.delta.broken_modules == [] and v.delta.newly_erroring == []
+    assert not codes(v) & {"collection_error", "regression_error", "environment_incomplete"}
+    r = reason(v, "missing_modules")
+    assert r.severity == "info"
+    assert r.message.endswith(
+        "nlpaug (not declared in any dependency file apifix reads). nlpaug blocks "
+        "tests/test_heavy.py; the other tests ran"
+    )
+    assert reason(v, "no_signal_preexisting").tests == ("tests.test_heavy",)
+    assert v.verdict == "verified"
+
+
+def test_module_collecting_only_after_the_fix_is_fixed_by_change(trees):
+    original, fixed = trees(HEAVY, {**ORIGINAL, **HEAVY})
+    baseline = run((T_ASK, "passed"), (T_STRIP, "passed"), ("tests.test_heavy", "error", "boom"))
+    fixed_run = run(
+        (T_ASK, "passed"),
+        (T_STRIP, "passed"),
+        ("tests.test_heavy::test_augment", "passed"),
+        coverage=FULL_COVERAGE,
+    )
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(baseline, [fixed_run]))
+    assert v.delta.fixed_by_change == ["tests.test_heavy"]
+    assert v.delta.new_tests == ["tests.test_heavy::test_augment"]
+
+
+def test_module_that_failed_to_collect_and_is_gone_is_not_fixed_by_change(trees):
+    original, fixed = trees({}, {**ORIGINAL, **HEAVY})  # the fix has no tests/test_heavy.py
+    baseline = run((T_ASK, "passed"), (T_STRIP, "passed"), ("tests.test_heavy", "error", "boom"))
+    fixed_run = run((T_ASK, "passed"), (T_STRIP, "passed"), coverage=FULL_COVERAGE)
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(baseline, [fixed_run]))
+    assert v.delta.fixed_by_change == [] and v.delta.no_signal_preexisting == []
+
+
+@pytest.mark.parametrize(
+    "others",
+    [
+        [],
+        [(T_ASK, "skipped")],
+        [(T_ASK, "error", "openai.error.APIConnectionError: Connection error.")],
+        [(T_ASK, "error", "collection failure", "app")],  # a repo module: still an import error
+    ],
+)
+def test_environment_incomplete_when_nothing_else_usable_ran(trees, others):
+    original, fixed = trees({})
+    baseline = run(("tests.test_heavy", "error", NO_NLPAUG, "nlpaug"), *others)
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(baseline, [PASSING]))
+    assert "environment_incomplete" in codes(v) and "missing_modules" not in codes(v)
+
+
+def test_missing_modules_are_info_when_another_test_fails_for_a_reason_a_fix_can_change(trees):
+    # nothing passed, but test_ask fails on the original code itself: the fix can be judged
+    original, fixed = trees({})
+    baseline = run(
+        ("tests.test_heavy", "error", NO_NLPAUG, "nlpaug"),
+        (T_ASK, "failed", "AssertionError: assert None == 'hi'"),
+    )
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(baseline, [PASSING]))
+    assert "environment_incomplete" not in codes(v)
+    r = reason(v, "missing_modules")
+    assert "nlpaug blocks tests.test_heavy; the other tests ran" in r.message  # no such file
+
+
 def test_a_baseline_without_import_errors_is_not_environment_incomplete(trees):
     original, fixed = trees({})
     baseline = run((T_ASK, "failed", "assert 1 == 2"), (T_STRIP, "failed", "boom"))

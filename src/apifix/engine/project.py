@@ -10,6 +10,7 @@ import configparser
 import hashlib
 import json
 import re
+import shlex
 import tomllib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -247,6 +248,7 @@ PYTEST_COMMAND = (
     "--junitxml=/results/junit.xml",
     "-rfE",
 )
+CONTINUE_ON_COLLECTION_ERRORS = "--continue-on-collection-errors"
 
 
 def _base_name(node: ast.expr) -> str:
@@ -328,9 +330,9 @@ def _pytest_signal(repo: Path, rel_files: list[str]) -> str | None:
 
 
 def pytest_config(repo: Path) -> tuple[str | None, dict[str, list[str]]]:
-    """The repo's pytest config file (in pytest's order) and its `testpaths`, `python_files`
-    and `pythonpath` options, as lists of strings."""
-    keys = ("testpaths", "python_files", "pythonpath")
+    """The repo's pytest config file (in pytest's order) and its `testpaths`, `python_files`,
+    `pythonpath` and `addopts` options, as lists of strings."""
+    keys = ("testpaths", "python_files", "pythonpath", "addopts")
     if (repo / "pytest.ini").is_file():
         return "pytest.ini", _ini_options(repo / "pytest.ini", "pytest", keys)
     pyproject = _read(repo / "pyproject.toml")
@@ -344,7 +346,7 @@ def pytest_config(repo: Path) -> tuple[str | None, dict[str, list[str]]]:
         for key in keys:
             value = options.get(key) if isinstance(options, dict) else None
             if isinstance(value, str):
-                found[key] = value.split()
+                found[key] = _split_option(value)
             elif isinstance(value, list):
                 found[key] = [str(v) for v in value]
         return "pyproject.toml", found
@@ -363,7 +365,42 @@ def _ini_options(path: Path, section: str, keys: tuple[str, ...]) -> dict[str, l
         return {}
     if not parser.has_section(section):
         return {}
-    return {k: parser.get(section, k).split() for k in keys if parser.has_option(section, k)}
+    return {k: _split_option(parser.get(section, k)) for k in keys if parser.has_option(section, k)}
+
+
+def _split_option(value: str) -> list[str]:
+    try:
+        return shlex.split(value)
+    except ValueError:  # an unbalanced quote
+        return value.split()
+
+
+# Short options of pytest (and pytest-xdist's -n) that take a value, which may be glued on
+# (`-rfE`, `-pno:x`): letters after one of these are the value, not more options.
+_SHORT_WITH_VALUE = frozenset("kmpcoWrn")
+
+
+def stops_at_first_failure(addopts: Iterable[str]) -> str | None:
+    """The option in a pytest `addopts` that ends the session at the first failure (then a
+    collection error still stops it, --continue-on-collection-errors or not), or None."""
+    opts = list(addopts)
+    for i, opt in enumerate(opts):
+        if opt in ("--exitfirst", "--sw", "--stepwise"):
+            return opt
+        if opt.startswith("--maxfail"):
+            value = (
+                opt.partition("=")[2] if "=" in opt else (opts[i + 1] if i + 1 < len(opts) else "")
+            )
+            if value.isdigit() and int(value) > 0:
+                return f"--maxfail {value}"
+            continue
+        if opt.startswith("-") and not opt.startswith("--"):
+            for letter in opt[1:]:
+                if letter == "x":
+                    return "-x"
+                if letter in _SHORT_WITH_VALUE:
+                    break
+    return None
 
 
 def _top_level_imports(source: str) -> set[str]:
@@ -459,11 +496,21 @@ def detect_tests(repo: Path) -> TestPlan:
         )
     else:
         import_paths, notes = guess_import_paths(repo, runnable)
+    base = PYTEST_COMMAND
+    stop = stops_at_first_failure(options.get("addopts", ()))
+    if stop:
+        notes += (
+            f"{config} addopts stops at the first failure ({stop}): a module that fails to "
+            "collect still ends the session",
+        )
+    else:
+        # one test module that does not import must not stop the others from running
+        base = (*base, CONTINUE_ON_COLLECTION_ERRORS)
     if options.get("testpaths") or options.get("python_files"):
         reason += f"; collection as configured in {config}"
-        command = PYTEST_COMMAND
+        command = base
     else:
-        command = (*PYTEST_COMMAND, *test_files)
+        command = (*base, *test_files)
     return TestPlan("pytest", test_files, command, reason, import_paths, notes)
 
 

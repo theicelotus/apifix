@@ -89,10 +89,23 @@ installed":
 - `environment.yml` next to a pixi manifest (pixi never reads it), and the conda list of an
   exported environment (`conda env export`: build strings, `prefix:`).
 
-When the original code's tests import modules that the sandbox does not have and no test
-passes, the verdict is "unverified" with `environment_incomplete`. The report names each missing
-module, where it is declared, and why it was not installed. No edit to the code can change
-that, so the fix is not retried, and the model is never told to change pins because of it.
+pytest keeps going past test files that fail to import (`--continue-on-collection-errors`,
+unless the repo's own pytest options stop at the first failure), so one test file that needs a
+package the sandbox lacks no longer stops the others. A file that fails to import both before
+and after the fix counts as already failing, not as a regression.
+
+When the original code's tests import modules that the sandbox does not have and nothing else
+usable runs (no test passes, and none fails for another reason), the verdict is "unverified"
+with `environment_incomplete`. The report names each missing module, where it is declared,
+and why it was not installed. No edit to the code can change that, so the fix is not retried,
+and the model is never told to change pins because of it. When other tests do run, the missing
+modules are only listed, with the test files they block.
+
+Before the first sandbox run, apifix also reads the code for third-party imports that no
+dependency file declares (and a `--sandbox-requirements` file does not list), and the report
+lists them under "Imported but not declared", with the likely pip name (`yaml` -> `pyyaml`,
+`sklearn` -> `scikit-learn`, `cv2` -> `opencv-python`) and the files that import them. This
+is information only: nothing is installed because of it.
 
 `--sandbox-requirements FILE` (for `fix` and `verify`) replaces apifix's dependency detection
 with your own requirements file for both the original code and the fix. The fix's own

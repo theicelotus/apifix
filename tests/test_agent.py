@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from apifix import cli
+from apifix.engine import agent as agent_module
 from apifix.engine.agent import (
     NO_CALL_NUDGE,
     AgentConfig,
@@ -2354,3 +2355,32 @@ def test_report_lists_the_users_library_pin_the_fixed_run_replaced(repo):
         "- Fixed run: `openai==0.28.1` from --sandbox-requirements reqs.txt replaced by "
         "`openai>=1.0,<2` (the migration's target; no edit of the fix changed this library)"
     ) in result.report_markdown.splitlines()
+
+
+# --- imported but not declared ------------------------------------------------------------------
+
+
+def test_fix_report_lists_imports_nothing_declares_before_the_baseline(tmp_path, monkeypatch):
+    files = {**ORIGINAL, "tests/test_extra.py": "import nlpaug\n\n\ndef test_x():\n    pass\n"}
+    repo = write_tree(tmp_path / "repo", files)
+    order: list[str] = []
+    real = agent_module.undeclared_imports
+    monkeypatch.setattr(
+        agent_module,
+        "undeclared_imports",
+        lambda root, override=None: order.append("imports") or real(root, override),
+    )
+
+    class Recording(JudgingSandbox):
+        def run(self, repo, *, coverage=False, env=None):
+            order.append("baseline")
+            return super().run(repo, coverage=coverage, env=env)
+
+    result = wf(repo, FakeLLM(list(GOOD)), Recording())
+    assert order == ["imports", "baseline"]
+    report = result.report_markdown
+    assert "- `nlpaug` (pip: `nlpaug`): tests/test_extra.py" in report
+    assert report.index("## Imported but not declared") < report.index("## Verification")
+    assert result.trajectory["job"]["undeclared_imports"] == [
+        {"module": "nlpaug", "distribution": "nlpaug", "files": ["tests/test_extra.py"]}
+    ]

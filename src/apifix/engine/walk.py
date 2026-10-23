@@ -53,6 +53,19 @@ def iter_files(root: Path) -> Iterator[Path]:
                 yield file
 
 
+def repo_module_names(root: Path) -> set[str]:
+    """Names a repo's own code can be imported by at the top level: every Python file's stem
+    and every directory that holds Python files."""
+    names: set[str] = set()
+    for path in iter_files(root):
+        if path.suffix != ".py":
+            continue
+        parts = path.relative_to(root).parts
+        names.add(path.stem)
+        names.update(parts[:-1])
+    return names
+
+
 def copy_repo(src: Path, dst: Path) -> None:
     """Copy a repo without its tooling dirs (.git, venvs, caches). Symlinks are copied as links,
     never followed."""

@@ -18,6 +18,12 @@ from pathlib import Path
 from typing import Any
 
 from apifix.engine.diffing import diff_trees, unified_diff
+from apifix.engine.imports import (
+    UndeclaredImport,
+    undeclared_imports,
+    undeclared_record,
+    undeclared_section,
+)
 from apifix.engine.migrations import Migration, get_migration
 from apifix.engine.project import ci_env_vars
 from apifix.engine.sandbox import Sandbox, SandboxResult
@@ -26,6 +32,7 @@ from apifix.engine.verifier import (
     Verification,
     VerifierConfig,
     downloads_line,
+    requirements_override,
     run_summary,
     sandbox_requirements_lines,
     sandbox_requirements_record,
@@ -131,6 +138,7 @@ def verify_diff(
             )
         applied = unified_diff(original, work, changes)
 
+        undeclared = undeclared_imports(original, requirements_override(sandbox))
         t0 = time.monotonic()
         baseline = sandbox.run(original, env=env)
         baseline_s = time.monotonic() - t0
@@ -155,6 +163,7 @@ def verify_diff(
             "files_changed": [ch.path for ch in changes],
             "sandbox_env_placeholders": ci_env,
             "sandbox_requirements": sandbox_requirements_record(sandbox),
+            "undeclared_imports": undeclared_record(undeclared),
             "started_at": started.isoformat(),
             "finished_at": datetime.now(UTC).isoformat(),
         },
@@ -179,6 +188,7 @@ def verify_diff(
         baseline_s,
         verify_s,
         sandbox_requirements_lines(sandbox),
+        undeclared,
     )
     return VerifyResult(v.verdict, reason, applied, v, report, trajectory)
 
@@ -198,6 +208,7 @@ def _report(
     baseline_s: float,
     verify_s: float,
     dependency_lines: Sequence[str] = (),
+    undeclared: Sequence[UndeclaredImport] = (),
 ) -> str:
     lines = [
         f"# apifix verify: {_TITLES[v.verdict]}",
@@ -229,5 +240,5 @@ def _report(
     downloads = downloads_line(runs)
     if downloads:
         lines.append(downloads)
-    lines += ["", v.report_markdown()]
+    lines += ["", *undeclared_section(list(undeclared)), v.report_markdown()]
     return "\n".join(lines).rstrip() + "\n"

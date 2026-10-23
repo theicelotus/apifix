@@ -8,6 +8,7 @@ import pytest
 
 from apifix.engine.models import LibraryTarget
 from apifix.engine.project import (
+    CONTINUE_ON_COLLECTION_ERRORS,
     PYTEST_COMMAND,
     SandboxRequirements,
     build_install_plan,
@@ -19,6 +20,9 @@ from apifix.engine.project import (
     load_sandbox_requirements,
     pytest_config,
 )
+
+# what detect_tests runs: pytest, past collection errors
+RUN = (*PYTEST_COMMAND, CONTINUE_ON_COLLECTION_ERRORS)
 
 
 def write(root: Path, files: dict[str, str]) -> Path:
@@ -162,7 +166,7 @@ def test_pytest_signals(tmp_path, files, reason):
     write(tmp_path, {"tests/test_a.py": "import unittest\n", **files})
     plan = detect_tests(tmp_path)
     assert plan.runner == "pytest" and plan.reason == reason
-    assert plan.command == (*PYTEST_COMMAND, "tests/test_a.py")
+    assert plan.command == (*RUN, "tests/test_a.py")
 
 
 def test_plain_test_functions_use_pytest(tmp_path):
@@ -185,7 +189,7 @@ def test_unittest_only_runs_with_pytest_and_explicit_files(tmp_path):
     assert plan.runner == "pytest"
     # conftest.py and helpers under tests/ are test files, but not given to pytest to collect
     assert plan.test_files == ("pkg/test_b.py", "pkg/tests.py")
-    assert plan.command == (*PYTEST_COMMAND, "pkg/test_b.py", "pkg/tests.py")
+    assert plan.command == (*RUN, "pkg/test_b.py", "pkg/tests.py")
 
 
 def test_names_pytest_would_not_collect_are_passed_explicitly(tmp_path):
@@ -211,8 +215,40 @@ def test_configured_collection_is_kept(tmp_path):
         },
     )
     plan = detect_tests(tmp_path)
-    assert plan.command == PYTEST_COMMAND
+    assert plan.command == RUN
     assert plan.reason == "pytest.ini; collection as configured in pytest.ini"
+
+
+@pytest.mark.parametrize(
+    ("addopts", "stop"),
+    [
+        ("-x", "-x"),
+        ("-q -xvs", "-x"),
+        ("--exitfirst", "--exitfirst"),
+        ("--maxfail=2", "--maxfail 2"),
+        ("--maxfail 1", "--maxfail 1"),
+        ("--sw", "--sw"),
+        ("--stepwise", "--stepwise"),
+    ],
+)
+def test_addopts_that_stop_at_the_first_failure_keep_the_repos_behaviour(tmp_path, addopts, stop):
+    write(tmp_path, {"pytest.ini": f"[pytest]\naddopts = {addopts}\n", "tests/test_a.py": ""})
+    plan = detect_tests(tmp_path)
+    assert CONTINUE_ON_COLLECTION_ERRORS not in plan.command
+    assert plan.command == (*PYTEST_COMMAND, "tests/test_a.py")
+    assert (
+        f"pytest.ini addopts stops at the first failure ({stop}): a module that fails to collect "
+        "still ends the session"
+    ) in plan.notes
+
+
+@pytest.mark.parametrize(
+    "addopts",
+    ["-q", "--maxfail=0", "-rxXs", "-p no:xdist", "-pno:xdist", "-k 'not x'", "-n 4", "--strict"],
+)
+def test_addopts_that_do_not_stop_early_get_the_flag(tmp_path, addopts):
+    write(tmp_path, {"pytest.ini": f"[pytest]\naddopts = {addopts}\n", "tests/test_a.py": ""})
+    assert detect_tests(tmp_path).command == (*RUN, "tests/test_a.py")
 
 
 # --- test files -------------------------------------------------------------------------------
@@ -281,7 +317,7 @@ def test_sibling_import_in_a_package_gets_an_import_path(tmp_path):
     assert plan.notes == (
         "added svc/ to the import path: svc/testserver.py imports server from it",
     )
-    assert plan.command == (*PYTEST_COMMAND, "svc/testserver.py")
+    assert plan.command == (*RUN, "svc/testserver.py")
 
 
 def test_module_in_a_parent_dir_is_found(tmp_path):
@@ -316,7 +352,7 @@ def test_repo_pythonpath_config_replaces_the_guess(tmp_path):
     plan = detect_tests(write(tmp_path, files))
     assert plan.import_paths == ("lib",)
     assert plan.notes == ("import path from pyproject.toml pythonpath: lib",)
-    assert plan.command == (*PYTEST_COMMAND, "svc/testserver.py")  # no testpaths: explicit
+    assert plan.command == (*RUN, "svc/testserver.py")  # no testpaths: explicit
 
 
 @pytest.mark.parametrize(
@@ -331,7 +367,11 @@ def test_repo_pythonpath_config_replaces_the_guess(tmp_path):
             {"setup.cfg": "[tool:pytest]\ntestpaths = tests\npython_files = check_*.py\n"},
             ("setup.cfg", {"testpaths": ["tests"], "python_files": ["check_*.py"]}),
         ),
-        ({"tox.ini": "[pytest]\naddopts = -q\n"}, ("tox.ini", {})),
+        ({"tox.ini": "[pytest]\naddopts = -q\n"}, ("tox.ini", {"addopts": ["-q"]})),
+        (
+            {"pyproject.toml": "[tool.pytest.ini_options]\naddopts = \"-k 'a and b' -x\"\n"},
+            ("pyproject.toml", {"addopts": ["-k", "a and b", "-x"]}),
+        ),
         (
             {"pyproject.toml": '[tool.pytest.ini_options]\ntestpaths = "tests"\n'},
             ("pyproject.toml", {"testpaths": ["tests"]}),

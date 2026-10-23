@@ -1,0 +1,20 @@
+[project]
+name = "suspense"
+version = "0.1.0"
+dependencies = [
+    "openai==0.28.1",
+    "pyyaml",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+ml = ["torch"]
+nlp = ["vaderSentiment"]
+adversarial = [
+    # "textattack",  # incompatible with Python 3.13
+    # "nlpaug",      # depends on textattack
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
