@@ -297,19 +297,29 @@ of this repo.
 | 2026-10-15 | fixture (live test) | `qwen2.5-coder:7b` (Ollama) | whole-file | CPU only | 2 | 48 min | 12,825 | verified | [JSON](benchmark/live/2026-10-15-qwen2.5-coder-7b-whole-file-verified.json) |
 | 2026-10-22 | [brianAbell/AI-powered-Resume-Analyzer-and-Feedback-Generator](https://github.com/brianAbell/AI-powered-Resume-Analyzer-and-Feedback-Generator) | `openai/gpt-oss-120b` (hosted free tier, $0) | whole-file | hosted | 1 | 140 s | 12,675 | verified | not published (repo has no license) |
 | 2026-10-23 | [MattOates/djgpt](https://github.com/MattOates/djgpt) | `openai/gpt-oss-120b` (hosted free tier, $0) | whole-file | hosted | 1 | 156 s | 20,750 | verified_weak | not published |
+| 2026-10-23 | [HCAI-Lab-GT/SuspensePerception](https://github.com/HCAI-Lab-GT/SuspensePerception) | `openai/gpt-oss-120b` (hosted free tier, $0) | whole-file | hosted | 1 | 271 s | 16,168 | verified_weak | not published (repo has no license) |
 
 2026-10-22: a Flask app on openai 0.28.1, CRLF line endings, tests in `backend/testapp.py`.
 Time: LLM 57 s, sandbox 82 s with the pip cache warm. All 8 findings resolved, 100%
 changed-line coverage; 4 tests that need PDF files missing from the repo fail before and after
 the fix, so they count as no signal, not as passes.
 
-2026-10-23: an MIT-licensed CLI with its dependencies in pixi and conda files, including speech
-libraries that cannot install in the sandbox, so it ran with `--sandbox-requirements`. Time: LLM
-105 s (83 s of it rate-limit waits), sandbox 43 s. 23 tests passed and 1 skipped, before and
-after the fix. apifix set both openai pins itself, without the model, and reverted one
-unrelated text edit the model made. The CLI's API key assignment was kept and the call moved to
-the module-level client. No test runs the 2 changed lines in `src/djgpt/prompt.py`, so the
+2026-10-23 (djgpt): an MIT-licensed CLI with its dependencies in pixi and conda files, including
+speech libraries that cannot install in the sandbox, so it ran with `--sandbox-requirements`.
+Time: LLM 105 s (83 s of it rate-limit waits), sandbox 43 s. 23 tests passed and 1 skipped,
+before and after the fix. apifix set both openai pins itself, without the model, and reverted
+one unrelated text edit the model made. The CLI's API key assignment was kept and the call moved
+to the module-level client. No test runs the 2 changed lines in `src/djgpt/prompt.py`, so the
 report lists them for review by hand.
+
+2026-10-23 (SuspensePerception): a research project that declared openai without a version
+while `uv.lock` had 1.99.2 and the code used the 0.x API, so it was broken for anyone
+installing it. apifix set `openai>=1.0,<2` itself and noted `uv.lock` for regenerating. Heavy
+NLP packages the repo imports but does not declare made it run with `--sandbox-requirements`.
+Time: LLM 70 s, sandbox 193 s. The repo's own suite fails 11 of its 13 tests before and after
+the fix (a fixture called directly, an outdated function signature), so apifix reports them as
+no signal, each with its reason. The fixed test mock patches `src.thriller.api.OpenAI` and
+`src.thriller.misc.OpenAI`, where the code uses the name.
 
 `verified_weak` means the tests pass but do not exercise the migrated code, so the fix still
 needs a human review.
