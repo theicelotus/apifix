@@ -7,9 +7,11 @@ The candidate is compared with the original line by line (the same diff as
 - text-only hunks (the token streams match once comments, blank lines, whitespace and string
   contents are set aside) are kept when they touch a string on a finding's line, or only change
   comments/whitespace near a finding's statement; any other is reverted to the original;
-- code hunks near a finding's statement, or that use a name the migration's code binds or
-  introduces or an attribute it accesses, are kept; any other is an error (sent back through
-  the check retry).
+- code hunks near a finding's statement are kept; so are code hunks elsewhere that use an
+  openai-bound name (see _Bound: the library's names and what is assigned from them, in scope)
+  or a name a near code hunk binds or introduces, in the same scope; any other is an error
+  (sent back through the check retry). Attribute names alone (`.chat`, `.choices`, which other
+  SDKs share) never make a hunk related.
 
 After the reverts, every string constant of the original must still be in the candidate (as a
 multiset over the whole file), except strings on a finding's lines (mock targets, removed
@@ -247,47 +249,6 @@ def _exempt_node(
 # --- names ------------------------------------------------------------------------------------
 
 
-def _bound(nodes: Iterable[ast.AST]) -> set[str]:
-    names: set[str] = set()
-    for n in nodes:
-        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store | ast.Del):
-            names.add(n.id)
-        elif isinstance(n, ast.arg):
-            names.add(n.arg)
-        elif isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
-            names.add(n.name)
-        elif isinstance(n, ast.alias):
-            names.add((n.asname or n.name).split(".")[0])
-        elif isinstance(n, ast.ExceptHandler) and n.name:
-            names.add(n.name)
-    return names - _NEVER_NAMES
-
-
-def _used(nodes: Iterable[ast.AST]) -> tuple[set[str], set[str]]:
-    """(identifiers, attribute names) in `nodes`."""
-    names: set[str] = set()
-    attrs: set[str] = set()
-    for n in nodes:
-        if isinstance(n, ast.Name):
-            names.add(n.id)
-        elif isinstance(n, ast.Attribute):
-            attrs.add(n.attr)
-        elif isinstance(n, ast.Global | ast.Nonlocal):
-            names.update(n.names)
-    return names | _bound(nodes), attrs
-
-
-def _instance_attributes(nodes: Iterable[ast.AST]) -> set[str]:
-    """`x` of every `self.x` / `cls.x`."""
-    return {
-        n.attr
-        for n in nodes
-        if isinstance(n, ast.Attribute)
-        and isinstance(n.value, ast.Name)
-        and n.value.id in ("self", "cls")
-    }
-
-
 def _library_names(tree: ast.Module, library_modules: Collection[str]) -> set[str]:
     """The library's module names and the names a file imports from it."""
     names = set(library_modules)
@@ -303,6 +264,334 @@ def _library_names(tree: ast.Module, library_modules: Collection[str]) -> set[st
         ):
             names.update(a.asname or a.name for a in node.names if a.name != "*")
     return names
+
+
+# --- scopes and openai-bound names -------------------------------------------------------------
+
+_DEFS = (ast.FunctionDef, ast.AsyncFunctionDef)
+_PATCH_CALLS = frozenset({"patch", "mock.patch", "unittest.mock.patch", "mocker.patch"})
+_PATCH_OBJECT_CALLS = frozenset(f"{p}.object" for p in _PATCH_CALLS)
+_PATCH_VALUES = ("new", "return_value", "side_effect", "wraps")  # keywords naming the stand-in
+
+
+def _qual(scope: str, name: str) -> str:
+    return f"{scope}.{name}" if scope else name
+
+
+def _enclosing(scope: str) -> list[str]:
+    """`scope` and the scopes around it, innermost first: "C.m" -> ["C.m", "C", ""]."""
+    out = [scope]
+    while scope:
+        scope = scope.rpartition(".")[0]
+        out.append(scope)
+    return out
+
+
+def _dotted(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        base = _dotted(node.value)
+        return f"{base}.{node.attr}" if base else None
+    return None
+
+
+def _self_attr(node: ast.AST) -> str | None:
+    """`x` of `self.x` / `cls.x`."""
+    if (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id in ("self", "cls")
+    ):
+        return node.attr
+    return None
+
+
+class _Scopes:
+    """Each node's scope: the qualified name of the innermost def or class around it ("" for
+    the module, "C.m" for a method). A def's name, decorators and a class's bases belong to
+    the scope around it."""
+
+    def __init__(self, tree: ast.Module) -> None:
+        self.of: dict[int, str] = {}
+        self.cls: dict[str, str] = {}  # function scope -> the class scope its self/cls sees
+        self.defs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+        self.methods: set[str] = set()
+        stack: list[tuple[ast.AST, str, str, bool]] = [(tree, "", "", False)]
+        while stack:
+            node, scope, cls, in_class = stack.pop()
+            self.of[id(node)] = scope
+            outer: list[ast.AST]
+            if isinstance(node, ast.ClassDef):
+                inner = _qual(scope, node.name)
+                outer = [*node.decorator_list, *node.bases, *node.keywords]
+                stack += [(n, scope, cls, in_class) for n in outer]
+                stack += [(n, inner, inner, True) for n in node.body]
+            elif isinstance(node, _DEFS):
+                inner = _qual(scope, node.name)
+                self.defs[inner] = node
+                self.cls[inner] = cls
+                if in_class:
+                    self.methods.add(inner)
+                outer = [*node.decorator_list, *([node.returns] if node.returns else [])]
+                stack += [(n, scope, cls, in_class) for n in outer]
+                stack += [(n, inner, cls, False) for n in [node.args, *node.body]]
+            else:
+                stack += [(n, scope, cls, in_class) for n in ast.iter_child_nodes(node)]
+
+    def scope(self, node: ast.AST) -> str:
+        return self.of.get(id(node), "")
+
+    def class_of(self, scope: str) -> str:
+        return self.cls.get(scope, "")
+
+
+def _own_nodes(fn: ast.AST) -> Iterable[ast.AST]:
+    """The nodes of a function's body, without nested defs, classes and lambdas."""
+    stack = list(ast.iter_child_nodes(fn))
+    while stack:
+        node = stack.pop()
+        yield node
+        if not isinstance(node, (*_DEFS, ast.ClassDef, ast.Lambda)):
+            stack += ast.iter_child_nodes(node)
+
+
+class _Bound:
+    """The openai-bound names of one version of the file, by scope: the library's module names
+    and the names imported from it; names (and `self.x`) assigned from an expression rooted at
+    one (`client = OpenAI()`, `r = client.chat.completions.create(...)`, `for c in r.choices`,
+    `with patch("openai.X") as m`); the stand-ins a library patch is given (`new`,
+    `return_value`, ...) and the parameters `@patch("openai.X")` decorators fill; functions
+    that return or yield a bound object or call (`get_client()`); and the parameters of a
+    function the file calls with a bound name or call (`first_choice(response)`). Computed to a
+    fixed point, flow-insensitive."""
+
+    MAX_ROUNDS = 20
+
+    def __init__(self, tree: ast.Module, scopes: _Scopes, library_modules: Collection[str]):
+        self.scopes, self.library = scopes, frozenset(library_modules)
+        self.names: set[tuple[str, str]] = {("", n) for n in _library_names(tree, library_modules)}
+        self.attrs: set[tuple[str, str]] = set()  # (class scope, x) of self.x
+        nodes = list(ast.walk(tree))
+        for _ in range(self.MAX_ROUNDS):
+            if not any([self._step(node) for node in nodes]):
+                break
+
+    # lookups
+
+    def name(self, name: str, scope: str) -> bool:
+        return any((s, name) in self.names for s in _enclosing(scope))
+
+    def attr(self, attr: str, scope: str) -> bool:
+        return (self.scopes.class_of(scope), attr) in self.attrs
+
+    def library_patch(self, node: ast.AST) -> bool:
+        """`patch("openai.X")` (any patch function) or `patch.object(<bound>, ...)`."""
+        if not isinstance(node, ast.Call) or not node.args:
+            return False
+        func, first = _dotted(node.func), node.args[0]
+        if func in _PATCH_CALLS:
+            return (
+                isinstance(first, ast.Constant)
+                and isinstance(first.value, str)
+                and first.value.split(".")[0] in self.library
+            )
+        return func in _PATCH_OBJECT_CALLS and self.rooted(first, self.scopes.scope(node))
+
+    def refers(self, node: ast.AST) -> bool:
+        """Does this node itself name something bound (a name, `self.x`, a library patch)?"""
+        scope = self.scopes.scope(node)
+        if isinstance(node, ast.Name):
+            return self.name(node.id, scope)
+        if isinstance(node, ast.arg):
+            return self.name(node.arg, scope)
+        attr = _self_attr(node)
+        if attr is not None:
+            return self.attr(attr, scope)
+        return self.library_patch(node)
+
+    def rooted(self, expr: ast.AST, scope: str, objects_only: bool = False) -> bool:
+        """Is `expr` rooted at a bound name: a name, attribute, subscript or call chain on one
+        (`client.chat.completions.create(...)`, `r.choices[0]`), through await, `a or b` and
+        `a if c else b`. With `objects_only`, attribute and subscript access that does not end
+        in a call is not enough (`r.choices[0].message.content` is data, not a client or a
+        response)."""
+        if isinstance(expr, ast.Await):
+            return self.rooted(expr.value, scope, objects_only)
+        if isinstance(expr, ast.BoolOp):
+            return any(self.rooted(v, scope, objects_only) for v in expr.values)
+        if isinstance(expr, ast.IfExp):
+            return self.rooted(expr.body, scope, objects_only) or self.rooted(
+                expr.orelse, scope, objects_only
+            )
+        if (
+            objects_only
+            and isinstance(expr, ast.Attribute | ast.Subscript)
+            and _self_attr(expr) is None
+        ):
+            return False
+        node: ast.AST = expr
+        while True:
+            if self.library_patch(node):
+                return True
+            attr = _self_attr(node)
+            if attr is not None:
+                return self.attr(attr, scope)
+            if isinstance(node, ast.Name):
+                return self.name(node.id, scope)
+            if isinstance(node, ast.Attribute | ast.Subscript):
+                node = node.value
+            elif isinstance(node, ast.Call):
+                node = node.func
+            else:
+                return False
+
+    # propagation
+
+    def _bind(self, target: ast.AST, scope: str) -> bool:
+        before = len(self.names) + len(self.attrs)
+        if isinstance(target, ast.Name):
+            self.names.add((scope, target.id))
+        elif isinstance(target, ast.Tuple | ast.List):
+            for elt in target.elts:
+                self._bind(elt, scope)
+        elif isinstance(target, ast.Starred):
+            self._bind(target.value, scope)
+        elif (attr := _self_attr(target)) is not None:
+            self.attrs.add((self.scopes.class_of(scope), attr))
+        return len(self.names) + len(self.attrs) > before
+
+    def _step(self, node: ast.AST) -> bool:
+        scope = self.scopes.scope(node)
+        changed = False
+        if isinstance(node, ast.Assign):
+            if self.rooted(node.value, scope):
+                for t in node.targets:
+                    changed |= self._bind(t, scope)
+        elif isinstance(node, ast.AnnAssign | ast.AugAssign | ast.NamedExpr):
+            if node.value is not None and self.rooted(node.value, scope):
+                changed |= self._bind(node.target, scope)
+        elif isinstance(node, ast.With | ast.AsyncWith):
+            for item in node.items:
+                if item.optional_vars is not None and self.rooted(item.context_expr, scope):
+                    changed |= self._bind(item.optional_vars, scope)
+        elif isinstance(node, ast.For | ast.AsyncFor | ast.comprehension):
+            if self.rooted(node.iter, scope):
+                changed |= self._bind(node.target, scope)
+        elif isinstance(node, ast.Call):
+            changed |= self._call(node, scope)
+        elif isinstance(node, _DEFS):
+            changed |= self._def(node, scope)
+        return changed
+
+    def _call(self, node: ast.Call, scope: str) -> bool:
+        changed = False
+        if self.library_patch(node):
+            given = node.args[1:2] if _dotted(node.func) in _PATCH_CALLS else node.args[2:3]
+            given += [k.value for k in node.keywords if k.arg in _PATCH_VALUES]
+            for value in given:
+                changed |= self._bind(value, scope)  # only names and self.x bind
+        callee = self._callee(node.func, scope)
+        if callee is None:
+            return changed
+        qual, fn = callee
+        params = [*fn.args.posonlyargs, *fn.args.args]
+        if qual in self.scopes.methods and isinstance(node.func, ast.Attribute):
+            params = params[1:]  # self.m(...): the instance fills the first parameter
+        named = {a.arg for a in [*params, *fn.args.kwonlyargs]}
+        for i, arg in enumerate(node.args):
+            if isinstance(arg, ast.Starred):
+                break
+            if i < len(params) and self.rooted(arg, scope, objects_only=True):
+                changed |= self._bind(ast.Name(params[i].arg, ast.Store()), qual)
+        for k in node.keywords:
+            if k.arg in named and self.rooted(k.value, scope, objects_only=True):
+                changed |= self._bind(ast.Name(k.arg, ast.Store()), qual)
+        return changed
+
+    def _callee(
+        self, func: ast.AST, scope: str
+    ) -> tuple[str, ast.FunctionDef | ast.AsyncFunctionDef] | None:
+        """The file's own function a call reaches: `f(...)` (in this scope or one around it) or
+        `self.m(...)` (a method of this class)."""
+        if isinstance(func, ast.Name):
+            for s in _enclosing(scope):
+                qual = _qual(s, func.id)
+                if qual in self.scopes.defs:
+                    return qual, self.scopes.defs[qual]
+            return None
+        attr = _self_attr(func)
+        if attr is not None:
+            qual = _qual(self.scopes.class_of(scope), attr)
+            if qual in self.scopes.defs:
+                return qual, self.scopes.defs[qual]
+        return None
+
+    def _def(self, fn: ast.FunctionDef | ast.AsyncFunctionDef, scope: str) -> bool:
+        changed = False
+        inner = _qual(scope, fn.name)
+        returns = any(
+            isinstance(n, ast.Return | ast.Yield | ast.YieldFrom)
+            and n.value is not None
+            and self.rooted(n.value, inner, objects_only=True)
+            for n in _own_nodes(fn)
+        )
+        if returns:
+            if inner in self.scopes.methods:
+                before = len(self.attrs)
+                self.attrs.add((scope, fn.name))
+                changed |= len(self.attrs) > before
+            else:
+                changed |= self._bind(ast.Name(fn.name, ast.Store()), scope)
+        # @patch("openai.X") decorators fill the test's parameters, the lowest decorator first
+        params = [a.arg for a in [*fn.args.posonlyargs, *fn.args.args]]
+        if params and params[0] in ("self", "cls"):
+            params = params[1:]
+        slot = 0
+        for deco in reversed(fn.decorator_list):
+            if not isinstance(deco, ast.Call) or not self._injects(deco):
+                continue
+            if slot < len(params) and self.library_patch(deco):
+                changed |= self._bind(ast.Name(params[slot], ast.Store()), inner)
+            slot += 1
+        return changed
+
+    @staticmethod
+    def _injects(deco: ast.Call) -> bool:
+        """Does this patch decorator pass the test a mock (no `new` given)?"""
+        func = _dotted(deco.func)
+        if any(k.arg == "new" for k in deco.keywords):
+            return False
+        if func in _PATCH_CALLS:
+            return len(deco.args) < 2
+        return func in _PATCH_OBJECT_CALLS and len(deco.args) < 3
+
+
+def _named(node: ast.AST) -> list[str]:
+    """The names a node uses or binds (not attributes)."""
+    if isinstance(node, ast.Name):
+        return [node.id]
+    if isinstance(node, ast.arg):
+        return [node.arg]
+    if isinstance(node, (*_DEFS, ast.ClassDef)):
+        return [node.name]
+    if isinstance(node, ast.ExceptHandler) and node.name:
+        return [node.name]
+    if isinstance(node, ast.Global | ast.Nonlocal):
+        return list(node.names)
+    return []
+
+
+def _alias_and_attr(node: ast.AST) -> list[str]:
+    if isinstance(node, ast.alias):
+        return [(node.asname or node.name).split(".")[0]]
+    return [node.attr] if isinstance(node, ast.Attribute) else []
+
+
+def _binds(node: ast.AST) -> bool:
+    if isinstance(node, ast.Name):
+        return isinstance(node.ctx, ast.Store | ast.Del)
+    return isinstance(node, (ast.arg, ast.ExceptHandler, ast.ClassDef, ast.Global, *_DEFS))
 
 
 # --- the check --------------------------------------------------------------------------------
@@ -330,6 +619,9 @@ class _Diff:
         self.finding_lines = lines
         self.exempt_lines, self.exempt_keys = _exempt_positions(self.old, findings)
         self.library_modules = library_modules
+        self.old_scopes, self.new_scopes = _Scopes(self.old.tree), _Scopes(self.new.tree)
+        self.old_bound = _Bound(self.old.tree, self.old_scopes, library_modules)
+        self.new_bound = _Bound(self.new.tree, self.new_scopes, library_modules)
         self.judged = self._judge()
 
     # one hunk's sides
@@ -383,6 +675,13 @@ class _Diff:
         old, new = self._tokens(h)
         return _strings(old) == _strings(new)
 
+    def _sides(self, h: Hunk) -> list[tuple[list[ast.AST], _Scopes, _Bound]]:
+        """Each side's nodes, with that version's scopes and openai-bound names."""
+        return [
+            (self.old.nodes_in(*self._old_side(h)), self.old_scopes, self.old_bound),
+            (self.new.nodes_in(*self._new_side(h)), self.new_scopes, self.new_bound),
+        ]
+
     def _judge(self) -> list[_Judged]:
         kinds = []
         for h in self.hunks:
@@ -392,24 +691,30 @@ class _Diff:
                 kinds.append((h, "text"))
             else:
                 kinds.append((h, "code"))
-        # Migration names: the library's; names bound on either side of the code hunks near a
-        # finding and on the candidate side of import hunks; names those code hunks introduce
-        # (used on the candidate side, nowhere in the original: `client`, also as an instance
-        # attribute `self.client`); attributes they access.
-        names = _library_names(self.new.tree, self.library_modules)
-        attrs: set[str] = set()
-        before_names, before_attrs = _used(ast.walk(self.old.tree))
-        before = before_names | before_attrs
+        # Names of the code hunks near a finding, by scope: what they bind on either side, and
+        # what they introduce (used on the candidate side, nowhere in the original: `client`,
+        # also as an instance attribute `self.client`, kept per class). A name counts only in
+        # its own scope and the scopes inside it, so a `mock_client` or `response` bound near a
+        # finding says nothing about another function's variable of the same name. Imports do
+        # not count here: the library's are openai-bound, and others (SimpleNamespace) are
+        # shared by everything.
+        before = {
+            name for n in ast.walk(self.old.tree) for name in [*_named(n), *_alias_and_attr(n)]
+        }
+        scoped: set[tuple[str, str]] = set()
+        scoped_attrs: set[tuple[str, str]] = set()
         for h, kind in kinds:
-            if kind == "import":
-                names |= _bound(self.new.nodes_in(*self._new_side(h)))
-            elif kind == "code" and self._near(h):
-                new_nodes = self.new.nodes_in(*self._new_side(h))
-                used, accessed = _used(new_nodes)
-                names |= _bound(self.old.nodes_in(*self._old_side(h))) | _bound(new_nodes)
-                names |= (used | _instance_attributes(new_nodes)) - before
-                attrs |= accessed
-        names -= _NEVER_NAMES
+            if kind != "code" or not self._near(h):
+                continue
+            for i, (nodes, scopes, _) in enumerate(self._sides(h)):
+                for n in nodes:
+                    scope = scopes.scope(n)
+                    for name in _named(n):
+                        if _binds(n) or (i == 1 and name not in before):
+                            scoped.add((scope, name))
+                    attr = _self_attr(n)
+                    if i == 1 and attr is not None and attr not in before:
+                        scoped_attrs.add((scopes.class_of(scope), attr))
         judged = []
         for h, kind in kinds:
             if kind == "import":
@@ -418,16 +723,36 @@ class _Diff:
                 keep = self._touches_exempt(h) or (self._strings_equal(h) and self._near(h))
                 verdict = "keep" if keep else "revert"
             else:
-                used_names: set[str] = set()
-                used_attrs: set[str] = set()
-                for version, side in ((self.old, self._old_side(h)), (self.new, self._new_side(h))):
-                    n, a = _used(version.nodes_in(*side))
-                    used_names |= n
-                    used_attrs |= a
-                related = self._near(h) or bool(used_names & names) or bool(used_attrs & attrs)
+                related = self._near(h) or self._uses_migration_names(h, scoped, scoped_attrs)
                 verdict = "keep" if related else "reject"
             judged.append(_Judged(h, kind, verdict))
         return judged
+
+    def _uses_migration_names(
+        self, h: Hunk, scoped: set[tuple[str, str]], scoped_attrs: set[tuple[str, str]]
+    ) -> bool:
+        """Does a hunk away from the findings use an openai-bound name, or a name a near code
+        hunk binds or introduces, in its scope (an introduced `self.x`: `self.x` or the name
+        `x` in a method of the same class)? Attribute names alone never count."""
+        for nodes, scopes, bound in self._sides(h):
+            for n in nodes:
+                if bound.refers(n):
+                    return True
+                scope = scopes.scope(n)
+                cls = scopes.class_of(scope)
+                for name in _named(n):
+                    if name in _NEVER_NAMES:
+                        continue
+                    # a near hunk's name in this scope or one around it; or its new `self.x`
+                    # seen as a name in a method of that class (a parameter threaded into it)
+                    if any((s, name) in scoped for s in _enclosing(scope)) or (
+                        cls and (cls, name) in scoped_attrs
+                    ):
+                        return True
+                attr = _self_attr(n)
+                if attr is not None and (scopes.class_of(scope), attr) in scoped_attrs:
+                    return True
+        return False
 
     # messages
 

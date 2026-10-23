@@ -53,7 +53,7 @@ from apifix.engine.pin_edits import (
     pin_line,
     plan_pin_edits,
 )
-from apifix.engine.project import ci_env_vars
+from apifix.engine.project import ci_env_vars, is_test_file
 from apifix.engine.sandbox import Sandbox, SandboxResult
 from apifix.engine.scanner import scan
 from apifix.engine.verifier import (
@@ -68,7 +68,7 @@ from apifix.engine.verifier import (
     upgraded_text,
     verify,
 )
-from apifix.engine.walk import copy_repo
+from apifix.engine.walk import copy_repo, iter_files
 from apifix.engine.whole_file import (
     CODE_BLOCK_NUDGE,
     DEFAULT_MAX_BYTES,
@@ -381,9 +381,16 @@ class _Job:
         # whole-file: the migration's own checks of a rewritten file (built from the original
         # repo once per job), run after apifix's generic ones
         self.rewrite_checks = None
+        # whole-file: the repo's Python files, non-test and test (judged on the original), for
+        # the check of library patch targets against `from <library> import X` modules
+        self.wf_python_modules: tuple[str, ...] = ()
+        self.wf_test_files: tuple[str, ...] = ()
         if self.whole_file:
             checker = getattr(migration, "rewrite_checker", None)
             self.rewrite_checks = checker(repo, findings) if callable(checker) else None
+            python = [p.relative_to(repo).as_posix() for p in iter_files(repo) if p.suffix == ".py"]
+            self.wf_test_files = tuple(r for r in python if is_test_file(r, root=repo))
+            self.wf_python_modules = tuple(r for r in python if r not in self.wf_test_files)
 
     # --- budget -----------------------------------------------------------------------------
 
@@ -756,6 +763,8 @@ class _Job:
                     module_roots=module_roots(
                         path, self.baseline.import_paths if self.baseline else ()
                     ),
+                    python_modules=self.wf_python_modules,
+                    test_files=self.wf_test_files,
                     findings=[f for f in self.findings if f.file == path],
                     rewrite_checks=self.rewrite_checks,
                 )

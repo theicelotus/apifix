@@ -173,8 +173,6 @@ def test_revert_kinds_and_excerpts():
             "\nclass Assistant:",
             "\ndef get_client():\n    return openai.OpenAI()\n\n\nclass Assistant:",
         ),
-        # response access the scanner missed, in another function
-        ('    return data["choices"][0]\n', "    return data.choices[0]\n"),
         # a whitespace reflow of the migrated call
         (
             '            model="gpt-3.5-turbo",\n            temperature=0.2,\n',
@@ -186,6 +184,24 @@ def test_changes_the_migration_needs_are_kept(old, new):
     candidate = edit(GOOD_ASSISTANT, old, new)
     r, errors = check(ASSISTANT, candidate)
     assert (r.text, r.reverted, errors) == (candidate, [], [])
+
+
+def test_response_access_in_another_function_needs_a_link_to_the_library():
+    # first_choice() is never called with a response, so its `data` could be anything (another
+    # SDK's dict, stored JSON): the `.choices` attribute alone does not make the edit related
+    alone = edit(GOOD_ASSISTANT, '    return data["choices"][0]\n', "    return data.choices[0]\n")
+    assert check(ASSISTANT, alone)[1] == [
+        'original line 20: changed code unrelated to the migration ("return data["choices"][0]"); '
+        "keep it exactly as in the original"
+    ]
+    # called with the response, its parameter is bound to the library
+    linked = edit(
+        alone,
+        "return _clean(response.choices[0].message.content)",
+        "return _clean(first_choice(response).message.content)",
+    )
+    r, errors = check(ASSISTANT, linked)
+    assert (r.text, r.reverted, errors) == (linked, [], [])
 
 
 def test_mock_targets_response_keys_and_renamed_mocks_are_kept():
@@ -250,6 +266,225 @@ def test_a_renamed_mock_used_far_from_the_finding_is_kept():
         'original line 15: changed code unrelated to the migration ("assert checked"); '
         "keep it exactly as in the original"
     ]
+
+
+# --- another SDK with the same names (sdk_lookalike fixture) ----------------------------------
+
+LOOKALIKE = Path(__file__).parent / "fixtures" / "sdk_lookalike"
+LOOKALIKE_FINDINGS = scan(LOOKALIKE, "openai-v1").findings
+CONFTEST = (LOOKALIKE / "conftest.py").read_text()
+# the openai mock rewritten for 1.x, as a model did in a real run
+GOOD_CONFTEST = edit(
+    edit(
+        CONFTEST,
+        "from unittest.mock import MagicMock, patch\n",
+        "from types import SimpleNamespace\nfrom unittest.mock import MagicMock, patch\n",
+    ),
+    """    with patch("openai.ChatCompletion.create") as mock_create:
+        mock_create.return_value = {"choices": [{"message": {"content": canned_reply}}]}
+        yield mock_create
+""",
+    """    mock_client = MagicMock()
+    mock_client.chat.completions.create.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=canned_reply))]
+    )
+    with patch("src.storyteller.llm.OpenAI", return_value=mock_client):
+        yield mock_client
+""",
+)
+# ... and the other SDK's mock rewritten too: its local canned_reply is renamed, so content=
+# now refers to the module-level string instead of the mock
+LOOKALIKE_CONFTEST = edit(
+    edit(
+        GOOD_CONFTEST,
+        """    canned_reply = MagicMock()
+    canned_reply.choices = [MagicMock(message=MagicMock(content=canned_reply))]
+""",
+        '''    """Patch the Acme client to return a 1.x-style response object."""
+    acme_reply = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=canned_reply))]
+    )
+''',
+    ),
+    "acme_client.chat.completions.create.return_value = canned_reply",
+    "acme_client.chat.completions.create.return_value = acme_reply",
+)
+
+
+def lookalike_check(path: str, old: str, new: str) -> list[str]:
+    findings = [f for f in LOOKALIKE_FINDINGS if f.file == path]
+    r = revert_text_edits(old, new, findings, LIBRARY)
+    assert r.reverted == []
+    return r.errors + unrelated_edits(old, r.text, findings, LIBRARY)
+
+
+def test_the_other_sdks_mock_is_rejected_and_the_openai_mock_kept():
+    assert lookalike_check("conftest.py", CONFTEST, GOOD_CONFTEST) == []
+    assert lookalike_check("conftest.py", CONFTEST, LOOKALIKE_CONFTEST) == [
+        'original line 22: changed code unrelated to the migration ("canned_reply = '
+        'MagicMock()"); keep it exactly as in the original',
+        "original line 26: changed code unrelated to the migration "
+        '("acme_client.chat.completions.create.return_value = canned_reply"); keep it exactly '
+        "as in the original",
+    ]
+
+
+def test_the_app_code_next_to_the_other_sdk_is_kept():
+    path = "src/storyteller/llm.py"
+    old = (LOOKALIKE / path).read_text()
+    new = edit(
+        edit(old, "import openai\n", "from openai import OpenAI\n"),
+        "        response = openai.ChatCompletion.create(",
+        "        client = OpenAI()\n        response = client.chat.completions.create(",
+    )
+    new = edit(
+        new,
+        '\n        return response["choices"][0]["message"]["content"]',
+        "        # 1.x responses are objects\n        return response.choices[0].message.content",
+    )
+    assert lookalike_check(path, old, new) == []
+    # the other SDK's call, edited with the same names, is not
+    acme = edit(
+        new,
+        "            messages=messages,\n        )\n        return reply",
+        "            messages=list(messages),\n        )\n        return reply",
+    )
+    assert lookalike_check(path, old, acme) == [
+        'original line 24: changed code unrelated to the migration ("messages=messages,"); '
+        "keep it exactly as in the original"
+    ]
+
+
+BOUND = """\
+import acmechat
+import openai
+
+
+def ask(question):
+    response = openai.ChatCompletion.create(model="m", messages=[question])
+    first = 1
+    second = 2
+    third = 3
+    record(response)
+    return first + second + third
+
+
+def other(question):
+    response = acmechat.chat.completions.create(model="a", messages=[question])
+    first = 1
+    second = 2
+    third = 3
+    record(response)
+    return first + second + third
+
+
+def get_client():
+    return openai.OpenAI()
+
+
+def get_acme():
+    return acmechat.Client()
+
+
+def ping_openai():
+    client = get_client()
+    client.ping()
+
+
+def ping_acme():
+    client = get_acme()
+    client.ping()
+
+
+class Bot:
+    def __init__(self):
+        self.client = openai.OpenAI()
+        self.acme = acmechat.Client()
+
+    def close(self):
+        self.client.close()
+        self.acme.close()
+
+
+def record(item):
+    print(item)
+"""
+BOUND_MIGRATED = edit(
+    BOUND, "response = openai.ChatCompletion.create(", "response = openai.chat.completions.create("
+)
+RECORD = "    record(response)\n    return first + second + third\n\n\ndef "
+RECORD_DUMP = "    record(response.model_dump())\n    return first + second + third\n\n\ndef "
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "line"),
+    [
+        # the response, used further down the same function
+        (RECORD + "other(", RECORD_DUMP + "other(", None),
+        # a variable of the same name in another function
+        (RECORD + "get_client(", RECORD_DUMP + "get_client(", 19),
+        # the other SDK's call, with the same attribute names as the migrated one
+        (
+            'acmechat.chat.completions.create(model="a", messages=[question])',
+            'acmechat.chat.completions.create(model="a", messages=[question, question])',
+            15,
+        ),
+        # a client from a function returning one, and from one returning the other SDK's
+        (
+            "client = get_client()\n    client.ping()\n",
+            "client = get_client()\n    client.ping(1)\n",
+            None,
+        ),
+        (
+            "client = get_acme()\n    client.ping()\n",
+            "client = get_acme()\n    client.ping(1)\n",
+            38,
+        ),
+        # an instance attribute set from the library, and one that is not
+        ("self.client.close()", "self.client.close(timeout=1)", None),
+        ("self.acme.close()", "self.acme.close(timeout=1)", 48),
+    ],
+)
+def test_openai_bound_names_relate_a_far_hunk_and_lookalikes_do_not(old, new, line):
+    findings = MIGRATION.check_python("bot.py", ast.parse(BOUND), BOUND)
+    errors = unrelated_edits(BOUND, edit(BOUND_MIGRATED, old, new), findings, LIBRARY)
+    if line is None:
+        assert errors == []
+    else:
+        assert len(errors) == 1, errors
+        assert errors[0].startswith(f"original line {line}: changed code unrelated"), errors
+
+
+PATCHED = """\
+from unittest import mock
+
+
+@mock.patch("acmechat.Client")
+@mock.patch("openai.ChatCompletion.create")
+def test_reply(create, acme):
+    run()
+    run()
+    run()
+    create.assert_called_once()
+    acme.assert_called_once()
+"""
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "related"),
+    [
+        ("create.assert_called_once()", "create.assert_called_once_with()", True),
+        ("acme.assert_called_once()", "acme.assert_called_once_with()", False),
+    ],
+)
+def test_a_patch_decorator_binds_its_test_parameter(old, new, related):
+    findings = MIGRATION.check_python("tests/test_x.py", ast.parse(PATCHED), PATCHED)
+    candidate = edit(
+        PATCHED.replace('"openai.ChatCompletion.create"', '"openai.chat.completions.create"'),
+        old,
+        new,
+    )
+    assert (unrelated_edits(PATCHED, candidate, findings, LIBRARY) == []) is related
 
 
 # --- rejected ---------------------------------------------------------------------------------

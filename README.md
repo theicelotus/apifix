@@ -185,12 +185,17 @@ sections the repo's findings need, and are laid out so a server's prompt cache c
 parse as Python (or as a dependency file), differ from the original when it has certain
 findings, contain no placeholders such as `# ... rest unchanged`, use no name it never imports
 or defines, and (test files) patch neither a repo-module name that does not exist nor the
-function the test calls; the error names the target to patch instead where it can, and a
-failing file gets it back once (a fresh request with the rejected version as a diff, not the
+function the test calls, nor a library name such as `openai.OpenAI` that a module imports with
+`from openai import OpenAI` (the patch never reaches it; the error names the module's own
+target, by the path the tests import it by); the error names the target to patch instead
+where it can, and a failing file gets it back once (a fresh request with the rejected version as a diff, not the
 whole rejected file). Edits away from the migration are caught as well: a changed string,
 docstring or comment far from any finding (a word slipped into a prompt) is put back by apifix
 and listed in the report ("apifix reverted: ..."); unrelated code changes, or string literals
-that went missing, send the file back. For openai-v1, so does dropping a configured
+that went missing, send the file back. Code counts as related through a finding nearby or a name
+tied to the library (imported from it, or assigned from its calls and clients), never through
+names other SDKs share, so a second chat SDK's `client.chat.completions.create` mock is left
+alone. For openai-v1, so does dropping a configured
 `openai.api_key` / `organization` / `api_base` value (a CLI option, say) or adding an
 `OpenAI()` that would ignore it: 1.x's `OpenAI()` never reads `openai.api_key`, so the guide
 says to keep the assignment and use the module-level client (`openai.chat.completions.create`).

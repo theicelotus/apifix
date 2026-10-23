@@ -896,3 +896,207 @@ def test_code_under_test_is_found_through_an_import_path():
     roots = module_roots("tests/test_server.py", ("svc",))
     (problem,) = mock_target_problems(SVC_TEST_OLD, patched_reply, files, roots=roots)
     assert "server.reply" in problem
+
+
+# --- patch where it is used: library names bound with `from openai import X` -----------------
+
+LOOKALIKE = Path(__file__).parent / "fixtures" / "sdk_lookalike"
+LOOKALIKE_MODULES = (
+    "src/__init__.py",
+    "src/storyteller/__init__.py",
+    "src/storyteller/llm.py",
+    "src/storyteller/scoring.py",
+)
+LOOKALIKE_TESTS = ("conftest.py", "tests/test_llm.py", "tests/test_scoring.py")
+LLM_FROM = (
+    (LOOKALIKE / "src/storyteller/llm.py")
+    .read_text()
+    .replace("import openai\n", "from openai import OpenAI\n")
+    .replace("openai.ChatCompletion.create(", "OpenAI().chat.completions.create(")
+)
+SCORING_FROM = (
+    (LOOKALIKE / "src/storyteller/scoring.py")
+    .read_text()
+    .replace("import openai\n", "from openai import OpenAI\n")
+    .replace("openai.ChatCompletion.create(", "OpenAI().chat.completions.create(")
+)
+SCORING_MODULE = (
+    (LOOKALIKE / "src/storyteller/scoring.py")
+    .read_text()
+    .replace("openai.ChatCompletion.create(", "openai.OpenAI().chat.completions.create(")
+)
+CONFTEST = (LOOKALIKE / "conftest.py").read_text()
+PATCHES_OPENAI = CONFTEST.replace(
+    """    with patch("openai.ChatCompletion.create") as mock_create:
+        mock_create.return_value = {"choices": [{"message": {"content": canned_reply}}]}
+        yield mock_create
+""",
+    """    mock_client = MagicMock()
+    with patch("openai.OpenAI", return_value=mock_client):
+        yield mock_client
+""",
+)
+assert PATCHES_OPENAI != CONFTEST
+
+
+def working_copy(**changed: str):
+    """The fixture's files, with `changed` ({"llm": text, ...} for src/storyteller/<name>.py,
+    "conftest" for conftest.py) standing in."""
+    paths = {"conftest": "conftest.py", "llm": "src/storyteller/llm.py"}
+    paths["scoring"] = "src/storyteller/scoring.py"
+    files = {paths[k]: v for k, v in changed.items()}
+
+    def read(rel: str) -> str | None:
+        if rel in files:
+            return files[rel]
+        f = LOOKALIKE / rel
+        return f.read_text() if f.is_file() else None
+
+    return read
+
+
+def binding_problems(candidate: str, **changed: str) -> list[str]:
+    return mock_target_problems(
+        CONFTEST,
+        candidate,
+        working_copy(conftest=candidate, **changed),
+        library_modules=frozenset({"openai"}),
+        roots=module_roots("conftest.py"),
+        modules=LOOKALIKE_MODULES,
+        test_files=LOOKALIKE_TESTS,
+    )
+
+
+def test_a_library_patch_misses_modules_that_import_the_name_from_it():
+    assert binding_problems(PATCHES_OPENAI, llm=LLM_FROM, scoring=SCORING_FROM) == [
+        'patch("openai.OpenAI") does not affect src/storyteller/llm.py, which imports OpenAI '
+        'with "from openai import OpenAI"; patch "src.storyteller.llm.OpenAI" instead (and '
+        "likewise for: src.storyteller.scoring)"
+    ]
+    # a module that calls openai.OpenAI() through `import openai` is reached by the patch
+    assert binding_problems(PATCHES_OPENAI, llm=LLM_FROM, scoring=SCORING_MODULE) == [
+        'patch("openai.OpenAI") does not affect src/storyteller/llm.py, which imports OpenAI '
+        'with "from openai import OpenAI"; patch "src.storyteller.llm.OpenAI" instead'
+    ]
+    llm_module = LLM_FROM.replace("from openai import OpenAI\n", "import openai\n").replace(
+        "OpenAI()", "openai.OpenAI()"
+    )
+    assert binding_problems(PATCHES_OPENAI, llm=llm_module, scoring=SCORING_MODULE) == []
+    # modules not migrated yet (the working copy still has `import openai`) are not flagged
+    assert binding_problems(PATCHES_OPENAI) == []
+
+
+def test_patching_each_module_by_the_path_the_tests_import_it_by_passes():
+    both = PATCHES_OPENAI.replace(
+        '    with patch("openai.OpenAI", return_value=mock_client):\n',
+        '    with patch("openai.OpenAI", return_value=mock_client), patch(\n'
+        '        "src.storyteller.llm.OpenAI", return_value=mock_client\n'
+        '    ), patch("src.storyteller.scoring.OpenAI", return_value=mock_client):\n',
+    )
+    assert binding_problems(both, llm=LLM_FROM, scoring=SCORING_FROM) == []
+    # by a path the tests do not use (src/ is not on sys.path here), it is still missed
+    other = both.replace('"src.storyteller.llm.OpenAI"', '"storyteller.llm.OpenAI"')
+    assert binding_problems(other, llm=LLM_FROM, scoring=SCORING_FROM) == [
+        'patch("openai.OpenAI") does not affect src/storyteller/llm.py, which imports OpenAI '
+        'with "from openai import OpenAI"; patch "src.storyteller.llm.OpenAI" instead '
+        '("storyteller.llm.OpenAI" names it by a path the tests do not import it by)'
+    ]
+
+
+def test_targets_the_original_already_patched_are_not_checked():
+    assert (
+        mock_target_problems(
+            PATCHES_OPENAI,
+            PATCHES_OPENAI,
+            working_copy(llm=LLM_FROM),
+            library_modules=frozenset({"openai"}),
+            modules=LOOKALIKE_MODULES,
+            test_files=LOOKALIKE_TESTS,
+        )
+        == []
+    )
+
+
+APP_FROM = "from openai import OpenAI\n\n\ndef ask():\n    return OpenAI()\n"
+TEST_PATCH = (
+    'from unittest import mock\n\n\n@mock.patch("openai.OpenAI")\ndef test_ask(m):\n    pass\n'
+)
+
+
+def app_problems(files: dict[str, str], test: str = TEST_PATCH) -> list[str]:
+    files = {"tests/test_app.py": test, **files}
+    return mock_target_problems(
+        "",
+        test,
+        reader(files),
+        library_modules=frozenset({"openai"}),
+        roots=module_roots("tests/test_app.py"),
+        modules=tuple(f for f in files if not f.startswith("tests/")),
+        test_files=tuple(f for f in files if f.startswith("tests/")),
+    )
+
+
+@pytest.mark.parametrize(
+    ("files", "target"),
+    [
+        # no file imports it: the shortest of its paths
+        ({"src/app/api.py": APP_FROM}, "app.api.OpenAI"),
+        # another module imports it as src.app.api
+        ({"src/app/api.py": APP_FROM, "src/app/cli.py": "import src.app.api\n"}, "src.app.api"),
+        # the tests import it as app.api, though another module uses src.app.api
+        (
+            {
+                "src/app/api.py": APP_FROM,
+                "src/app/cli.py": "from src.app import api\n",
+                "tests/test_other.py": "from app.api import ask\n",
+            },
+            "app.api.OpenAI",
+        ),
+        # a package's __init__.py
+        ({"app/__init__.py": APP_FROM}, "app.OpenAI"),
+    ],
+)
+def test_the_suggested_target_uses_the_path_the_tests_import_it_by(files, target):
+    (problem,) = app_problems(files)
+    assert f'patch "{target}' in problem
+
+
+@pytest.mark.parametrize(
+    "app",
+    [
+        # imported inside a function: runs at call time, under the patch
+        "def ask():\n    from openai import OpenAI\n\n    return OpenAI()\n",
+        # only for type checkers
+        "from typing import TYPE_CHECKING\n\nimport openai\n\nif TYPE_CHECKING:\n"
+        "    from openai import OpenAI\n\n\ndef ask() -> 'OpenAI':\n    return openai.OpenAI()\n",
+        # imported but never used
+        "import openai\nfrom openai import OpenAI\n\n\ndef ask():\n    return openai.OpenAI()\n",
+    ],
+)
+def test_imports_the_patch_reaches_are_not_flagged(app):
+    assert app_problems({"app.py": app}) == []
+
+
+def test_a_test_that_uses_the_library_name_itself_is_not_flagged():
+    own = TEST_PATCH.replace("    pass\n", "    import openai as oa\n\n    oa.OpenAI()\n")
+    assert app_problems({"app.py": APP_FROM}, own) == []
+
+
+def test_aliases_submodules_and_files_with_no_dotted_name():
+    alias = APP_FROM.replace("import OpenAI", "import OpenAI as OAI").replace("OpenAI()", "OAI()")
+    # modules in the order the job lists them; another bound name is shown with the module
+    assert app_problems({"app.py": alias, "other.py": alias, "more.py": APP_FROM}) == [
+        'patch("openai.OpenAI") does not affect app.py, which imports OpenAI with "from openai '
+        'import OpenAI as OAI"; patch "app.OAI" instead (and likewise for: other, more (as '
+        "OpenAI))"
+    ]
+    sub = "from openai.types.chat import ChatCompletion\n\nx = ChatCompletion\n"
+    test = TEST_PATCH.replace('"openai.OpenAI"', '"openai.types.chat.ChatCompletion"')
+    (problem,) = app_problems({"app.py": sub}, test)
+    assert problem.endswith('patch "app.ChatCompletion" instead')
+    assert app_problems({"my-scripts/app.py": APP_FROM}) == []
+
+
+def test_a_repo_module_named_like_the_library_is_not_this_check():
+    files = {"openai.py": "OpenAI = object\n", "app.py": APP_FROM}
+    assert app_problems(files) == []

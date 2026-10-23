@@ -112,7 +112,9 @@ src/apifix/
     code_checks.py    static checks on a rewritten file (not mode-specific): new undefined names
                       (pyflakes; adds the import itself when exactly one is known), new
                       mock.patch targets missing from repo modules or patching the code under
-                      test, with the concrete target, mock chain and response shape instead
+                      test, with the concrete target, mock chain and response shape instead;
+                      library targets (`openai.OpenAI`) that modules importing the name with
+                      `from openai import` never see
 benchmark/            real repos + scoring
 docs/plans/           approved plans, one file per step (request, plan, amendments)
 tests/                pytest; fixtures/ holds realistic sample code
@@ -573,11 +575,24 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   (insertions: only strictly inside a region), and are otherwise **reverted** by apifix before
   the other checks (`reverted` per reply and file entry; report "apifix reverted:
   file:line (...)" with the written file's line); *code* hunks are kept near a region or when
-  they use a migration name (the library's names; names bound on either side of a near code hunk
-  or on the candidate side of an import hunk; names such a hunk introduces that the original
-  never uses, also as `self.x`; attributes it accesses), and are otherwise a check error
-  ("original line N: changed/removed code unrelated to the migration (...)"; "after original
-  line N: added code ..."). Then every non-exempt string constant of the original must still be
+  they use (either side) an *openai-bound* name or a name a near code hunk binds or introduces
+  (used on its candidate side, never in the original) in the same scope, and are otherwise a
+  check error ("original line N: changed/removed code unrelated to the migration (...)"; "after
+  original line N: added code ..."). Attribute names alone never count (`.chat`, `.choices`:
+  other SDKs share them), nor do names bound by non-library imports (`SimpleNamespace`).
+  openai-bound (`unrelated._Bound`, per version, scope-aware, flow-insensitive, to a fixed
+  point): the library's module names and names imported from it; names and `self.x` assigned
+  (`=`, annotated, augmented, `:=`, `with ... as`, `for`, comprehensions) from a name /
+  attribute / subscript / call chain rooted at one (through await, `or`, `if`-else); stand-ins
+  passed to a library patch (`new`, `return_value`, `side_effect`, `wraps`) and test parameters
+  filled by `@patch("openai...")` decorators (lowest first); functions and methods that return
+  or yield a bound name, `self.x` or call (not attribute/subscript data such as
+  `r.choices[0].message.content`); parameters of the file's own functions called with one
+  (`first_choice(response)`, also `self.m(...)`); library patch calls themselves. Scopes are
+  qualified def/class names; a name resolves in its own scope and the ones around it, so a
+  pytest fixture yielding a bound mock makes test parameters of that name bound, and a local
+  that shadows a bound module name counts as bound. A near hunk's introduced `self.x` relates
+  `self.x` and the name `x` in methods of the same class (a threaded parameter). Then every non-exempt string constant of the original must still be
   in the candidate (multiset over the file); exempt: strings on a finding's lines, keys of
   dict-literal findings, and dict/subscript keys that became attribute or keyword names
   (`d["choices"]` -> `d.choices`). A revert whose result does not parse is not made; each such
@@ -585,9 +600,13 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   as _OpenAI ...` that stubs the library) counts as related; a removed string that also occurs
   elsewhere in the file is not missed (multiset); any edit within 3 lines of a finding is
   trusted (only its strings are protected); names like `e` from `except ... as e` make every
-  other use of `e` related. Known false positives: a far signature change that names a new
-  parameter only used through another name; a pure comment insertion right above a finding's
-  statement is reverted (insertions get no proximity). Whole-file mode only (not agent mode or
+  other use of `e` in that function related; flow-insensitivity makes a name assigned from the
+  library anywhere in a function bound in all of it (`response` reused for another call).
+  Known false positives: a far signature change that names a new parameter only used through
+  another name; response access in a function the file never calls with a response
+  (`data["choices"]` -> `data.choices` in a helper called from another module) is rejected;
+  a pure comment insertion right above a finding's statement is reverted (insertions get no
+  proximity). Whole-file mode only (not agent mode or
   `apifix verify`: see docs/plans/unrelated-edits-and-config.md, "Later").
 - Config checks (`Migration.rewrite_checker`, openai-v1 `config_checks.py`; check `config`, run
   last, non-test Python files only), built once per job from the original repo (non-test files
@@ -635,6 +654,24 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   that do not parse or have a star import or module `__getattr__`, aliased patch functions
   (`from unittest.mock import patch as p`), `target=` keywords, and attributes deeper than
   the first name (`app.client.missing_attr` passes if `client` exists).
+- Library targets (`patch("openai.OpenAI")`, any `<library>.<path>.X` new versus the original,
+  when the repo has no module of the library's name): rejected when a non-test module (the
+  job's list of the repo's Python files, split by `is_test_file` on the original; text from
+  the working copy, so modules accepted earlier in the attempt count) binds the target at
+  module level with `from openai[.sub] import X [as Y]` (not under `if TYPE_CHECKING:`;
+  imports inside functions run under the patch) and uses the name. Not when the test file
+  patches that module's own target `<module path>.Y` (by the path the tests import it by
+  when known, else any of its paths), nor when the test file itself uses `openai.X` through
+  `import openai [as oa]` (the patch is for its own call). Module path: its dotted names under
+  the test's module roots; the first a test file imports (`import a.b`, `from a.b import c`,
+  `from a import b`), else the first a non-test module imports, else the shortest. One error
+  per target: the first module, the target to patch, "(and likewise for: ...)" with the other
+  modules (`mod (as Y)` for another bound name), and a note when the module is patched by a
+  path the tests do not import it by. Not detected: rebinding after the import (an `OpenAI =
+  _OpenAI` shim gets the import's name as target), `patch.object(openai, "OpenAI")`, modules
+  with no dotted name (a dir with a dash). False positive: a test exercising only modules
+  that use `openai.OpenAI` through `import openai`, in a repo where another module imports
+  it with `from`, is rejected. Whole-file mode only.
 - A failing candidate gets its error back once (`check_retry`) as a fresh request: the file's
   request again, with the rejected candidate as a diff against the original and the error (not
   the conversation, which would carry the whole rejected file). A second failure ends the

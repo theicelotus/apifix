@@ -430,6 +430,8 @@ def check_candidate(
     known_imports: ImportTable = DEFAULT_IMPORTS,
     mock_responses: Mapping[str, str] | None = None,
     module_roots: Sequence[str] = MODULE_ROOTS,
+    python_modules: Sequence[str] = (),
+    test_files: Sequence[str] = (),
     findings: Sequence[Finding] | None = None,
     rewrite_checks: Callable[[str, str, str], list[str]] | None = None,
 ) -> CheckResult:
@@ -439,9 +441,11 @@ def check_candidate(
     files), and mock targets that are missing from repo modules or patch the code under test
     (test files; `read_module(relpath)` returns the working copy's text of a repo file, or
     None; `library_modules`, the migrated library, lets messages name the target to patch,
-    and `mock_responses` gives its example a response shape). Python files that parse first get
-    an import for each new undefined name with exactly one `known_imports` entry, so every
-    check sees the completed file (`text`, `auto_imports`).
+    and `mock_responses` gives its example a response shape; `python_modules` and
+    `test_files`, the repo's non-test and test Python files, let a patch of a library name be
+    checked against modules that import that name with `from <library> import X`). Python
+    files that parse first get an import for each new undefined name with exactly one
+    `known_imports` entry, so every check sees the completed file (`text`, `auto_imports`).
 
     With `findings` (the file's own scanner findings), Python files also get the unrelated-edit
     check (unrelated.py): text-only hunks away from the migration are reverted before the
@@ -521,6 +525,8 @@ def check_candidate(
             library_modules=library_modules,
             mock_responses=mock_responses,
             roots=module_roots,
+            modules=python_modules,
+            test_files=test_files,
         )
         if mocks and read_module is not None
         else []

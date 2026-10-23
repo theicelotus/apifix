@@ -4,6 +4,10 @@ test exercises. Both compare the candidate with the original file, so only what 
 introduced is reported. Mock-target messages name the concrete target to patch instead when
 the module's code reaches the migrated library in a recognisable way.
 
+A patch of a library name (`patch("openai.OpenAI")`) is also checked against the repo's
+non-test modules: one that binds the name at import time (`from openai import OpenAI`) never
+sees it, so the message names the module's own target.
+
 Pure functions (source text in, messages out); repo modules are read through a callback.
 """
 
@@ -488,6 +492,8 @@ class _Options:
     mock_responses: Mapping[str, str]  # call path -> object-shaped example response
     dict_helpers: tuple[str, ...]  # the candidate's top-level functions returning a dict literal
     roots: tuple[str, ...] = MODULE_ROOTS  # where repo modules are looked up
+    modules: tuple[str, ...] = ()  # the repo's non-test Python files (relpaths)
+    test_files: tuple[str, ...] = ()  # the repo's test files (relpaths)
 
 
 MAX_EXAMPLE_LINE = 88
@@ -664,6 +670,194 @@ def _code_under_test_problem(
     return None
 
 
+# --- patch where it is used: library names bound at import time ------------------------------
+
+
+def _type_checking(test: ast.expr) -> bool:
+    return _dotted(test) in ("TYPE_CHECKING", "typing.TYPE_CHECKING")
+
+
+def _runtime_module_level(body: list[ast.stmt]) -> Iterator[ast.stmt]:
+    """_module_level without the bodies of `if TYPE_CHECKING:` (never run)."""
+    for stmt in body:
+        yield stmt
+        if isinstance(stmt, ast.If):
+            yield from _runtime_module_level(
+                stmt.orelse if _type_checking(stmt.test) else stmt.body + stmt.orelse
+            )
+        elif isinstance(stmt, ast.For | ast.AsyncFor | ast.While):
+            yield from _runtime_module_level(stmt.body + stmt.orelse)
+        elif isinstance(stmt, ast.With | ast.AsyncWith):
+            yield from _runtime_module_level(stmt.body)
+        elif isinstance(stmt, ast.Try | ast.TryStar):
+            handlers = [s for h in stmt.handlers for s in h.body]
+            yield from _runtime_module_level(stmt.body + handlers + stmt.orelse + stmt.finalbody)
+
+
+def _from_imports(tree: ast.Module, target: str) -> list[tuple[str, str]]:
+    """(bound name, the import as written) of each module-level `from M import X [as Y]` with
+    `M.X == target` whose name the module uses."""
+    loaded = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    found = []
+    for stmt in _runtime_module_level(tree.body):
+        if not isinstance(stmt, ast.ImportFrom) or stmt.level or not stmt.module:
+            continue
+        for a in stmt.names:
+            if f"{stmt.module}.{a.name}" == target and (a.asname or a.name) in loaded:
+                alias = f" as {a.asname}" if a.asname else ""
+                found.append((a.asname or a.name, f"from {stmt.module} import {a.name}{alias}"))
+    return found
+
+
+def _module_paths(rel: str, roots: Sequence[str]) -> list[str]:
+    """The dotted names a repo file can be imported by under `roots` (each root that holds it,
+    in order; the repo root always does): `src/app/api.py` -> `src.app.api`, `app.api`."""
+    found = []
+    for root in (*roots, ""):
+        if not rel.startswith(root):
+            continue
+        stem = rel[len(root) :]
+        stem = stem[: -len("/__init__.py")] if stem.endswith("/__init__.py") else stem[:-3]
+        parts = stem.split("/")
+        if stem and all(p.isidentifier() for p in parts):
+            found.append(".".join(parts))
+    return list(dict.fromkeys(found))
+
+
+def _imported_modules(tree: ast.Module) -> set[str]:
+    """Dotted names a file imports: `import a.b` -> a.b; `from a.b import c` -> a.b, a.b.c
+    (c may be a submodule)."""
+    out: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            out.update(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            out.add(node.module)
+            out.update(f"{node.module}.{a.name}" for a in node.names)
+    return out
+
+
+class _RepoImports:
+    """The repo's Python files as they are now (parsed once, when first needed), and the
+    dotted names its test files and its other modules import."""
+
+    def __init__(self, read_module: ReadModule, options: _Options) -> None:
+        self.read_module, self.options = read_module, options
+        self._trees: dict[str, ast.Module | None] = {}
+        self._by_tests: set[str] | None = None
+        self._by_modules: set[str] | None = None
+
+    def tree(self, rel: str) -> ast.Module | None:
+        if rel not in self._trees:
+            text = self.read_module(rel)
+            try:
+                self._trees[rel] = ast.parse(text) if text is not None else None
+            except (SyntaxError, ValueError):
+                self._trees[rel] = None
+        return self._trees[rel]
+
+    def _imports(self, files: Sequence[str]) -> set[str]:
+        out: set[str] = set()
+        for rel in files:
+            tree = self.tree(rel)
+            if tree is not None:
+                out |= _imported_modules(tree)
+        return out
+
+    def module_path(self, rel: str) -> tuple[str, bool]:
+        """How the tests import `rel`: the first of its dotted names a test file imports, else
+        the first another module imports (known: True), else the shortest (False)."""
+        names = _module_paths(rel, self.options.roots)
+        if self._by_tests is None:
+            self._by_tests = self._imports(self.options.test_files)
+        for name in names:
+            if name in self._by_tests:
+                return name, True
+        if self._by_modules is None:
+            self._by_modules = self._imports(self.options.modules)
+        for name in names:
+            if name in self._by_modules:
+                return name, True
+        return min(names, key=len), False
+
+
+def _uses_attribute(tree: ast.Module, target: str) -> bool:
+    """Does the code use `target` as an attribute of the library module (`openai.OpenAI`, also
+    through `import openai as oa`)? A patch of it then reaches that code."""
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.asname:  # import openai as oa -> oa.X is openai.X
+                    aliases[a.asname] = a.name
+                else:  # import openai.types binds openai
+                    root = a.name.split(".")[0]
+                    aliases[root] = root
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            dotted = _dotted(node)
+            if dotted:
+                root, _, rest = dotted.partition(".")
+                if root in aliases and f"{aliases[root]}.{rest}" == target:
+                    return True
+    return False
+
+
+def _library_binding_problem(
+    target: str,
+    tree: ast.Module,
+    patched: set[str],
+    read_module: ReadModule,
+    options: _Options,
+    imports: _RepoImports,
+) -> str | None:
+    """`patch("openai.OpenAI")` when a non-test module binds OpenAI at import time with `from
+    openai import OpenAI`: the patch replaces the library's attribute, which that module no
+    longer reads. Fine: modules using `openai.OpenAI` through `import openai`, imports inside
+    functions (run under the patch), modules whose own target the test already patches (by
+    the path the tests import it by, when that is known), and test files (`tree`) that use
+    `openai.OpenAI` themselves (the patch is for their own call)."""
+    parts = target.split(".")
+    if (
+        len(parts) < 2
+        or parts[0] not in options.library_modules
+        or _module_file(parts[:1], read_module, options.roots) is not None
+        or _uses_attribute(tree, target)
+    ):
+        return None
+    # (rel, dotted module, bound name, import, a patch of it by another path)
+    missed: list[tuple[str, str, str, str, str]] = []
+    for rel in options.modules:
+        module = imports.tree(rel)
+        if module is None:
+            continue
+        paths = _module_paths(rel, options.roots)
+        if not paths:  # not importable by a dotted name (e.g. a dir with a dash): no target
+            continue
+        for bound, written in _from_imports(module, target):
+            dotted, known = imports.module_path(rel)
+            accepted = [dotted] if known else paths
+            if any(f"{p}.{bound}" in patched for p in accepted):
+                continue
+            other = next((f"{p}.{bound}" for p in paths if f"{p}.{bound}" in patched), "")
+            missed.append((rel, dotted, bound, written, other))
+    if not missed:
+        return None
+    rel, dotted, bound, written, other = missed[0]
+    text = (
+        f'patch("{target}") does not affect {rel}, which imports {parts[-1]} with "{written}"; '
+        f'patch "{dotted}.{bound}" instead'
+    )
+    if other:
+        text += f' ("{other}" names it by a path the tests do not import it by)'
+    others = list(
+        dict.fromkeys(d if b == bound else f"{d} (as {b})" for _, d, b, _, _ in missed[1:])
+    )
+    if others:
+        text += f" (and likewise for: {', '.join(others)})"
+    return text
+
+
 def mock_target_problems(
     original: str,
     candidate: str,
@@ -672,6 +866,8 @@ def mock_target_problems(
     library_modules: frozenset[str] = frozenset(),
     mock_responses: Mapping[str, str] | None = None,
     roots: Sequence[str] = MODULE_ROOTS,
+    modules: Sequence[str] = (),
+    test_files: Sequence[str] = (),
 ) -> list[str]:
     """Mock targets new in the candidate that are wrong for a repo module (`read_module(relpath)`
     gives its current text, or None if there is no such file): a name the module does not
@@ -679,20 +875,37 @@ def mock_target_problems(
     (the code under test). With `library_modules` (the migrated library's top-level modules),
     a message names the concrete target to patch instead when the module's code reaches the
     library in a recognisable way; its example sets an object-shaped response from
-    `mock_responses` (call path -> example) when one matches the call."""
+    `mock_responses` (call path -> example) when one matches the call. A library target
+    (`openai.OpenAI`) is wrong when one of `modules` (the repo's non-test files) binds that
+    name with `from openai import OpenAI` (see _library_binding_problem; `test_files` tell
+    which module path the tests use)."""
     try:
         tree = ast.parse(candidate)
     except (SyntaxError, ValueError):
         return []
-    options = _Options(library_modules, mock_responses or {}, _dict_helpers(tree), tuple(roots))
+    options = _Options(
+        library_modules,
+        mock_responses or {},
+        _dict_helpers(tree),
+        tuple(roots),
+        tuple(modules),
+        tuple(test_files),
+    )
     known = {target for _, target in mock_targets(original)}
+    sites = _patch_sites(tree)
+    patched = {site.target for site in sites}
+    imports = _RepoImports(read_module, options)
     problems, seen = [], set()
-    for site in _patch_sites(tree):
+    for site in sites:
         if site.target in known or site.target in seen:
             continue
         problem = _missing_name_problem(site, read_module, options)
         if problem is None:
             problem = _code_under_test_problem(site, tree, read_module, options)
+        if problem is None:
+            problem = _library_binding_problem(
+                site.target, tree, patched, read_module, options, imports
+            )
         if problem:
             seen.add(site.target)
             problems.append(problem)

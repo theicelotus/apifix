@@ -2384,3 +2384,78 @@ def test_fix_report_lists_imports_nothing_declares_before_the_baseline(tmp_path,
     assert result.trajectory["job"]["undeclared_imports"] == [
         {"module": "nlpaug", "distribution": "nlpaug", "files": ["tests/test_extra.py"]}
     ]
+
+
+# --- whole-file: patch where the library name is used (sdk_lookalike fixture) ------------------
+
+LOOKALIKE = Path(__file__).parent / "fixtures" / "sdk_lookalike"
+
+
+def test_whole_file_sends_a_library_patch_that_misses_from_imports_back(tmp_path):
+    from tests.test_unrelated import edit
+
+    repo = tmp_path / "repo"
+    shutil.copytree(LOOKALIKE, repo)
+
+    def migrated(path: str, call: str, var: str) -> str:
+        text = (LOOKALIKE / path).read_text()
+        text = edit(text, "import openai\n", "from openai import OpenAI\n")
+        text = edit(text, f"{var} = openai.ChatCompletion.create(", f"{var} = {call}(")
+        return edit(
+            text,
+            f'{var}["choices"][0]["message"]["content"]',
+            f"{var}.choices[0].message.content",
+        )
+
+    llm_py = migrated("src/storyteller/llm.py", "OpenAI().chat.completions.create", "response")
+    scoring = migrated("src/storyteller/scoring.py", "OpenAI().chat.completions.create", "result")
+    conftest = (LOOKALIKE / "conftest.py").read_text()
+    response = (
+        "SimpleNamespace(\n"
+        "            choices=[SimpleNamespace(message=SimpleNamespace(content=canned_reply))]\n"
+        "        )"
+    )
+    misses = edit(
+        conftest,
+        """    with patch("openai.ChatCompletion.create") as mock_create:
+        mock_create.return_value = {"choices": [{"message": {"content": canned_reply}}]}
+        yield mock_create
+""",
+        f"""    with patch("openai.OpenAI") as mock_class:
+        mock_class.return_value.chat.completions.create.return_value = {response}
+        yield mock_class
+""",
+    )
+    misses = "from types import SimpleNamespace\n" + misses
+    reaches = misses.replace('"openai.OpenAI"', '"src.storyteller.llm.OpenAI"')
+    test_scoring = (LOOKALIKE / "tests/test_scoring.py").read_text()
+    test_scoring = edit(
+        "from types import SimpleNamespace\n" + test_scoring,
+        """    with patch("openai.ChatCompletion.create") as create:
+        create.return_value = {"choices": [{"message": {"content": " 4 "}}]}
+""",
+        """    with patch("src.storyteller.scoring.OpenAI") as client_class:
+        create = client_class.return_value.chat.completions.create
+        create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=" 4 "))]
+        )
+""",
+    )
+    llm = FakeLLM(
+        [block(llm_py), block(scoring), block(misses), block(reaches), block(test_scoring)]
+    )
+    result = wf(
+        repo,
+        llm,
+        JudgingSandbox(judge=lambda tree: run(("tests.test_llm::test_openai_reply", "passed"))),
+        max_retries=0,
+    )
+    (attempt,) = result.trajectory["attempts"]
+    assert [(n["kind"], n["file"]) for n in attempt["nudges"]] == [("check_retry", "conftest.py")]
+    assert attempt["nudges"][0]["error"] == (
+        'patch("openai.OpenAI") does not affect src/storyteller/llm.py, which imports OpenAI '
+        'with "from openai import OpenAI"; patch "src.storyteller.llm.OpenAI" instead (and '
+        "likewise for: src.storyteller.scoring)"
+    )
+    assert [f["accepted"] for f in attempt["files"]] == [True, True, True, True]
+    assert '+    with patch("src.storyteller.llm.OpenAI") as mock_class:' in result.diff
