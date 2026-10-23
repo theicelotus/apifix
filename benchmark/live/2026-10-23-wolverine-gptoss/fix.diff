@@ -1,0 +1,89 @@
+diff --git a/requirements.txt b/requirements.txt
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -10,7 +10,7 @@
+ idna==3.4
+ iniconfig==2.0.0
+ multidict==6.0.4
+-openai==0.27.4
++openai>=1.0,<2
+ packaging==23.1
+ pluggy==1.0.0
+ pytest==7.3.1
+diff --git a/tests/test_wolverine.py b/tests/test_wolverine.py
+--- a/tests/test_wolverine.py
++++ b/tests/test_wolverine.py
+@@ -56,10 +56,13 @@
+     # Open the test file
+     with open(chat_completion_response, 'r') as file:
+         response = file.read()
+-    # Mock the openAi chat completion API call
+-    mocker.patch(
+-        "openai.ChatCompletion.create",
+-        return_value=mock_open_ai_response_object(mocker=mocker, content=response))
++    # Mock the OpenAI client used inside json_validated_response
++    client_mock = mocker.Mock()
++    client_mock.chat.completions.create.return_value = mock_open_ai_response_object(
++        mocker=mocker, content=response
++    )
++    mocker.patch("wolverine.wolverine.get_client", return_value=client_mock)
++
+     # ChatCompletion returned an invalid response
+     if fail:
+         with pytest.raises(Exception) as err:
+diff --git a/wolverine/wolverine.py b/wolverine/wolverine.py
+--- a/wolverine/wolverine.py
++++ b/wolverine/wolverine.py
+@@ -4,16 +4,17 @@
+ import shutil
+ import subprocess
+ import sys
++from functools import lru_cache
+ 
+ import openai
+-
++from openai import OpenAI
+ from typing import List, Dict
+ from termcolor import cprint
+ from dotenv import load_dotenv
+ 
+ # Set up the OpenAI API
+ load_dotenv()
+-openai.api_key = os.getenv("OPENAI_API_KEY")
++# openai.api_key = os.getenv("OPENAI_API_KEY")  # Removed: OpenAI() reads the env var itself
+ 
+ # Default model is GPT-4
+ DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "gpt-4")
+@@ -24,6 +25,12 @@
+ # Read the system prompt
+ with open(os.path.join(os.path.dirname(__file__), "..", "prompt.txt"), "r") as f:
+     SYSTEM_PROMPT = f.read()
++
++
++@lru_cache()
++def get_client() -> OpenAI:
++    """Lazily create and cache an OpenAI client."""
++    return OpenAI()
+ 
+ 
+ def run_script(script_name: str, script_args: List) -> str:
+@@ -56,7 +63,8 @@
+     """
+     json_response = {}
+     if nb_retry != 0:
+-        response = openai.ChatCompletion.create(
++        client = get_client()
++        response = client.chat.completions.create(
+             model=model,
+             messages=messages,
+             temperature=0.5,
+@@ -195,7 +203,8 @@
+ 
+ 
+ def check_model_availability(model):
+-    available_models = [x["id"] for x in openai.Model.list()["data"]]
++    client = get_client()
++    available_models = [x.id for x in client.models.list().data]
+     if model not in available_models:
+         print(
+             f"Model {model} is not available. Perhaps try running with "

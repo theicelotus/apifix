@@ -288,9 +288,8 @@ would be removed.
 ## Live results
 
 The results now include real repos as well as runs of the live test
-`test_local_whole_file_fix_completes` (a small openai 0.x fixture repo). Real repos are linked,
-not copied: without a license that allows it, their code, the diff and the trajectory stay out
-of this repo.
+`test_local_whole_file_fix_completes` (a small openai 0.x fixture repo). Real repos are linked;
+their code, the diff and the trajectory are copied here only when the repo's license allows it.
 
 | Date | Repo | Model | Mode | Hardware | Attempts | Time | Tokens | Verdict | Trajectory |
 |---|---|---|---|---|---|---|---|---|---|
@@ -298,6 +297,7 @@ of this repo.
 | 2026-10-22 | [brianAbell/AI-powered-Resume-Analyzer-and-Feedback-Generator](https://github.com/brianAbell/AI-powered-Resume-Analyzer-and-Feedback-Generator) | `openai/gpt-oss-120b` (hosted free tier, $0) | whole-file | hosted | 1 | 140 s | 12,675 | verified | not published (repo has no license) |
 | 2026-10-23 | [MattOates/djgpt](https://github.com/MattOates/djgpt) | `openai/gpt-oss-120b` (hosted free tier, $0) | whole-file | hosted | 1 | 156 s | 20,750 | verified_weak | not published |
 | 2026-10-23 | [HCAI-Lab-GT/SuspensePerception](https://github.com/HCAI-Lab-GT/SuspensePerception) | `openai/gpt-oss-120b` (hosted free tier, $0) | whole-file | hosted | 1 | 271 s | 16,168 | verified_weak | not published (repo has no license) |
+| 2026-10-23 | [biobootloader/wolverine](https://github.com/biobootloader/wolverine) | `openai/gpt-oss-120b` (hosted free tier, $0) | whole-file | hosted | 1 | 153 s | 17,571 | verified | [folder](benchmark/live/2026-10-23-wolverine-gptoss/) |
 
 2026-10-22: a Flask app on openai 0.28.1, CRLF line endings, tests in `backend/testapp.py`.
 Time: LLM 57 s, sandbox 82 s with the pip cache warm. All 8 findings resolved, 100%
@@ -320,6 +320,12 @@ Time: LLM 70 s, sandbox 193 s. The repo's own suite fails 11 of its 13 tests bef
 the fix (a fixture called directly, an outdated function signature), so apifix reports them as
 no signal, each with its reason. The fixed test mock patches `src.thriller.api.OpenAI` and
 `src.thriller.misc.OpenAI`, where the code uses the name.
+
+2026-10-23 (wolverine): an MIT-licensed tool (~5k stars) that reruns a crashing script and asks
+GPT-4 to fix it, pinned to openai 0.27.4. Time: LLM 86 s (66 s of it rate-limit waits), sandbox
+66 s. 6 of 6 tests pass before and after the fix and run 67% of the changed lines. apifix set
+`openai==0.27.4` -> `openai>=1.0,<2` itself; the fix also moves `openai.Model.list()` to
+`client.models.list()`.
 
 `verified_weak` means the tests pass but do not exercise the migrated code, so the fix still
 needs a human review.
