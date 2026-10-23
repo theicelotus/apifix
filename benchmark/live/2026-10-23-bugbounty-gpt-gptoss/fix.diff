@@ -1,0 +1,53 @@
+diff --git a/bugbounty_gpt/handlers/openai_handler.py b/bugbounty_gpt/handlers/openai_handler.py
+--- a/bugbounty_gpt/handlers/openai_handler.py
++++ b/bugbounty_gpt/handlers/openai_handler.py
+@@ -78,7 +78,12 @@
+         try:
+             request_data = OpenAIHandler._build_request_data(submission_content)
+             loop = asyncio.get_running_loop()
+-            response = await loop.run_in_executor(None, lambda: openai.ChatCompletion.create(**request_data))
++            # Create the client inside the function to avoid import‑time initialization
++            client = openai.OpenAI()
++            response = await loop.run_in_executor(
++                None,
++                lambda: client.chat.completions.create(**request_data)
++            )
+             return OpenAIHandler._handle_response(response)
+         except Exception as error:
+             return OpenAIHandler._handle_response_error(error)
+diff --git a/pyproject.toml b/pyproject.toml
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -21,7 +21,7 @@
+ Mako = "1.2.4"
+ MarkupSafe = "2.1.3"
+ multidict = "6.0.4"
+-openai = "0.28.1"
++openai = ">=1.0,<2"
+ psycopg2-binary = "2.9.9"
+ SQLAlchemy = "2.0.22"
+ PyYAML = "6.0.1"
+diff --git a/tests/test_openai_classification.py b/tests/test_openai_classification.py
+--- a/tests/test_openai_classification.py
++++ b/tests/test_openai_classification.py
+@@ -51,16 +51,16 @@
+ 
+ @pytest.mark.asyncio
+ async def test_classify_submission_exception():
+-    with patch("openai.ChatCompletion.create") as mock_create:
+-        mock_create.side_effect = Exception("Sample Error")
++    with patch("bugbounty_gpt.handlers.openai_handler.openai.OpenAI") as mock_openai:
++        mock_openai.return_value.chat.completions.create.side_effect = Exception("Sample Error")
+         with patch("bugbounty_gpt.handlers.openai_handler.OpenAIHandler._handle_response_error") as mock_handle_error:
+             await OpenAIHandler.classify_submission("Sample content")
+             mock_handle_error.assert_called()
+ 
+ @pytest.mark.asyncio
+ async def test_classify_submission_success():
+-    with patch("openai.ChatCompletion.create") as mock_create:
+-        mock_create.return_value = type("Response", (object,), {
++    with patch("bugbounty_gpt.handlers.openai_handler.openai.OpenAI") as mock_openai:
++        mock_openai.return_value.chat.completions.create.return_value = type("Response", (object,), {
+             "choices": [type("Choice", (object,), {"message": type("Message", (object,), {"content": " Policy or Content Complaints\nExplanation"})})]
+         })
+         category, explanation = await OpenAIHandler.classify_submission("Sample content")
