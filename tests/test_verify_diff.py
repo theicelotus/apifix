@@ -11,6 +11,7 @@ import pytest
 
 from apifix import cli
 from apifix.engine.diffing import unified_diff
+from apifix.engine.local_paths import redact_local_paths
 from apifix.engine.verify_diff import VerifyError, apply_diff, verify_diff
 from tests.test_verifier import (
     APP_NEW,
@@ -195,6 +196,18 @@ def test_cli_verify_writes_the_same_files_as_fix(saved, tmp_path, fake_sandbox, 
     assert printed.startswith("verified\nno LLM used; wrote fix.diff, report.md")
 
 
+def test_cli_outputs_write_the_home_dir_as_tilde(saved, tmp_path, fake_sandbox, monkeypatch):
+    original, diff = saved
+    monkeypatch.setenv("HOME", str(tmp_path))
+    out = tmp_path / "out"
+    args = ["verify", str(original), "--migration", "openai-v1", "--diff", str(diff)]
+    assert cli.main([*args, "--out", str(out)]) == cli.EXIT_CLEAN
+    job = json.loads((out / "trajectory.json").read_text())["job"]
+    assert job["repo"] == "~/" + str(original.relative_to(tmp_path))
+    for name in ("trajectory.json", "verification.json", "report.md"):
+        assert str(tmp_path) not in (out / name).read_text()
+
+
 def test_cli_verify_errors(saved, tmp_path, fake_sandbox, capsys):
     original, _ = saved
     bad = tmp_path / "bad.diff"
@@ -262,7 +275,8 @@ def test_cli_verify_with_sandbox_requirements(saved, tmp_path, fake_sandbox):
     (config,) = fake_sandbox
     assert config.requirements_override.lines == ("openai==0.28.1", "pytest")
     report = (out / "report.md").read_text()
-    assert f"- Sandbox dependencies: from `{reqs.resolve()}` (2 requirement(s), sha256 " in report
+    shown = redact_local_paths(str(reqs.resolve()))  # outputs hide the user's paths
+    assert f"- Sandbox dependencies: from `{shown}` (2 requirement(s), sha256 " in report
     job = json.loads((out / "trajectory.json").read_text())["job"]
     assert job["sandbox_requirements"]["lines"] == ["openai==0.28.1", "pytest"]
 

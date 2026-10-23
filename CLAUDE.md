@@ -76,6 +76,8 @@ src/apifix/
     sandbox_driver.py runs INSIDE containers (Python 3.8+ compatible, stdlib only)
     docker.py         DockerClient protocol + `docker` CLI implementation (bounded output)
     cleanup.py        removes containers / temp workspaces left by crashed or killed runs
+    local_paths.py    home dir -> ~ and pytest-of-<user> -> pytest-of-USER in written outputs
+                      (report, verification, trajectory; never fix.diff)
     imports.py        third-party imports no dependency file declares ("imported but not
                       declared"), read before the first sandbox run; report section only
     test_results.py   JUnit / unittest output -> counts + per-test outcomes (+ the module of

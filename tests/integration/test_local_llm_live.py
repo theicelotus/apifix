@@ -20,6 +20,7 @@ from apifix.engine.agent import AgentConfig, fix
 from apifix.engine.docker import DockerCLI
 from apifix.engine.llm import LLMError, Usage
 from apifix.engine.llm_openai_compat import DEFAULT_BASE_URL, OpenAICompatLLM
+from apifix.engine.local_paths import redact_local_paths
 from apifix.engine.sandbox import Sandbox, SandboxConfig, default_pip_cache_dir
 from tests.integration.tiny_repo import ORIGINAL, make_repo
 
@@ -77,7 +78,8 @@ def _run_fix(tmp_path, edit_mode: str):
             edit_mode=edit_mode,
         ),
     )
-    (tmp_path / "trajectory.json").write_text(json.dumps(result.trajectory, indent=2))
+    trajectory = redact_local_paths(result.trajectory)  # publishable as is
+    (tmp_path / "trajectory.json").write_text(json.dumps(trajectory, indent=2))
     return result
 
 

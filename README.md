@@ -20,7 +20,8 @@ apifix cleanup [--dry-run]                              # recover after a crash
 
 `apifix fix` works on a copy of the repo (yours is never modified). It writes `fix.diff`,
 `report.md`, `verification.json` and `trajectory.json` to `./apifix-out/<timestamp>/` (or
-`--out`). Exit code 0 means verified (possibly with weak evidence), 1 not verified, 2 aborted
+`--out`); the last three write your home directory as `~`, so they can be published as they
+are. Exit code 0 means verified (possibly with weak evidence), 1 not verified, 2 aborted
 or a usage error, 3 already migrated: the code is already on the new API (every declared
 `openai` requirement needs 1.x, non-test code uses 1.x names) and every finding is in a test
 file, so the tests are out of date rather than the code. `fix` then stops before any LLM call

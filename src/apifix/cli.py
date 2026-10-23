@@ -17,6 +17,9 @@ Exit codes: 0 clean (fix: verified), 1 findings (fix: not verified), 2 usage err
 3 (fix) already migrated: the findings are all in test files that look out of date with code
 already on the new API; nothing was sent to an LLM or run.
 
+report.md, verification.json and trajectory.json write the home directory as ~ (fix.diff is
+unchanged).
+
 fix and verify keep a pip cache for the sandbox's dependency installs
 ($APIFIX_PIP_CACHE, else ~/.cache/apifix/pip); --no-pip-cache turns it off.
 """
@@ -183,6 +186,10 @@ def _out_dir(args: argparse.Namespace) -> Path:
 def _write_outputs(
     out: Path, diff: str, report: str, verification: dict | None, trajectory: dict
 ) -> None:
+    from apifix.engine.local_paths import redact_local_paths
+
+    # Outputs get published as evidence: home dir -> ~ (the diff stays byte-for-byte).
+    report, verification, trajectory = redact_local_paths((report, verification, trajectory))
     (out / "fix.diff").write_text(diff, newline="")  # CRLF lines of CRLF files stay
     (out / "report.md").write_text(report)
     (out / "verification.json").write_text(json.dumps(verification, indent=2) + "\n")
