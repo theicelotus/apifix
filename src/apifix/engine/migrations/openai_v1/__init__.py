@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 
 from apifix.engine.dependencies import DeclaredDependency, entirely_below
 from apifix.engine.migrations.guide import full_guide
-from apifix.engine.migrations.openai_v1 import guide_parts, rules
+from apifix.engine.migrations.openai_v1 import config_checks, guide_parts, repo_findings, rules
 from apifix.engine.migrations.openai_v1.python_checks import check_python
 from apifix.engine.models import CERTAIN, Finding, SmokeCheck
 
@@ -32,7 +32,9 @@ class OpenAIV1Migration:
             'test looks it up (e.g. patch("app.openai.OpenAI") and set '
             "OpenAI.return_value.chat.completions.create.return_value), patch the module's "
             "client or get_client(), or build the client lazily instead of at import. Never "
-            "add a real key.",
+            "add a real key. If the code uses the module-level client "
+            "(openai.chat.completions.create), set a placeholder key in the test "
+            '(OPENAI_API_KEY, or openai.api_key = "test").',
         ),
         (
             "unexpected keyword argument 'proxies'",
@@ -69,6 +71,14 @@ class OpenAIV1Migration:
         repo_modules: frozenset[str] = frozenset(),
     ) -> list[Finding]:
         return check_python(file, tree, source, repo_modules)
+
+    def adjust_findings(self, findings: list[Finding], root: Path | None = None) -> list[Finding]:
+        return repo_findings.adjust_findings(findings, root)
+
+    def rewrite_checker(
+        self, root: Path, findings: Sequence[Finding]
+    ) -> Callable[[str, str, str], list[str]] | None:
+        return config_checks.rewrite_checker(root, findings)
 
     def check_dependency(self, file: str, dep: DeclaredDependency) -> Finding | None:
         if dep.name != rules.PACKAGE or not entirely_below(dep.clauses, rules.FIRST_V1):

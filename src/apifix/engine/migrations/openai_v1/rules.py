@@ -122,6 +122,51 @@ CONFIG_ATTRS: dict[str, tuple[str, str, Confidence]] = {
     ),
 }
 
+# Assignments to these module attributes are reported on the whole statement, with a
+# suggestion that depends on the value (CONFIG_DROP / CONFIG_KEEP / CONFIG_API_BASE). 1.x keeps
+# api_key / organization / base_url (not api_base) for the module-level client only.
+CONFIG_ASSIGN_ATTRS = frozenset({"api_key", "organization", "api_base"})
+# The variable 1.x reads itself, per module attribute: an assignment from it (no default) or of
+# None can go. 0.x's OPENAI_API_BASE is not one (1.x reads OPENAI_BASE_URL).
+ENV_READ_BY_V1: dict[str, str] = {
+    "api_key": "OPENAI_API_KEY",
+    "organization": "OPENAI_ORG_ID",
+    "base_url": "OPENAI_BASE_URL",
+}
+CONFIG_DROP = (
+    "1.x reads {env} itself: this line can go (OpenAI() and the module-level client both read it)"
+)
+CONFIG_KEEP_PREFIX = "Never drop this value"
+CONFIG_KEEP = (
+    CONFIG_KEEP_PREFIX + ": keep the assignment and call the module-level client "
+    "(openai.chat.completions.create(...) reads openai.{attr}), or pass it to every client: "
+    "openai.OpenAI({attr}={value})"
+)
+CONFIG_API_BASE_PREFIX = "1.x ignores api_base"
+CONFIG_API_BASE = (
+    CONFIG_API_BASE_PREFIX + ": assign openai.base_url = {value} and use the module-level client, "
+    "or pass openai.OpenAI(base_url={value}); never drop it"
+)
+CONFIG_READ = (
+    "1.x keeps openai.{attr} for the module-level client only; openai.OpenAI() does not read it"
+)
+AZURE_CONFIG_KEEP = "; never drop the value"
+# Repo-level pass (repo_findings.py): when a non-test file keeps a configured value, call sites
+# use the module-level client.
+MODULE_CLIENT_CALL = (
+    "Use openai.{path}(...): the module-level client, which reads {attrs} (set in {where}); "
+    "the response is a typed object, not a dict"
+)
+MODULE_CLIENT_ASYNC = (
+    "Use await client.{path}(...) with client = openai.AsyncOpenAI({kwargs}) created where it "
+    "is used (1.x has no module-level async client); the response is a typed object, not a dict"
+)
+MODULE_CLIENT_MOCK = (
+    'patch "openai.{path}" (the code uses the module-level client; the test needs '
+    "OPENAI_API_KEY or openai.api_key set)"
+)
+CONFIG_CALLS_ELSEWHERE = ". The API calls are in {files}: {keep}"
+
 INVALID_REQUEST_NOTE = (
     "1.x splits this by HTTP status (BadRequestError, NotFoundError, UnprocessableEntityError, "
     "ConflictError); except blocks may need several classes, or openai.APIStatusError"
@@ -201,6 +246,7 @@ GUIDE_FOR_TEST_FILES = frozenset({"tests"})  # when a finding is in a test file
 GUIDE_SELECTORS: dict[str, tuple[tuple[frozenset[str], tuple[str, ...]], ...]] = {
     "client.async": ((frozenset(), ("AsyncOpenAI", "await ", "aiosession")),),
     "client.azure": ((frozenset(), ("Azure", "azure", "deployment_id")),),
+    "client.config": ((frozenset({"client_config"}), (CONFIG_KEEP_PREFIX, "never drop it")),),
     "client.kwargs": (
         (frozenset({"client_config"}), ()),
         (frozenset({"api_call"}), tuple(f"{kwarg}=" for kwarg in KWARG_CHANGES)),

@@ -132,6 +132,38 @@ def test_guide_parts_follow_the_findings(finding, part):
     assert part not in selected_parts([_finding("dependency")]) or part == "dependencies"
 
 
+def test_client_config_part_only_for_values_that_must_be_kept():
+    from apifix.engine.migrations.openai_v1 import rules
+
+    mig = get_migration("openai-v1")
+    keep = _finding(
+        "client_config",
+        "openai.api_key = key",
+        rules.CONFIG_KEEP.format(attr="api_key", value="key"),
+    )
+    base = _finding(
+        "client_config", "openai.api_base = url", rules.CONFIG_API_BASE.format(value="url")
+    )
+    env = _finding(
+        "client_config",
+        'openai.api_key = os.getenv("OPENAI_API_KEY")',
+        rules.CONFIG_DROP.format(env="OPENAI_API_KEY"),
+    )
+    for finding in (keep, base):
+        text, parts = mig.job_guide([finding])
+        assert "client.config" in parts
+        assert "**Never drop a configured value**" in text
+        assert "set a key from somewhere else (see below)." in text
+    text, parts = mig.job_guide([env])
+    assert "client.config" not in parts and "Never drop" not in text
+    assert "set a key from somewhere else." in text
+
+
+def test_module_client_failure_hint():
+    (_, hint), _ = get_migration("openai-v1").failure_hints
+    assert 'openai.api_key = "test"' in hint and "module-level client" in hint
+
+
 def test_resources_table_keeps_only_used_rows():
     mig = get_migration("openai-v1")
     text, _ = mig.job_guide(

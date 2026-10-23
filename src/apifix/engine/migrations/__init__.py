@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Protocol
 
@@ -68,6 +68,19 @@ class Migration(Protocol):
 
     def check_dependency(self, file: str, dep: DeclaredDependency) -> Finding | None:
         """Return a finding if a declared dependency must change, else None."""
+        ...
+
+    def adjust_findings(self, findings: list[Finding], root: Path | None = None) -> list[Finding]:
+        """The scan's findings after a repo-level pass (called once at the end of a scan, on
+        the sorted findings), e.g. suggestions that depend on other files. `root`: the scan
+        root, for recognising test files by content."""
+        ...
+
+    def rewrite_checker(
+        self, root: Path, findings: Sequence[Finding]
+    ) -> Callable[[str, str, str], list[str]] | None:
+        """Migration-specific checks of a rewritten file, built once per job from the original
+        repo: a function (path, original, candidate) -> check errors, or None for no checks."""
         ...
 
 

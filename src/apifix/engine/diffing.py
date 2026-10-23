@@ -13,6 +13,22 @@ ChangeKind = Literal["added", "deleted", "modified"]
 
 
 @dataclass(frozen=True)
+class Hunk:
+    """One changed region of a text file. `old_start` is the original's first line (for an
+    insertion: the line it follows); `new_start` the fixed file's (for a removal: the line
+    after it). Both 1-based."""
+
+    old_start: int
+    new_start: int
+    old: tuple[str, ...]
+    new: tuple[str, ...]
+
+    @property
+    def new_lines(self) -> range:
+        return range(self.new_start, self.new_start + len(self.new))
+
+
+@dataclass(frozen=True)
 class FileChange:
     path: str  # relative, POSIX separators
     kind: ChangeKind
@@ -20,6 +36,7 @@ class FileChange:
     # and binary files).
     changed_lines: tuple[int, ...] = ()
     removed_lines: int = 0  # lines of the original that are gone
+    hunks: tuple[Hunk, ...] = ()  # text files that were modified or added
 
     @property
     def is_python(self) -> bool:
@@ -57,21 +74,34 @@ def diff_trees(original: Path, fixed: Path) -> list[FileChange]:
             changes.append(FileChange(rel, kind))
             continue
         changed, removed = changed_lines(old_text, new_text)
-        changes.append(FileChange(rel, kind, changed, removed))
+        changes.append(FileChange(rel, kind, changed, removed, hunks(old_text, new_text)))
     return changes
+
+
+def opcodes(old: str, new: str) -> list[tuple[int, int, int, int]]:
+    """(i1, i2, j1, j2) of every changed region, 0-based and half-open: the line diff that
+    changed_lines, hunks and the unrelated-edit check share."""
+    a, b = old.splitlines(), new.splitlines()
+    matcher = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    return [(i1, i2, j1, j2) for op, i1, i2, j1, j2 in matcher.get_opcodes() if op != "equal"]
 
 
 def changed_lines(old: str, new: str) -> tuple[tuple[int, ...], int]:
     """(lines of `new` that were inserted or replaced, number of `old` lines removed)."""
-    a, b = old.splitlines(), new.splitlines()
     changed: list[int] = []
     removed = 0
-    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
-        if op in ("replace", "insert"):
-            changed.extend(range(j1 + 1, j2 + 1))
-        if op in ("replace", "delete"):
-            removed += i2 - i1
+    for i1, i2, j1, j2 in opcodes(old, new):
+        changed.extend(range(j1 + 1, j2 + 1))
+        removed += i2 - i1
     return tuple(changed), removed
+
+
+def hunks(old: str, new: str) -> tuple[Hunk, ...]:
+    a, b = old.splitlines(), new.splitlines()
+    return tuple(
+        Hunk(i1 + 1 if i2 > i1 else i1, j1 + 1, tuple(a[i1:i2]), tuple(b[j1:j2]))
+        for i1, i2, j1, j2 in opcodes(old, new)
+    )
 
 
 def unified_diff(original: Path, fixed: Path, changes: list[FileChange] | None = None) -> str:

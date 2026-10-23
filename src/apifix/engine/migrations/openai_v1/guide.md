@@ -40,6 +40,27 @@ def ask(msgs):
 - Per-call `api_key=` / `organization=` / `api_base=` move to the client (or
   `client.with_options(...)`).
 - `request_timeout=` becomes `timeout=`. `engine=` / `deployment_id=` become `model=`.
+<!-- part: client.config -->
+- **Never drop a configured value** (`openai.api_key = <value>`, `organization`, `api_base`).
+  `OpenAI()` reads only its arguments and the environment (`OPENAI_API_KEY`, `OPENAI_ORG_ID`,
+  `OPENAI_BASE_URL`), never `openai.api_key`. Either keep the assignment and call the
+  module-level client, which reads `openai.api_key` / `organization` / `base_url` for each
+  request:
+
+  ```python
+  openai.api_key = key  # unchanged
+  resp = openai.chat.completions.create(model=m, messages=msgs)
+  ```
+
+  or pass the value to every client: `OpenAI(api_key=key)`. When the assignment is in one module
+  (e.g. a CLI that takes `--api-key`) and the API calls are in another, keep the assignment and
+  use `openai.chat.completions.create(...)` at the call sites. 1.x ignores `openai.api_base`:
+  assign `openai.base_url` instead. An assignment from the variable 1.x reads itself
+  (`os.getenv("OPENAI_API_KEY")`) can go; 0.x's `OPENAI_API_BASE` is not one (1.x reads
+  `OPENAI_BASE_URL`). Async code: `AsyncOpenAI(api_key=openai.api_key)` where it is used.
+- Tests of code that uses the module-level client: patching `openai.OpenAI` does not reach it.
+  Patch `openai.chat.completions.create`, with a key set (`OPENAI_API_KEY` or
+  `openai.api_key = "test"`): the module client is built on first use, and that needs a key.
 
 <!-- part: resources -->
 ## Resources

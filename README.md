@@ -35,6 +35,11 @@ the fixed code are not counted as regressions: they may have failed before too. 
 then "unverified" (or "verified, with weak evidence" when every test passes), and the report
 lists the failing tests and suggests `apifix verify` for a later re-check.
 
+When the verdict is "verified, with weak evidence" or "unverified", the report also lists the
+changes no test executed under "Review by hand", one entry per changed region: removed lines,
+code turned into a comment and edits inside strings are always listed, since coverage cannot
+vouch for them.
+
 Tests run with pytest in the sandbox, which also runs unittest tests. Test files are found by
 name (`test*.py`, `*_test.py`, anything under `tests/`) or by content (imports unittest or
 pytest and defines `Test*` classes or `test_*` functions) and passed to pytest explicitly. When
@@ -155,7 +160,15 @@ findings, contain no placeholders such as `# ... rest unchanged`, use no name it
 or defines, and (test files) patch neither a repo-module name that does not exist nor the
 function the test calls; the error names the target to patch instead where it can, and a
 failing file gets it back once (a fresh request with the rejected version as a diff, not the
-whole rejected file). Dependency files whose only findings are pins apifix set are not sent.
+whole rejected file). Edits away from the migration are caught as well: a changed string,
+docstring or comment far from any finding (a word slipped into a prompt) is put back by apifix
+and listed in the report ("apifix reverted: ..."); unrelated code changes, or string literals
+that went missing, send the file back. For openai-v1, so does dropping a configured
+`openai.api_key` / `organization` / `api_base` value (a CLI option, say) or adding an
+`OpenAI()` that would ignore it: 1.x's `OpenAI()` never reads `openai.api_key`, so the guide
+says to keep the assignment and use the module-level client (`openai.chat.completions.create`).
+These checks are heuristics (see CLAUDE.md for what they miss) and run in whole-file mode only
+for now. Dependency files whose only findings are pins apifix set are not sent.
 All files are then verified together exactly as in agent mode,
 and a failed verification starts the next attempt from the original files, with the failing
 test output and each file's previous version as a diff.

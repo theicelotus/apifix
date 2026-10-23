@@ -15,6 +15,7 @@ from apifix.engine.models import CERTAIN, LIKELY, Category, Confidence, Finding
 from apifix.engine.project import is_test_file
 
 _MAX_PATTERN = 120
+_MAX_VALUE = 60
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,43 @@ def _targets_azure(tree: ast.Module, aliases: dict[str, str]) -> bool:
         ):
             return True
     return False
+
+
+def env_name(node: ast.expr) -> str | None:
+    """The variable of `os.getenv("X")`, `os.environ.get("X")` or `os.environ["X"]` (also
+    `getenv` / `environ` imported from os), with no default; else None."""
+    if isinstance(node, ast.Call) and len(node.args) == 1 and not node.keywords:
+        arg = node.args[0]
+        if (
+            ast.unparse(node.func) in ("os.getenv", "getenv", "os.environ.get", "environ.get")
+            and isinstance(arg, ast.Constant)
+            and isinstance(arg.value, str)
+        ):
+            return arg.value
+    if (
+        isinstance(node, ast.Subscript)
+        and ast.unparse(node.value) in ("os.environ", "environ")
+        and isinstance(node.slice, ast.Constant)
+        and isinstance(node.slice.value, str)
+    ):
+        return node.slice.value
+    return None
+
+
+def config_value_exempt(attr: str, value: ast.expr) -> bool:
+    """None, or a read of the variable 1.x reads itself for module attribute `attr`: dropping
+    the assignment loses nothing."""
+    if isinstance(value, ast.Constant) and value.value is None:
+        return True
+    env = env_name(value)
+    return env is not None and env == rules.ENV_READ_BY_V1.get(attr)
+
+
+def config_target(target: ast.AST, aliases: dict[str, str]) -> str | None:
+    """The module attribute (`api_key`, ...) an assignment target sets on openai, if any."""
+    canonical = _resolve(target, aliases) if isinstance(target, ast.Attribute) else None
+    parts = canonical.split(".") if canonical else []
+    return parts[1] if len(parts) == 2 else None
 
 
 # --- classification -------------------------------------------------------------------------
@@ -240,9 +278,33 @@ class _Visitor(ast.NodeVisitor):
     def visit_Attribute(self, node: ast.Attribute) -> None:
         canonical = _resolve(node, self.aliases)
         if canonical and (rule := _classify(canonical, self.azure)):
+            attr = canonical.split(".", 1)[1]
+            if attr in ("api_key", "organization") and not self.azure:  # a read
+                rule = _Rule(rule.category, rules.CONFIG_READ.format(attr=attr), rule.confidence)
             self._report_rule(node, rule)
             return  # the rest of the chain is part of this finding
         self.generic_visit(node)
+
+    def _config_rule(self, attr: str, value: ast.expr) -> _Rule:
+        """The finding for an assignment of `value` to openai.<attr> (CONFIG_ASSIGN_ATTRS)."""
+        plain, for_azure, confidence = rules.CONFIG_ATTRS[attr]
+        exempt = config_value_exempt(attr, value)
+        if self.azure:
+            none = isinstance(value, ast.Constant) and value.value is None
+            return _Rule(
+                "client_config", for_azure + ("" if none else rules.AZURE_CONFIG_KEEP), confidence
+            )
+        source = " ".join(
+            (ast.get_source_segment(self.source, value) or ast.unparse(value)).split()
+        )
+        if len(source) > _MAX_VALUE:
+            source = "..."
+        if attr == "api_base":
+            return _Rule("client_config", rules.CONFIG_API_BASE.format(value=source), CERTAIN)
+        if exempt:
+            env = rules.ENV_READ_BY_V1[attr]
+            return _Rule("client_config", rules.CONFIG_DROP.format(env=env), confidence)
+        return _Rule("client_config", rules.CONFIG_KEEP.format(attr=attr, value=source), confidence)
 
     def visit_Name(self, node: ast.Name) -> None:
         canonical = self.aliases.get(node.id)
@@ -356,7 +418,20 @@ class _Visitor(ast.NodeVisitor):
                 self.scopes[-1][target.id] = kind
 
     def visit_Assign(self, node: ast.Assign) -> None:
-        self.generic_visit(node)
+        config = {
+            id(t): attr
+            for t in node.targets
+            if (attr := config_target(t, self.aliases)) in rules.CONFIG_ASSIGN_ATTRS
+        }
+        if config:  # reported on the whole statement, with a suggestion for the value
+            for t in node.targets:
+                if id(t) in config:
+                    self._report_rule(node, self._config_rule(config[id(t)], node.value))
+                else:
+                    self.visit(t)
+            self.visit(node.value)
+        else:
+            self.generic_visit(node)
         kind = self._response_kind(node.value)
         for t in node.targets:
             self._bind(t, kind)

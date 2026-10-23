@@ -60,6 +60,10 @@ EXTERNAL_MARKERS = (
 )
 NON_SOURCE_FILES = {"setup.py", "noxfile.py"}
 MAX_LISTED = 15
+# "Review by hand": changes no test executed, for these verdicts (the first line of each side
+# of a hunk, at most this long)
+REVIEW_VERDICTS = frozenset({"verified_weak", "unverified"})
+REVIEW_CHARS = 100
 # pip output kept per failed install phase in run summaries (the tail: that is where pip's
 # error is)
 INSTALL_OUTPUT_CHARS = 4_000
@@ -119,6 +123,9 @@ class ChangedLineCoverage:
     # path -> (executed, executable, sorted uncovered changed lines)
     per_file: dict[str, tuple[int, int, tuple[int, ...]]] = field(default_factory=dict)
     unmeasured_files: list[str] = field(default_factory=list)
+    # every changed source file (also one with only removals) -> (its executable changed
+    # lines, those the tests executed), for the review-by-hand list
+    lines: dict[str, tuple[frozenset[int], frozenset[int]]] = field(default_factory=dict)
 
     @property
     def ratio(self) -> float | None:
@@ -138,6 +145,8 @@ class Verification:
     baseline: SandboxResult
     fixed: SandboxResult
     rerun: SandboxResult | None = None
+    # verified_weak / unverified: hunks of source files no test executed (review_by_hand())
+    review_by_hand: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Compact machine-readable form (no captured output)."""
@@ -154,6 +163,7 @@ class Verification:
             "test_edits": [asdict(e) for e in self.edits],
             "findings_before": self.findings_before,
             "remaining_findings": [asdict(f) for f in self.remaining_findings],
+            "review_by_hand": self.review_by_hand,
             "runs": {
                 name: run_summary(run)
                 for name, run in (("baseline", self.baseline), ("fixed", self.fixed))
@@ -483,12 +493,14 @@ def changed_line_coverage(
         if (
             not ch.is_python
             or ch.kind == "deleted"
-            or not ch.changed_lines
             or is_test_file(ch.path, root=original if ch.kind != "added" else fixed)
             or PurePosixPath(ch.path).name in NON_SOURCE_FILES
         ):
             continue
         lines = set(ch.changed_lines)
+        if not lines:  # only removals
+            cov.lines[ch.path] = (frozenset(), frozenset())
+            continue
         measured = (fixed_run.coverage or {}).get(ch.path)
         if measured is None:
             # Never imported (or no coverage at all): count non-blank, non-comment lines.
@@ -505,6 +517,7 @@ def changed_line_coverage(
         else:
             executable = lines & measured.executable
             executed = lines & measured.executed
+        cov.lines[ch.path] = (frozenset(executable), frozenset(executed))
         if executable:
             cov.per_file[ch.path] = (
                 len(executed),
@@ -514,6 +527,71 @@ def changed_line_coverage(
             cov.executable += len(executable)
             cov.executed += len(executed)
     return cov
+
+
+def _first_code_line(lines: Sequence[str]) -> str:
+    """The first non-blank, non-comment line (else the first non-blank one), shortened."""
+    stripped = [line.strip() for line in lines if line.strip()]
+    text = next(
+        (line for line in stripped if not line.startswith("#")), stripped[0] if stripped else ""
+    )
+    return text if len(text) <= REVIEW_CHARS else text[: REVIEW_CHARS - 3] + "..."
+
+
+def review_by_hand(
+    changes: list[FileChange], coverage: ChangedLineCoverage
+) -> list[dict[str, Any]]:
+    """Hunks of changed source files that no test executed: none of the hunk's fixed-side
+    executable lines ran, or it has none (a removal, code turned into a comment, an edit inside
+    a string), which coverage cannot vouch for. Fixed-side line numbers."""
+    out = []
+    for ch in changes:
+        if ch.path not in coverage.lines:
+            continue
+        executable, executed = coverage.lines[ch.path]
+        for h in ch.hunks:
+            lines = set(h.new_lines) & executable
+            if lines & executed:
+                continue
+            code = [line for line in h.new if line.strip() and not line.lstrip().startswith("#")]
+            out.append(
+                {
+                    "file": ch.path,
+                    "line": h.new_start,
+                    "end_line": h.new_start + max(len(h.new), 1) - 1,
+                    "old": _first_code_line(h.old),
+                    "new": _first_code_line(h.new),
+                    "old_lines": len(h.old),
+                    "new_lines": len(h.new),
+                    "new_is_code": bool(code),
+                }
+            )
+    return out
+
+
+def _code(text: str) -> str:
+    return f"`` {text} ``" if "`" in text else f"`{text}`"
+
+
+def review_line(entry: Mapping[str, Any]) -> str:
+    """One review-by-hand bullet (without the leading "- ")."""
+    first, last = entry["line"], entry["end_line"]
+    where = f"{entry['file']}:{first}" + (f"-{last}" if last > first else "")
+    old, new = entry["old"], entry["new"]
+    more = entry["new_lines"] - 1
+    plus = f" (+{more} line{'s' if more > 1 else ''})" if more > 0 else ""
+    if not entry["old_lines"]:
+        what = f"added {_code(new)}{plus}"
+    elif not entry["new_lines"]:
+        extra = entry["old_lines"] - 1
+        what = f"removed {_code(old)}" + (
+            f" (+{extra} line{'s' if extra > 1 else ''})" if extra > 0 else ""
+        )
+    elif not entry["new_is_code"]:
+        what = f"removed {_code(old)}" + (f"; added {_code(new)}" if new else "")
+    else:
+        what = f"{_code(old)} -> {_code(new)}{plus}"
+    return f"`{where}`: {what}"
 
 
 # --- reasons and verdict ----------------------------------------------------------------------
@@ -1038,8 +1116,10 @@ def verify(
         + environment_reasons(baseline, original)
         + _evidence_reasons(fixed_run, coverage, config)
     )
+    verdict = decide(reasons)
+    review = review_by_hand(changes, coverage) if verdict in REVIEW_VERDICTS else []
     return Verification(
-        verdict=decide(reasons),
+        verdict=verdict,
         reasons=reasons,
         delta=delta,
         edits=edits,
@@ -1050,6 +1130,7 @@ def verify(
         baseline=baseline,
         fixed=fixed_run,
         rerun=rerun,
+        review_by_hand=review,
     )
 
 
@@ -1159,6 +1240,13 @@ def _report(v: Verification) -> str:
         out += _bullets(
             [f"**{r.code}**: {_where(r)}{r.message}{_tests_suffix(r)}" for r in blocking]
         )
+        out.append("")
+
+    if v.review_by_hand:
+        out += ["### Review by hand", "", "No test executed these changes:", ""]
+        out += [f"- {review_line(e)}" for e in v.review_by_hand[:MAX_LISTED]]
+        if len(v.review_by_hand) > MAX_LISTED:
+            out.append(f"- ... and {len(v.review_by_hand) - MAX_LISTED} more (see fix.diff)")
         out.append("")
 
     out += _not_installed_section(v.fixed.not_installed or v.baseline.not_installed)

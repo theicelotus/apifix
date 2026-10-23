@@ -49,10 +49,15 @@ src/apifix/
                       import name -> distribution table
     scanner.py        finds affected call sites + dependency pins (ast, no LLM)
     migrations/       one package per migration; registry in __init__.py; guide.py splits
-                      guides into `<!-- part: id -->` parts for per-job selection
+                      guides into `<!-- part: id -->` parts for per-job selection; optional
+                      hooks `adjust_findings` (repo-level pass at the end of a scan) and
+                      `rewrite_checker` (migration checks of a whole-file rewrite)
       openai_v1/      rules.py (pure data tables, incl. guide-part selectors) + migration-
                       specific heuristics; guide.md (old -> new reference used in the prompts);
-                      guide_parts.py (which parts / Resources rows a job's findings need)
+                      guide_parts.py (which parts / Resources rows a job's findings need);
+                      repo_findings.py (adjust_findings: call sites -> module-level client when
+                      a non-test file keeps a configured value); config_checks.py (rewrite
+                      checks: dropped / ignored openai.api_key, organization, api_base)
     project.py        target repo facts: Python version, test files (`is_test_file`, the one
                       definition everything uses), test plan (pytest, explicit file list,
                       import paths), install plan (where each dependency is declared, what
@@ -68,14 +73,15 @@ src/apifix/
     cleanup.py        removes containers / temp workspaces left by crashed or killed runs
     test_results.py   JUnit / unittest output -> counts + per-test outcomes (+ the module of
                       a "No module named" error, read before messages are clipped)
-    diffing.py        original vs fixed tree: changed files and changed lines
+    diffing.py        original vs fixed tree: changed files, changed lines and hunks
     tampering.py      AST comparison of test files: removed/weakened asserts, skips, ...
     scope.py          CI/tooling config changes (warned, not rejected)
     suspicious.py     added code unrelated to the migration (network/process calls, eval,
                       encoded literals, new imports/deps): prompt-injection warnings
     verifier.py       baseline vs fix: per-test deltas, flaky rerun, tampering, completeness,
                       changed-line coverage, environment (missing modules, library not
-                      declared) -> verdict + reasons + PR report section
+                      declared) -> verdict + reasons + PR report section (with a per-hunk
+                      "Review by hand" list for verified_weak / unverified)
     llm.py            provider-neutral LLM interface, model/price table (TOML-overridable)
     llm_anthropic.py  Claude via the official `anthropic` SDK (optional extra)
     llm_openai_compat.py  any OpenAI-compatible endpoint (Ollama, LM Studio, vLLM, hosted);
@@ -93,6 +99,9 @@ src/apifix/
     whole_file.py     whole-file mode (no tools, one file per request): file selection, prompts,
                       code-block parsing, pre-apply checks (syntax, dependency file, changed,
                       abbreviation, undefined names, mock targets)
+    unrelated.py      unrelated-edit check of a rewritten Python file (whole-file mode): text-only
+                      hunks away from the findings reverted, unrelated code hunks and missing
+                      original strings as check errors
     code_checks.py    static checks on a rewritten file (not mode-specific): new undefined names
                       (pyflakes; adds the import itself when exactly one is known), new
                       mock.patch targets missing from repo modules or patching the code under
@@ -162,6 +171,23 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
 ```
 
 ## Known limitations (scanner)
+
+- openai-v1 module config: assignments to `openai.api_key` / `organization` / `api_base`
+  (aliases resolved) are one finding on the whole statement, with a suggestion by value: `None`
+  or an env read 1.x does itself (`os.getenv` / `os.environ.get` / `os.environ[...]` of
+  `OPENAI_API_KEY`, `OPENAI_ORG_ID`, no default) "can go"; anything else "Never drop this value"
+  (keep it and use the module-level client, or pass it to every client); `api_base` always
+  "1.x ignores api_base" (assign `openai.base_url`). Azure files keep their suggestions plus
+  "never drop the value". Reads (`if not openai.api_key:`) get a neutral [likely] hint. Other
+  attributes (`api_type`, `proxy`, ...) are reported on the attribute as before.
+- Repo-level pass (`adjust_findings`, openai-v1): when a non-test, non-Azure file has a "Never
+  drop" / api_base finding, api_call suggestions of the form "Use [await] client.X(...) with
+  client = openai.[Async]OpenAI()" in non-test files become "Use openai.X(...): the
+  module-level client, which reads openai.api_key ... (set in file:line)" (async:
+  `AsyncOpenAI(api_key=openai.api_key)` where it is used), string mock targets in test files
+  say to patch `openai.X` with a key set, and the assignment's suggestion names the files that
+  make the calls. Other suggestion forms (resource classes, kwargs) are not rewritten. The guide
+  part `client.config` is selected by a "Never drop" / "never drop it" suggestion.
 
 - Dependency pins: pip entries only (pixi `pypi-dependencies` of every table, all platforms;
   an environment file's `pip:` list). Requirements-file lines are read without per-requirement
@@ -331,6 +357,12 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   coverage/pytest-cov configuration can interfere with the `coverage run` wrapper.
 - Scope warnings use the scanner's findings per file, so legitimate edits in files without
   findings (e.g. mock data helpers) are still warned about.
+- Review by hand (`verified_weak`, `unverified` only): hunks of changed non-test source files
+  (the files changed-line coverage counts) none of whose fixed-side executable lines ran; hunks
+  with no executable fixed-side line (removals, code turned into a comment, edits inside a
+  multi-line string) are always listed. First non-comment line of each side (100 characters),
+  at most 15 in the report (`verification.review_by_hand` has all). Fixed-side line numbers; a
+  removal is shown at the line that now follows it.
 
 ## Known limitations (agent)
 
@@ -458,6 +490,43 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   original, and at least half the original's lines when it has 20 or more. Placeholder
   detection is a regex over comment lines, so an unusual phrasing passes and a genuine new
   comment like "# rest of the payload" can be rejected (one in-file retry softens this).
+- Unrelated edits (`unrelated.py`, Python files incl. test files): the candidate is diffed
+  against the original by line (`diffing.opcodes`). A finding's *region* is the innermost
+  statement holding its line (simple statements whole, compound ones by their header:
+  decorators to the line before the body; `except` handlers count). Per hunk: import-only hunks
+  are kept; *text-only* hunks (same tokens once comments, blank lines, whitespace and string
+  contents are set aside) are kept when they touch a string on a finding's line (or a key of a
+  dict-literal finding), or change only comments/whitespace within 3 lines of a region
+  (insertions: only strictly inside a region), and are otherwise **reverted** by apifix before
+  the other checks (`reverted` per reply and file entry; report "apifix reverted:
+  file:line (...)" with the written file's line); *code* hunks are kept near a region or when
+  they use a migration name (the library's names; names bound on either side of a near code hunk
+  or on the candidate side of an import hunk; names such a hunk introduces that the original
+  never uses, also as `self.x`; attributes it accesses), and are otherwise a check error
+  ("original line N: changed/removed code unrelated to the migration (...)"; "after original
+  line N: added code ..."). Then every non-exempt string constant of the original must still be
+  in the candidate (multiset over the file); exempt: strings on a finding's lines, keys of
+  dict-literal findings, and dict/subscript keys that became attribute or keyword names
+  (`d["choices"]` -> `d.choices`). A revert whose result does not parse is not made; each such
+  hunk is an error instead. Known misses: a library-name shim (`try: from openai import OpenAI
+  as _OpenAI ...` that stubs the library) counts as related; a removed string that also occurs
+  elsewhere in the file is not missed (multiset); any edit within 3 lines of a finding is
+  trusted (only its strings are protected); names like `e` from `except ... as e` make every
+  other use of `e` related. Known false positives: a far signature change that names a new
+  parameter only used through another name; a pure comment insertion right above a finding's
+  statement is reverted (insertions get no proximity). Whole-file mode only (not agent mode or
+  `apifix verify`: see docs/plans/unrelated-edits-and-config.md, "Later").
+- Config checks (`Migration.rewrite_checker`, openai-v1 `config_checks.py`; check `config`, run
+  last, non-test Python files only), built once per job from the original repo (non-test files
+  with findings). A, dropped: each original assignment to `openai.api_key` / `organization` /
+  `api_base` / `base_url` whose value is not exempt (None, or the env variable 1.x reads itself)
+  must still be assigned to the 1.x name (`api_base` -> `base_url`; Azure also
+  `azure_endpoint`) or passed as that keyword to a client constructor in the same file; values
+  compared by `ast.dump`, so passing it through a local variable fails. `openai.api_base = x`
+  kept as is is an error (1.x ignores it). B, ignored (non-Azure files): a client constructor
+  call the original did not have must pass every keyword the repo's configured values need
+  (any value) or `**kwargs`. Two deliberately different clients fail B. Constructors reached
+  through a shim (`OpenAI = _OpenAI`) or a factory in another module are not seen.
 - Undefined names (`code_checks.py`, Python files): pyflakes `UndefinedName` messages only, and
   only names the original did not already use undefined (star imports and builtins never
   count). Before the checks, apifix adds the import itself for each such name with exactly
@@ -501,7 +570,8 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   bullet list. Code-block nudges still continue the conversation.
 - A retry note also lists the file's earlier check errors in this job (any attempt) that the
   current reply does not have, under "Keep these fixed", compared and shown by first line
-  without the `line N:` prefix (so the same problem on another line counts as the same).
+  without the `line N:` prefix (also `original line N:`, `after original line N:`), so the
+  same problem on another line counts as the same.
 - After a failed verification every Python file is resent with the verifier's reasons and
   failing test output (at most 10 tests, 2,000 characters each, 8,000 in total). A dependency
   file (accepted, or set by apifix) is resent only when a reason or remaining finding names

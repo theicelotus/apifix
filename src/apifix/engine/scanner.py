@@ -50,6 +50,9 @@ def scan(path: str | os.PathLike[str], migration: str | Migration) -> ScanResult
             _scan_dependencies(rel, data, migration, result)
 
     result.findings.sort()
+    adjust = getattr(migration, "adjust_findings", None)
+    if callable(adjust):
+        result.findings = sorted(adjust(result.findings, base))
     return result
 
 

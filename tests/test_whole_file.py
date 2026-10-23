@@ -107,6 +107,8 @@ def test_valid_changed_python_passes():
         "abbreviation": "ok",
         "undefined_names": "ok",
         "mock_targets": "n/a",  # not a test file
+        "unrelated_edits": "n/a",  # no findings given
+        "config": "n/a",  # no migration checks given
     }
 
 
@@ -153,6 +155,69 @@ def test_check_candidate_without_a_known_import_still_fails():
     assert broken.auto_imports == [] and broken.checks["undefined_names"] == "n/a"
     reqs = check_candidate("requirements.txt", "openai==0.28\n", "openai>=1\n", required=True)
     assert reqs.auto_imports == [] and reqs.text == "openai>=1\n"
+
+
+def test_unrelated_edits_are_reverted_before_imports_are_added_and_config_runs_last():
+    from tests.test_unrelated import ASSISTANT, FINDINGS, FIXTURE, GOOD_ASSISTANT, LIBRARY, edit
+
+    original = (FIXTURE / ASSISTANT).read_text()
+    candidate = edit(GOOD_ASSISTANT, "rate how  well", "rate how such well")
+    candidate = edit(
+        candidate,
+        "        response = openai.chat.completions.create(",
+        "        response = OpenAI().chat.completions.create(",  # OpenAI is not imported
+    )
+    own = [f for f in FINDINGS if f.file == ASSISTANT]
+    checker = get_migration("openai-v1").rewrite_checker(FIXTURE, FINDINGS)
+    r = check_candidate(
+        ASSISTANT,
+        original,
+        candidate,
+        required=True,
+        known_imports=KNOWN,
+        library_modules=LIBRARY,
+        findings=own,
+        rewrite_checks=checker,
+    )
+    assert r.auto_imports == ["from openai import OpenAI"]
+    assert r.reverted == [
+        {
+            "line": 10,
+            "fixed_line": 11,  # below the import apifix added
+            "kind": "changed",
+            "old": "Then rate how  well the answer fits the...",
+            "new": "Then rate how such well the answer fits the...",
+        }
+    ]
+    assert "rate how  well" in r.text and r.text.startswith(
+        '"""Answers spoken questions with a chat model."""\n\nimport openai\n'
+        "from openai import OpenAI\n"
+    )
+    assert r.checks["unrelated_edits"] == "ok"
+    (config,) = r.errors
+    assert r.checks["config"] == config
+    assert config.startswith(
+        "line 32: `OpenAI()` does not read openai.api_key, which voicebot/cli.py:12 sets from "
+        "`api_key` or openai.base_url"
+    )
+
+
+def test_unrelated_edit_errors_are_one_error_each():
+    from tests.test_unrelated import ASSISTANT, FINDINGS, FIXTURE, GOOD_ASSISTANT, LIBRARY, edit
+
+    candidate = edit(GOOD_ASSISTANT, 'model="gpt-3.5-turbo"', 'model="gpt-4o-mini"')
+    candidate = edit(candidate, "MAX_WORDS = 80", "MAX_WORDS = 120")
+    r = check_candidate(
+        ASSISTANT,
+        (FIXTURE / ASSISTANT).read_text(),
+        candidate,
+        required=True,
+        library_modules=LIBRARY,
+        findings=[f for f in FINDINGS if f.file == ASSISTANT],
+    )
+    assert [e.split(":")[0] for e in r.errors] == ["original line 6", "original line 32"]
+    assert r.checks["unrelated_edits"] == "; ".join(r.errors)
+    assert r.checks["config"] == "n/a"
 
 
 def test_retry_note_lists_problems_to_keep_fixed():

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import subprocess
 
-from apifix.engine.diffing import FileChange, changed_lines, diff_trees, unified_diff
+from apifix.engine.diffing import FileChange, Hunk, changed_lines, diff_trees, hunks, unified_diff
 
 
 def test_changed_lines():
@@ -28,9 +28,20 @@ def test_diff_trees(tmp_path):
     assert diff_trees(before, after) == [
         FileChange("blob.bin", "added"),
         FileChange("gone.py", "deleted", (), 2),
-        FileChange("new.py", "added", (1,), 0),
-        FileChange("pkg/mod.py", "modified", (2,), 1),
+        FileChange("new.py", "added", (1,), 0, (Hunk(0, 1, (), ("z = 1",)),)),
+        FileChange("pkg/mod.py", "modified", (2,), 1, (Hunk(2, 2, ("b = 2",), ("b = 3",)),)),
     ]
+
+
+def test_hunks_number_both_sides():
+    old = "a\nb\nc\nd\ne\n"
+    new = "a\nB\nc\nnew\nd\n"
+    assert hunks(old, new) == (
+        Hunk(2, 2, ("b",), ("B",)),  # replaced
+        Hunk(3, 4, (), ("new",)),  # inserted after original line 3
+        Hunk(5, 6, ("e",), ()),  # removed; the fixed file's line 6 is where it was
+    )
+    assert [list(h.new_lines) for h in hunks(old, new)] == [[2], [4], []]
 
 
 def test_unified_diff_applies_with_git(tmp_path):

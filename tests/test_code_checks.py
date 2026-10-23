@@ -656,6 +656,21 @@ def test_suggestion_for_a_direct_library_call():
     assert 'patch("app.openai.moderations.create") and set create.return_value.' in problem
 
 
+def test_suggestion_for_the_module_level_client():
+    """Code that keeps openai.api_key and calls the module-level client (client.config)."""
+    app = """\
+        import openai
+
+
+        def ask(q):
+            r = openai.chat.completions.create(model="m", messages=[q])
+            return r.choices[0].message.content
+    """
+    problem = _suggestion(app)
+    assert "ask() calls openai.chat.completions.create(), so " in problem
+    assert 'patch("app.openai.chat.completions.create") and set create.return_value.' in problem
+
+
 def test_no_suggestion_without_a_library_call():
     app = "import json\n\n\ndef ask(q):\n    return json.dumps(q.strip())\n"
     assert _suggestion(app).endswith("patch what it calls instead")

@@ -382,13 +382,18 @@ class _ModuleIndex:
         imported = self.imports.get(dotted.split(".")[0])
         return imported is not None and imported.split(".")[0] in self.library
 
+    def _library_class(self, dotted: str | None) -> bool:
+        """A class of the library (`openai.OpenAI`), not one of its calls
+        (`openai.chat.completions.create`, whose result is a response)."""
+        return self._from_library(dotted) and (dotted or "").rsplit(".", 1)[-1][:1].isupper()
+
     def factory(self, value: ast.expr) -> tuple[str, str] | None:
-        """("ctor", "openai.OpenAI") for a library call such as `openai.OpenAI()`, or
+        """("ctor", "openai.OpenAI") for a library class call such as `openai.OpenAI()`, or
         ("factory", "get_client") for a call of a top-level function that returns one."""
         if not isinstance(value, ast.Call):
             return None
         func = _dotted(value.func)
-        if self._from_library(func):
+        if self._library_class(func):
             return "ctor", func or ""
         fn = self.functions.get(func or "")
         if fn is not None:
@@ -396,7 +401,7 @@ class _ModuleIndex:
                 if (
                     isinstance(node, ast.Return)
                     and isinstance(node.value, ast.Call)
-                    and self._from_library(_dotted(node.value.func))
+                    and self._library_class(_dotted(node.value.func))
                 ):
                     return "factory", fn.name
         return None

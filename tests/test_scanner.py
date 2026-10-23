@@ -29,7 +29,9 @@ def test_chatbot(fixture_findings):
     assert at(findings, 27).old_pattern == 'resp["choices"][0]["message"]["content"]'
     assert at(findings, 27).confidence == "likely"
     assert at(findings, 28).suggestion == "Use openai.RateLimitError"
-    assert "OpenAI(api_key=" in at(findings, 9).suggestion
+    # openai.api_key = os.getenv("OPENAI_API_KEY"): the variable 1.x reads itself
+    assert at(findings, 9).old_pattern == 'openai.api_key = os.getenv("OPENAI_API_KEY")'
+    assert at(findings, 9).suggestion.startswith("1.x reads OPENAI_API_KEY itself")
 
 
 def test_async_streaming(fixture_findings):
@@ -580,3 +582,153 @@ def test_tiny_repo_test_file_gets_the_new_finding(tmp_path):
         (10, "api_call"),
         (16, "api_call"),
     ]
+
+
+# --- module configuration: statement-level findings and the repo-level pass ---------------------
+
+
+@pytest.mark.parametrize(
+    ("statement", "start", "confidence"),
+    [
+        (
+            'openai.api_key = os.getenv("OPENAI_API_KEY")',
+            "1.x reads OPENAI_API_KEY itself",
+            "likely",
+        ),
+        (
+            'openai.api_key = os.environ["OPENAI_API_KEY"]',
+            "1.x reads OPENAI_API_KEY itself",
+            "likely",
+        ),
+        ("openai.api_key = None", "1.x reads OPENAI_API_KEY itself", "likely"),
+        ('openai.organization = os.getenv("OPENAI_ORG_ID")', "1.x reads OPENAI_ORG_ID", "likely"),
+        ("openai.api_key = key", "Never drop this value", "likely"),
+        ('openai.api_key = os.getenv("MY_KEY")', "Never drop this value", "likely"),
+        ('openai.api_key = os.getenv("OPENAI_API_KEY", "x")', "Never drop this value", "likely"),
+        ('openai.api_key = "EMPTY"', "Never drop this value", "likely"),
+        ("openai.api_base = url", "1.x ignores api_base", "certain"),
+        ('openai.api_base = os.getenv("OPENAI_API_BASE")', "1.x ignores api_base", "certain"),
+    ],
+)
+def test_config_assignments_are_reported_on_the_statement(scan_code, statement, start, confidence):
+    (f,) = scan_code(f"import os\nimport openai\n\nkey = url = None\n{statement}\n")
+    assert (f.line, f.col, f.category, f.old_pattern) == (5, 1, "client_config", statement)
+    assert f.suggestion.startswith(start) and f.confidence == confidence
+
+
+def test_config_suggestions_name_the_value(scan_code):
+    (key,) = scan_code("import openai\n\n\ndef main(cli_key):\n    openai.api_key = cli_key\n")
+    assert key.suggestion == (
+        "Never drop this value: keep the assignment and call the module-level client "
+        "(openai.chat.completions.create(...) reads openai.api_key), or pass it to every client: "
+        "openai.OpenAI(api_key=cli_key)"
+    )
+    (base,) = scan_code("import openai as oa\noa.api_base = 'http://localhost:8000/v1'\n")
+    assert base.old_pattern == "oa.api_base = 'http://localhost:8000/v1'"
+    assert base.suggestion == (
+        "1.x ignores api_base: assign openai.base_url = 'http://localhost:8000/v1' and use the "
+        "module-level client, or pass openai.OpenAI(base_url='http://localhost:8000/v1'); never "
+        "drop it"
+    )
+
+
+def test_config_reads_get_a_neutral_hint(scan_code):
+    findings = scan_code("import openai\n\nif not openai.api_key:\n    raise SystemExit(1)\n")
+    assert [(f.line, f.old_pattern) for f in findings] == [(3, "openai.api_key")]
+    assert findings[0].suggestion == (
+        "1.x keeps openai.api_key for the module-level client only; openai.OpenAI() does not "
+        "read it"
+    )
+
+
+def test_azure_config_keeps_its_suggestions_and_never_drops_values(fixture_findings):
+    findings = fixture_findings("azure_config.py")
+    base, key = at(findings, 8), at(findings, 10)
+    assert base.old_pattern == 'openai.api_base = os.environ["AZURE_OPENAI_ENDPOINT"]'
+    assert base.suggestion.startswith("api_base becomes azure_endpoint")
+    assert base.suggestion.endswith("; never drop the value")
+    assert key.suggestion.endswith("; never drop the value")
+    assert "client = openai.AzureOpenAI" in at(findings, 14).suggestion  # no repo-level rewrite
+
+
+def _repo_findings(tmp_path, files: dict[str, str]) -> list:
+    for rel, text in files.items():
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text(textwrap.dedent(text))
+    return scan(tmp_path, "openai-v1").findings
+
+
+def test_split_config_points_call_sites_at_the_module_level_client():
+    findings = scan(FIXTURES.parent / "split_config", "openai-v1").findings
+    by = {(f.file, f.line): f for f in findings}
+    assert by[("voicebot/assistant.py", 31)].suggestion == (
+        "Use openai.chat.completions.create(...): the module-level client, which reads "
+        "openai.api_key and openai.base_url (set in voicebot/cli.py:12,13); the response is a "
+        "typed object, not a dict"
+    )
+    assert by[("voicebot/cli.py", 12)].suggestion.endswith(
+        ". The API calls are in voicebot/assistant.py: keep this assignment"
+    )
+    assert by[("voicebot/cli.py", 13)].suggestion.endswith(
+        ". The API calls are in voicebot/assistant.py: keep the value set here (as openai.base_url)"
+    )
+    assert by[("tests/test_assistant.py", 10)].suggestion == (
+        'String reference (e.g. a mock.patch target): patch "openai.chat.completions.create" '
+        "(the code uses the module-level client; the test needs OPENAI_API_KEY or "
+        "openai.api_key set)"
+    )
+
+
+def test_repo_pass_async_calls_and_untouched_cases(tmp_path):
+    findings = _repo_findings(
+        tmp_path,
+        {
+            "app/config.py": "import openai\n\n\ndef setup(key):\n    openai.api_key = key\n",
+            "app/chat.py": """\
+                import openai
+
+
+                async def ask(m):
+                    return await openai.ChatCompletion.acreate(model="m", messages=m)
+                """,
+        },
+    )
+    (call,) = [f for f in findings if f.category == "api_call"]
+    assert call.suggestion == (
+        "Use await client.chat.completions.create(...) with client = "
+        "openai.AsyncOpenAI(api_key=openai.api_key) created where it is used (1.x has no "
+        "module-level async client); the response is a typed object, not a dict"
+    )
+
+
+CONFIG_FROM_ENV = 'import os\nimport openai\n\nopenai.api_key = os.getenv("OPENAI_API_KEY")\n'
+CHAT = "import openai\n\nopenai.ChatCompletion.create(model='m', messages=[])\n"
+
+
+def test_no_repo_pass_when_the_key_comes_from_the_environment(tmp_path):
+    findings = _repo_findings(
+        tmp_path,
+        {
+            "app/config.py": CONFIG_FROM_ENV,
+            "app/chat.py": CHAT,
+            "tests/test_chat.py": "from unittest import mock\n\nmock.patch(CREATE)\n".replace(
+                "CREATE", "'openai.ChatCompletion.create'"
+            ),
+        },
+    )
+    by = {f.file: f for f in findings}
+    assert by["app/chat.py"].suggestion.startswith("Use client.chat.completions.create(...) with")
+    assert "keep this assignment" not in by["app/config.py"].suggestion
+    assert "client.chat.completions.create" in by["tests/test_chat.py"].suggestion
+
+
+def test_a_test_file_setting_a_key_does_not_trigger_the_repo_pass(tmp_path):
+    findings = _repo_findings(
+        tmp_path,
+        {
+            "tests/test_chat.py": "import openai\n\nopenai.api_key = 'test'\n",
+            "app/chat.py": CHAT,
+        },
+    )
+    call = next(f for f in findings if f.file == "app/chat.py")
+    assert call.suggestion.startswith("Use client.chat.completions.create(...) with")

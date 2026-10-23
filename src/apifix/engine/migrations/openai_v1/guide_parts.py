@@ -15,6 +15,8 @@ from apifix.engine.project import is_test_file
 GUIDE_SOURCE = (Path(__file__).parent / "guide.md").read_text(encoding="utf-8")
 PARTS = guide_parts(GUIDE_SOURCE)
 _ROW = re.compile(r"^\| `openai\.(\w+)\.")
+# The client part's sentence that the client.config part qualifies, when both are sent.
+CLIENT_KEY_SENTENCE = "0.x code set a key from somewhere else"
 
 
 def _matches(finding: Finding, selector: tuple[frozenset[str], tuple[str, ...]]) -> bool:
@@ -61,13 +63,18 @@ def _filter_resources(body: str, findings: list[Finding]) -> str:
     return re.sub(r"\n{3,}", "\n\n", "".join(out))
 
 
+def _part_text(part: str, body: str, findings: list[Finding], keep: set[str]) -> str:
+    if part == "resources":
+        return _filter_resources(body, findings)
+    if part == "client" and "client.config" in keep:
+        return body.replace(CLIENT_KEY_SENTENCE, CLIENT_KEY_SENTENCE + " (see below)")
+    return body
+
+
 def job_guide(findings: list[Finding], root: Path | None = None) -> tuple[str, list[str]]:
     """The guide text for these findings, and the ids of the parts it holds (in guide order)."""
     keep = selected_parts(findings, root)
-    parts = [
-        (part, _filter_resources(body, findings) if part == "resources" else body)
-        for part, body in PARTS
-    ]
+    parts = [(part, _part_text(part, body, findings, keep)) for part, body in PARTS]
     text = render_parts(parts, keep)
     return text, [part for part, _ in PARTS if part in keep]
 

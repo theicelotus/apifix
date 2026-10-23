@@ -356,6 +356,12 @@ class _Job:
         self.wf_all: list[str] = []
         self.wf_guide = ""
         self.preflight_done = False
+        # whole-file: the migration's own checks of a rewritten file (built from the original
+        # repo once per job), run after apifix's generic ones
+        self.rewrite_checks = None
+        if self.whole_file:
+            checker = getattr(migration, "rewrite_checker", None)
+            self.rewrite_checks = checker(repo, findings) if callable(checker) else None
 
     # --- budget -----------------------------------------------------------------------------
 
@@ -728,9 +734,12 @@ class _Job:
                     module_roots=module_roots(
                         path, self.baseline.import_paths if self.baseline else ()
                     ),
+                    findings=[f for f in self.findings if f.file == path],
+                    rewrite_checks=self.rewrite_checks,
                 )
                 reply["checks"] = result.checks
                 reply["auto_imports"] = result.auto_imports
+                reply["reverted"] = result.reverted
                 candidate = result.text
                 if not result.ok:
                     error = join_errors(result.errors)
@@ -762,6 +771,7 @@ class _Job:
                     break
                 (self.work / path).write_bytes(candidate.encode("utf-8"))
                 entry["auto_imports"] = result.auto_imports
+                entry["reverted"] = result.reverted
                 entry["accepted"] = True
                 entry["changed"] = candidate != original
                 break
@@ -1061,6 +1071,19 @@ class _Job:
         }
 
 
+def revert_text(r: dict[str, Any]) -> str:
+    """A report's words for one reverted text edit (unrelated.Revert.to_dict())."""
+    if r["kind"] == "added":
+        if not r["new"]:
+            return "blank lines added outside the migration, removed"
+        return f'text added outside the migration: "{r["new"]}" removed'
+    if r["kind"] == "removed":
+        if not r["old"]:
+            return "blank lines removed outside the migration, put back"
+        return f'text removed outside the migration: "{r["old"]}" put back'
+    return f'text changed outside the migration: "{r["new"]}" restored to the original'
+
+
 def _dependency_problem(path: str, v: Verification) -> bool:
     """Did the verification implicate this dependency file: a reason or a remaining finding
     points at it, or the install or the smoke check failed and the fixed run's install read the
@@ -1218,6 +1241,11 @@ def report_markdown(
             for f in a.files:
                 for line in f.get("auto_imports", []) if f["accepted"] else []:
                     lines.append(f"- apifix added: {line} ({f['path']}, attempt {a.number})")
+                for r in f.get("reverted", []) if f["accepted"] else []:
+                    lines.append(
+                        f"- apifix reverted: {f['path']}:{r['fixed_line']} ({revert_text(r)}; "
+                        f"attempt {a.number})"
+                    )
         if job.guide_sections is not None:
             lines.append(f"- Guide sections sent: {', '.join(job.guide_sections)}")
         lines += [f"- Not sent: `{f['path']}` ({f['reason']})" for f in job.wf_skipped]

@@ -1043,3 +1043,108 @@ def test_report_lists_dependencies_left_out_and_the_override(trees):
     assert summary["not_installed"][0] == {"name": "typer", "source": conda[0], "why": conda[1]}
     assert summary["override_replaced"] == ["openai: openai==0.28 -> openai>=1.0"]
     assert sandbox.originals == [original.resolve()]
+
+
+# --- review by hand ---------------------------------------------------------------------------
+
+SETTINGS_OLD = '''\
+import openai
+
+TIMEOUT = 5
+PROMPT = """Say hello
+politely."""
+
+
+def setup(key):
+    openai.api_key = key
+    return key
+'''
+SETTINGS_NEW = '''\
+import openai
+
+PROMPT = """Say hello
+kindly."""
+
+
+def setup(key):
+    # OpenAI() reads the key from the environment
+    return key
+'''
+
+
+def _review_trees(trees):
+    return trees({"settings.py": SETTINGS_NEW}, {**ORIGINAL, "settings.py": SETTINGS_OLD})
+
+
+def test_review_by_hand_lists_hunks_no_test_executed(trees):
+    original, fixed = _review_trees(trees)
+    coverage = {
+        "app.py": FileCoverage(frozenset({1, 3, 6}), frozenset({7, 8})),
+        "settings.py": FileCoverage(frozenset({1, 3, 7, 9}), frozenset()),  # all of it ran
+    }
+    after = run((T_ASK, "passed"), (T_STRIP, "passed"), coverage=coverage)
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(PASSING, [after]))
+    assert v.verdict == "verified_weak"
+    # app.py's client line ran (not listed); an edit inside a string, a removal and code turned
+    # into a comment have no executable line, so coverage cannot vouch for them
+    assert [(e["file"], e["line"], e["end_line"]) for e in v.review_by_hand] == [
+        ("app.py", 7, 8),
+        ("settings.py", 3, 3),
+        ("settings.py", 4, 4),
+        ("settings.py", 8, 8),
+    ]
+    report = v.report_markdown()
+    section = report.split("### Review by hand\n\nNo test executed these changes:\n\n")[1]
+    assert section.startswith(
+        '- `app.py:7-8`: `r = openai.ChatCompletion.create(model="gpt-4", messages=[{"role": '
+        '"user", "content": q}])` -> `r = client.chat.completions.create(model="gpt-4", '
+        'messages=[{"role": "user", "content": q}])` (+1 line)\n'
+        "- `settings.py:3`: removed `TIMEOUT = 5`\n"
+        '- `settings.py:4`: `politely."""` -> `kindly."""`\n'
+        "- `settings.py:8`: removed `openai.api_key = key`; added "
+        "`# OpenAI() reads the key from the environment`\n"
+    )
+    assert v.to_dict()["review_by_hand"] == v.review_by_hand
+
+
+def test_review_by_hand_is_capped(trees):
+    import dataclasses
+
+    original, fixed = _review_trees(trees)
+    after = run((T_ASK, "passed"), (T_STRIP, "passed"), coverage=None)
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(PASSING, [after]))
+    assert v.verdict == "verified_weak"  # coverage unavailable: every hunk is listed
+    assert len(v.review_by_hand) == 5
+    many = dataclasses.replace(v, review_by_hand=v.review_by_hand * 4)
+    report = many.report_markdown()
+    assert report.count("\n- `settings.py:") + report.count("\n- `app.py:") == 15
+    assert "- ... and 5 more (see fix.diff)" in report
+
+
+def test_review_by_hand_only_for_weak_and_unverified_results(trees):
+    original, fixed = _review_trees(trees)
+    full = {
+        "app.py": FileCoverage(frozenset({1, 3, 6, 7, 8}), frozenset()),
+        "settings.py": FileCoverage(frozenset({1, 3, 7, 9}), frozenset()),
+    }
+    after = run((T_ASK, "passed"), (T_STRIP, "passed"), coverage=full)
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(PASSING, [after]))
+    assert v.verdict == "verified" and v.review_by_hand == []
+    assert "Review by hand" not in v.report_markdown()
+    nothing = run(status="unverified", reason="no test files found")
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(nothing, [nothing]))
+    assert v.verdict == "unverified" and len(v.review_by_hand) == 5
+
+
+def test_review_line_forms():
+    from apifix.engine.verifier import review_line
+
+    base = {"file": "a.py", "line": 3, "end_line": 3, "old": "x = 1", "new": "x = 2"}
+    one = {**base, "old_lines": 1, "new_lines": 1, "new_is_code": True}
+    assert review_line(one) == "`a.py:3`: `x = 1` -> `x = 2`"
+    added = {**one, "old_lines": 0, "new_lines": 3, "end_line": 5, "old": ""}
+    assert review_line(added) == "`a.py:3-5`: added `x = 2` (+2 lines)"
+    removed = {**one, "old_lines": 2, "new_lines": 0, "new": ""}
+    assert review_line(removed) == "`a.py:3`: removed `x = 1` (+1 line)"
+    ticks = {**one, "new": "print(`x`)"}
+    assert review_line(ticks) == "`a.py:3`: `x = 1` -> `` print(`x`) ``"

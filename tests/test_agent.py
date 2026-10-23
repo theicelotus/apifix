@@ -1116,8 +1116,11 @@ def test_whole_file_migrates_each_file_in_its_own_request(repo):
                 "abbreviation": "ok",
                 "undefined_names": "ok",
                 "mock_targets": "n/a",  # not a test file
+                "unrelated_edits": "ok",
+                "config": "ok",
             },
             "auto_imports": [],
+            "reverted": [],
         }
     ]
     tests_checks = attempt["files"][1]["replies"][0]["checks"]
@@ -1233,9 +1236,15 @@ def test_check_failure_gets_one_retry_as_a_fresh_request(repo):
 
 def test_each_file_gets_its_own_check_retry(repo):
     abbreviated = APP_NEW + "# ... rest unchanged\n"
+    # a placeholder in place of code (a placeholder comment merely added far from the
+    # migration is text-only: apifix reverts it, see test_unrelated.py)
+    tests_abbreviated = TESTS_NEW.replace(
+        '    create.return_value = completion("x\\n")\n    assert ask("q") == "x"\n',
+        "    # ... rest unchanged\n",
+    )
+    assert tests_abbreviated != TESTS_NEW
     llm = FakeLLM(
-        [block(abbreviated), block(APP_NEW), block(TESTS_NEW + "# ... rest unchanged\n")]
-        + [block(TESTS_NEW)]
+        [block(abbreviated), block(APP_NEW), block(tests_abbreviated)] + [block(TESTS_NEW)]
     )
     result = wf(repo, llm)
     assert result.outcome == "verified"
@@ -2202,3 +2211,82 @@ def test_agent_mode_applies_the_pins_it_can_and_leaves_the_rest_to_the_model(rep
         "- apifix could not set: requirements.txt:2 (the requirement continues over several "
         "lines; sent to the model)"
     ) in result.report_markdown
+
+
+# --- whole-file: unrelated edits and module config (split_config fixture) ----------------------
+
+SPLIT = Path(__file__).parent / "fixtures" / "split_config"
+T_CLEANED = "tests.test_assistant::AssistantTest::test_reply_is_cleaned"
+
+
+def split_judge(tree: Path) -> SandboxResult:
+    """Tests pass on the original and on a fix with the module-level client; the reply's line
+    ran, the response access did not, nor did the CLI."""
+    return run(
+        (T_CLEANED, "passed"),
+        coverage={
+            "voicebot/assistant.py": FileCoverage(frozenset({31}), frozenset({39})),
+            "voicebot/cli.py": FileCoverage(frozenset(), frozenset({12, 13})),
+        },
+    )
+
+
+def test_whole_file_reverts_unrelated_text_and_sends_dropped_config_back(tmp_path):
+    from tests.test_unrelated import GOOD_ASSISTANT, GOOD_CLI, GOOD_TESTS, edit
+
+    repo = tmp_path / "repo"
+    shutil.copytree(SPLIT, repo)
+    own_client = edit(
+        GOOD_ASSISTANT,
+        "        response = openai.chat.completions.create(",
+        "        client = openai.OpenAI()\n        response = client.chat.completions.create(",
+    )
+    dropped = edit(GOOD_CLI, "    openai.api_key = api_key\n", "    # OpenAI() reads the key\n")
+    word = edit(GOOD_ASSISTANT, "rate how  well", "rate how such well")
+    llm = FakeLLM(
+        [block(own_client), block(word), block(dropped), block(GOOD_CLI), block(GOOD_TESTS)]
+    )
+    result = wf(repo, llm, JudgingSandbox(judge=split_judge), max_retries=0)
+    assert result.outcome == "verified_weak", result.report_markdown
+    (attempt,) = result.trajectory["attempts"]
+    assert [(n["kind"], n["file"]) for n in attempt["nudges"]] == [
+        ("check_retry", "voicebot/assistant.py"),
+        ("check_retry", "voicebot/cli.py"),
+    ]
+    b, a = (n["error"] for n in attempt["nudges"])
+    assert b.startswith("line 31: `openai.OpenAI()` does not read openai.api_key, which ")
+    assert a.startswith("original line 12: removed `openai.api_key = api_key`, so that key ")
+    assert a.endswith(
+        "This file makes no API calls (they are in voicebot/assistant.py): keep the assignment"
+    )
+    assistant, cli, tests = attempt["files"]
+    assert [f["accepted"] for f in (assistant, cli, tests)] == [True, True, True]
+    assert assistant["replies"][0]["checks"]["config"] == b
+    assert assistant["replies"][1]["checks"]["config"] == "ok"
+    assert [r["line"] for r in assistant["reverted"]] == [10]
+    assert (repo / "voicebot" / "cli.py").read_text() == (SPLIT / "voicebot" / "cli.py").read_text()
+    assert "+    openai.base_url = base_url" in result.diff
+    assert "how such well" not in result.diff
+    report = result.report_markdown
+    assert (
+        "- apifix reverted: voicebot/assistant.py:10 (text changed outside the migration: "
+        '"Then rate how such well the answer fits the..." restored to the original; attempt 1)'
+        in report
+    )
+    assert "- Files that failed a check and were sent back once: 2" in report
+    # verified_weak: the hunks no test executed, removals included
+    assert "### Review by hand" in report
+    assert (
+        '- `voicebot/assistant.py:39`: `return _clean(response["choices"][0]["message"]'
+        '["content"])` -> `return _clean(response.choices[0].message.content)`' in report
+    )
+    assert (
+        "- `voicebot/cli.py:13`: `openai.api_base = base_url` -> `openai.base_url = base_url`"
+        in report
+    )
+    assert "voicebot/assistant.py:31" not in report.split("### Review by hand")[1]
+    review = result.trajectory["attempts"][0]["verification"]["review_by_hand"]
+    assert [(e["file"], e["line"]) for e in review] == [
+        ("voicebot/assistant.py", 39),
+        ("voicebot/cli.py", 13),
+    ]

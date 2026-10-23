@@ -28,6 +28,7 @@ from apifix.engine.dependencies import dependency_file_problem, is_dependency_fi
 from apifix.engine.migrations import Migration
 from apifix.engine.models import CERTAIN, Finding
 from apifix.engine.project import is_test_file
+from apifix.engine.unrelated import Revert, relocate, revert_text_edits, unrelated_edits
 from apifix.engine.verifier import Verification, feedback_lines
 
 DEFAULT_MAX_BYTES = 24_000
@@ -321,11 +322,12 @@ def join_errors(errors: list[str]) -> str:
     return "; ".join(errors)
 
 
-_LINE_PREFIX = re.compile(r"^line \d+: ")
+_LINE_PREFIX = re.compile(r"^(?:(?:after |before )?original line|line) \d+: ")
 
 
 def error_key(error: str) -> str:
-    """An error's identity across replies: its first line without the `line N: ` prefix."""
+    """An error's identity across replies: its first line without the `line N: ` prefix
+    (also `original line N: `, `after original line N: `)."""
     return _LINE_PREFIX.sub("", error.split("\n", 1)[0])
 
 
@@ -398,6 +400,8 @@ class CheckResult:
     checks: dict[str, str] = field(default_factory=dict)  # name -> "ok" / "n/a" / problem
     text: str = ""  # what is written if the checks pass: the candidate plus added imports
     auto_imports: list[str] = field(default_factory=list)  # import lines apifix added
+    # text-only edits unrelated to the migration that apifix put back (Revert.to_dict())
+    reverted: list[dict[str, object]] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -426,6 +430,8 @@ def check_candidate(
     known_imports: ImportTable = DEFAULT_IMPORTS,
     mock_responses: Mapping[str, str] | None = None,
     module_roots: Sequence[str] = MODULE_ROOTS,
+    findings: Sequence[Finding] | None = None,
+    rewrite_checks: Callable[[str, str, str], list[str]] | None = None,
 ) -> CheckResult:
     """Syntax (Python files), well-formedness (dependency files), "differs from the original"
     (only when `required`), abbreviation (placeholders, or under half the original's lines
@@ -435,7 +441,13 @@ def check_candidate(
     None; `library_modules`, the migrated library, lets messages name the target to patch,
     and `mock_responses` gives its example a response shape). Python files that parse first get
     an import for each new undefined name with exactly one `known_imports` entry, so every
-    check sees the completed file (`text`, `auto_imports`)."""
+    check sees the completed file (`text`, `auto_imports`).
+
+    With `findings` (the file's own scanner findings), Python files also get the unrelated-edit
+    check (unrelated.py): text-only hunks away from the migration are reverted before the
+    imports are added (`reverted`), and code hunks unrelated to it, or original strings that
+    are missing, are errors. `rewrite_checks(path, original, candidate)`: the migration's own
+    checks (Migration.rewrite_checker), run last on the completed file (check `config`)."""
     checks: dict[str, str] = {}
     errors: list[str] = []
 
@@ -443,6 +455,11 @@ def check_candidate(
         checks[name] = "n/a" if not applies else (problem or "ok")
         if applies and problem:
             errors.append(problem)
+
+    def record_all(name: str, problems: list[str], applies: bool) -> None:
+        """A check with several independent problems: one error each."""
+        checks[name] = "n/a" if not applies else ("; ".join(problems) or "ok")
+        errors.extend(problems if applies else [])
 
     syntax = None
     if path.endswith(".py"):
@@ -453,9 +470,19 @@ def check_candidate(
             text = f": {exc.text.strip()!r}" if exc.text and exc.text.strip() else ""
             syntax = f"SyntaxError: {exc.msg}{where}{text}"
     record("syntax", syntax, path.endswith(".py"))
+    unrelated = findings is not None and path.endswith(".py") and not syntax
+    reverted: list[Revert] = []
+    reverts: list[dict[str, object]] = []
+    revert_errors: list[str] = []
+    if unrelated:
+        result = revert_text_edits(original, candidate, findings or (), library_modules)
+        candidate, reverted, revert_errors = result.text, result.reverted, result.errors
     added: list[str] = []
     if path.endswith(".py") and not syntax:
+        before = candidate
         candidate, added = add_missing_imports(path, original, candidate, known_imports)
+        if unrelated:
+            reverts = [r.to_dict() for r in relocate(reverted, before, candidate)]
 
     dep = is_dependency_file(path) and not syntax  # setup.py with a syntax error: not re-checked
     problem = dependency_file_problem(path, candidate) if dep else None
@@ -499,4 +526,14 @@ def check_candidate(
         else []
     )
     record("mock_targets", "; ".join(targets) or None, mocks)
-    return CheckResult(errors, checks, candidate, added)
+
+    unrelated_problems = (
+        revert_errors + unrelated_edits(original, candidate, findings or (), library_modules)
+        if unrelated
+        else []
+    )
+    record_all("unrelated_edits", unrelated_problems, unrelated)
+    config = path.endswith(".py") and not syntax and rewrite_checks is not None
+    config_problems = rewrite_checks(path, original, candidate) if config and rewrite_checks else []
+    record_all("config", config_problems, config)
+    return CheckResult(errors, checks, candidate, added, reverts)
