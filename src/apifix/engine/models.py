@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from apifix.engine.already_migrated import AlreadyMigrated
 
 Category = Literal[
     "import",
@@ -75,3 +78,5 @@ class ScanResult:
     findings: list[Finding] = field(default_factory=list)
     files_scanned: int = 0
     parse_errors: list[ParseError] = field(default_factory=list)
+    # set when the findings are all stale tests of code already on the new API
+    already_migrated: AlreadyMigrated | None = None

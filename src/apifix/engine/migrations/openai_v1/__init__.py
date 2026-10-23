@@ -9,7 +9,7 @@ from pathlib import Path
 from apifix.engine.dependencies import DeclaredDependency, entirely_below
 from apifix.engine.migrations.guide import full_guide
 from apifix.engine.migrations.openai_v1 import config_checks, guide_parts, repo_findings, rules
-from apifix.engine.migrations.openai_v1.python_checks import check_python
+from apifix.engine.migrations.openai_v1.python_checks import check_python, v1_api_uses
 from apifix.engine.models import CERTAIN, Finding, SmokeCheck
 
 
@@ -56,6 +56,8 @@ class OpenAIV1Migration:
     package = rules.PACKAGE
     pin_spec = rules.PIN_SPEC
     companion_pins = rules.COMPANION_PINS
+    first_version = rules.FIRST_V1
+    target_name = "openai 1.x"
 
     def job_guide(self, findings: list[Finding], root: Path | None = None) -> tuple[str, list[str]]:
         return guide_parts.job_guide(findings, root)
@@ -71,6 +73,9 @@ class OpenAIV1Migration:
         repo_modules: frozenset[str] = frozenset(),
     ) -> list[Finding]:
         return check_python(file, tree, source, repo_modules)
+
+    def new_api_uses(self, file: str, tree: ast.Module) -> list[tuple[int, str]]:
+        return v1_api_uses(tree)
 
     def adjust_findings(self, findings: list[Finding], root: Path | None = None) -> list[Finding]:
         return repo_findings.adjust_findings(findings, root)

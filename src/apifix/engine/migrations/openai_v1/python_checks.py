@@ -39,6 +39,26 @@ def check_python(
     return visitor.findings
 
 
+def v1_api_uses(tree: ast.Module) -> list[tuple[int, str]]:
+    """(line, name) of every use of a name only 1.x has (`openai.OpenAI`, `openai.chat`, ...),
+    aliases resolved, imports included; sorted, one entry per line and name."""
+    aliases = _collect_aliases(tree)
+    found: set[tuple[int, str]] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.level == 0 and _is_openai(node.module or ""):
+            for a in node.names:
+                if f"{node.module}.{a.name}" in rules.V1_ONLY_NAMES:
+                    found.add((node.lineno, f"{node.module}.{a.name}"))
+        elif isinstance(node, (ast.Name, ast.Attribute)):
+            canonical = _resolve(node, aliases)
+            parts = canonical.split(".") if canonical else []
+            if canonical in rules.V1_ONLY_NAMES:
+                found.add((node.lineno, canonical))
+            elif len(parts) > 1 and parts[0] == "openai" and parts[1] in rules.V1_MODULE_RESOURCES:
+                found.add((node.lineno, ".".join(parts[:2])))
+    return sorted(found)
+
+
 # --- name resolution ------------------------------------------------------------------------
 
 

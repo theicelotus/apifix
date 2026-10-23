@@ -21,7 +21,10 @@ apifix cleanup [--dry-run]                              # recover after a crash
 `apifix fix` works on a copy of the repo (yours is never modified). It writes `fix.diff`,
 `report.md`, `verification.json` and `trajectory.json` to `./apifix-out/<timestamp>/` (or
 `--out`). Exit code 0 means verified (possibly with weak evidence), 1 not verified, 2 aborted
-or a usage error. Model prices used for `--max-cost` can be overridden with `--prices FILE`
+or a usage error, 3 already migrated: the code is already on the new API (every declared
+`openai` requirement needs 1.x, non-test code uses 1.x names) and every finding is in a test
+file, so the tests are out of date rather than the code. `fix` then stops before any LLM call
+or sandbox run and lists those findings; `scan` reports the same case. Model prices used for `--max-cost` can be overridden with `--prices FILE`
 (TOML); check them against Anthropic's pricing page.
 
 `apifix verify` re-checks a saved diff (e.g. a previous run's `fix.diff`, or one written by

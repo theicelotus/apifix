@@ -175,6 +175,15 @@ def test_skips_pixi_and_conda_environments(tmp_path):
     assert {f.file for f in result.findings} == {"pkg/mod.py"}
 
 
+def test_directory_with_trailing_space_is_scanned(tmp_path):
+    # a real repo has `src/outline_gen /` (trailing space in the directory name)
+    (tmp_path / "src" / "outline_gen ").mkdir(parents=True)
+    (tmp_path / "src" / "outline_gen " / "utils.py").write_text(OLD_CALL)
+    result = scan(tmp_path, "openai-v1")
+    assert {f.file for f in result.findings} == {"src/outline_gen /utils.py"}
+    assert result.files_scanned == 1
+
+
 def test_paths_are_relative_posix(tmp_path):
     (tmp_path / "a" / "b").mkdir(parents=True)
     (tmp_path / "a" / "b" / "c.py").write_text(OLD_CALL)

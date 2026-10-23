@@ -13,6 +13,10 @@ apifix fix|verify ... --sandbox-requirements FILE
                                  dependency edits still apply)
 apifix cleanup [--dry-run]      remove containers/temp dirs left by interrupted runs
 
+Exit codes: 0 clean (fix: verified), 1 findings (fix: not verified), 2 usage error or aborted,
+3 (fix) already migrated: the findings are all in test files that look out of date with code
+already on the new API; nothing was sent to an LLM or run.
+
 fix and verify keep a pip cache for the sandbox's dependency installs
 ($APIFIX_PIP_CACHE, else ~/.cache/apifix/pip); --no-pip-cache turns it off.
 """
@@ -32,7 +36,7 @@ from apifix.engine.migrations import available_migrations
 from apifix.engine.models import ScanResult
 from apifix.engine.scanner import scan
 
-EXIT_CLEAN, EXIT_FINDINGS, EXIT_USAGE = 0, 1, 2
+EXIT_CLEAN, EXIT_FINDINGS, EXIT_USAGE, EXIT_ALREADY_MIGRATED = 0, 1, 2, 3
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -271,12 +275,16 @@ def _fix(args: argparse.Namespace) -> int:
     verification = result.verification.to_dict() if result.verification else None
     _write_outputs(out, result.diff, result.report_markdown, verification, result.trajectory)
     print(f"{result.outcome}: {result.reason}")
+    if result.outcome == "already_migrated":
+        print(_findings_text(result.trajectory["findings"]))
     print(
         f"{result.attempts} attempt(s), {result.usage.total:,} tokens, ${result.cost_usd:.2f}; "
         f"wrote fix.diff, report.md, verification.json, trajectory.json to {out}"
     )
     if result.outcome in ("verified", "verified_weak", "no_findings"):
         return EXIT_CLEAN
+    if result.outcome == "already_migrated":
+        return EXIT_ALREADY_MIGRATED
     return EXIT_USAGE if result.outcome == "aborted" else EXIT_FINDINGS
 
 
@@ -297,8 +305,20 @@ def _to_json(result: ScanResult) -> str:
     return json.dumps(asdict(result), indent=2)
 
 
+def _findings_text(findings: list[dict]) -> str:
+    """One line per finding (fix's console output for an already-migrated repo)."""
+    return "\n".join(
+        f"  {f['file']}:{f['line']}:{f['col']}: {f['category']} [{f['confidence']}] "
+        f"{f['old_pattern']}"
+        for f in findings
+    )
+
+
 def _to_text(result: ScanResult) -> str:
     lines = []
+    if result.already_migrated:
+        lines.append(result.already_migrated.message)
+        lines += [f"  {line}" for line in result.already_migrated.report_lines()]
     for f in result.findings:
         lines.append(f"{f.file}:{f.line}:{f.col}: {f.category} [{f.confidence}]")
         lines.append(f"    old: {f.old_pattern}")

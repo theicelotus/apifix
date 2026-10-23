@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from apifix.engine.agent_tools import TOOLS, EditRecord, Workspace
+from apifix.engine.already_migrated import AlreadyMigrated, detect_already_migrated
 from apifix.engine.code_checks import STDLIB_IMPORTS, import_table, module_roots
 from apifix.engine.dependencies import is_dependency_file
 from apifix.engine.diffing import diff_trees, read_text, unified_diff
@@ -81,7 +82,17 @@ from apifix.engine.whole_file import (
 )
 from apifix.engine.whole_file import system_prompt as whole_file_system_prompt
 
-Outcome = Literal["verified", "verified_weak", "rejected", "unverified", "aborted", "no_findings"]
+Outcome = Literal[
+    "verified",
+    "verified_weak",
+    "rejected",
+    "unverified",
+    "aborted",
+    "no_findings",
+    "already_migrated",
+]
+# outcomes that stop before any attempt (nothing to choose from)
+_NO_ATTEMPTS = ("aborted", "no_findings", "already_migrated")
 EditMode = Literal["agent", "whole-file"]
 EDIT_MODES: tuple[EditMode, ...] = ("agent", "whole-file")
 TRAJECTORY_VERSION = 1
@@ -336,6 +347,7 @@ class _Job:
         self.known_imports = import_table(STDLIB_IMPORTS, migration.known_imports)
         # Variables the repo's CI sets that the sandbox's test phase gets placeholders for
         # (name -> workflow file), in the baseline and in every verification.
+        self.already_migrated: AlreadyMigrated | None = None
         self.ci_env = ci_env_vars(repo, migration.ci_env_placeholders)
         self.sandbox_env = {name: migration.ci_env_placeholders[name] for name in self.ci_env}
         # wall-clock seconds: LLM requests, and sandbox work (baseline run, verify() calls)
@@ -838,6 +850,8 @@ class _Job:
     def run(self) -> tuple[Outcome, str]:
         if not self.findings:
             return "no_findings", "the scanner found nothing to migrate"
+        if self.already_migrated:
+            return "already_migrated", self.already_migrated.message
         if not self.price_known and self.config.max_cost_usd is not None:
             raise ValueError(
                 f"no price for model {self.llm.model}: add it to the price table "
@@ -1041,6 +1055,9 @@ class _Job:
                 "skipped_files": self.wf_skipped if self.whole_file else None,
                 "guide_sections": self.guide_sections,
                 "sandbox_env_placeholders": self.ci_env,
+                "already_migrated": (
+                    asdict(self.already_migrated) if self.already_migrated else None
+                ),
                 "sandbox_requirements": sandbox_requirements_record(self.sandbox),
                 "pin_edits": [asdict(e) for f in self.pin_files for e in f.edits],
                 "pin_fallbacks": [asdict(b) for b in self.pin_fallbacks],
@@ -1172,6 +1189,7 @@ def report_markdown(
         "unverified": "Not verified (not enough evidence)",
         "aborted": "Aborted",
         "no_findings": "Nothing to migrate",
+        "already_migrated": "Already migrated (only the tests look out of date)",
     }[result_outcome]
     lines = [
         f"# apifix fix: {title}",
@@ -1277,9 +1295,29 @@ def report_markdown(
     lines.append("")
     if chosen and chosen.verification:
         lines.append(chosen.verification.report_markdown())
+    elif result_outcome == "already_migrated" and job.already_migrated:
+        lines += already_migrated_section(job.already_migrated, job.findings)
     elif result_outcome == "aborted":
         lines.append("The edits made before the job stopped were not verified.")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def already_migrated_section(already: AlreadyMigrated, findings: Sequence[Finding]) -> list[str]:
+    """The report's body for an already-migrated repo: the evidence, then the findings."""
+    lines = ["## Already migrated", ""]
+    lines += [f"- {line}" for line in already.report_lines()]
+    lines += [
+        "",
+        "No LLM was called and no sandbox was run: the code is already migrated, and apifix "
+        "does not repair out-of-date tests yet. Update these by hand:",
+        "",
+    ]
+    lines += [
+        f"- `{f.file}:{f.line}` {f.category} [{f.confidence}] `{_one_line(f.old_pattern, 100)}`: "
+        f"{_one_line(f.suggestion, 200)}"
+        for f in findings
+    ]
+    return lines
 
 
 def fix(
@@ -1298,14 +1336,18 @@ def fix(
         raise NotADirectoryError(f"not a directory: {original}")
     mig = get_migration(migration) if isinstance(migration, str) else migration
     if findings is None:
-        findings = scan(original, mig).findings
+        scanned = scan(original, mig)
+        findings, already = scanned.findings, scanned.already_migrated
+    else:
+        already = detect_already_migrated(original, mig, findings)
     start = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="apifix-fix-") as tmp:
         work = Path(tmp) / original.name
         copy_repo(original, work)
         job = _Job(original, mig, llm, sandbox, list(findings), config, work)
+        job.already_migrated = already
         outcome, reason = job.run()
-        chosen = job.best_attempt() if outcome not in ("aborted", "no_findings") else None
+        chosen = job.best_attempt() if outcome not in _NO_ATTEMPTS else None
         diff = unified_diff(original, work)
         trajectory = job.trajectory(outcome, reason, chosen)
         duration = time.monotonic() - start

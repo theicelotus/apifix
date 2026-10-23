@@ -278,6 +278,17 @@ KNOWN_IMPORTS: dict[str, str] = {
     "httpx": "import httpx",
 }
 
+# Names only 1.x has (no 0.x code reaches them): non-test code that uses one is already
+# migrated. Client classes and errors new in 1.x, and the module-level client's resources
+# (`openai.chat.completions`; 0.x had capitalised classes such as openai.ChatCompletion).
+V1_ONLY_NAMES = frozenset(
+    f"openai.{name}"
+    for name in (*_CLIENT_CLASSES, *(n for n in _V1_ERRORS if n not in ERROR_CLASSES))
+)
+V1_MODULE_RESOURCES = frozenset(
+    {"chat", "completions", "embeddings", "images", "moderations", "audio", "fine_tuning"}
+)
+
 # Object-shaped example responses for mocks, by the 1.x call they stand in for.
 MOCK_RESPONSES: dict[str, str] = {
     "chat.completions.create": (

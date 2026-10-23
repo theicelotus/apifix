@@ -48,10 +48,15 @@ src/apifix/
                       left out (conda-only, other platforms); --sandbox-requirements checks;
                       import name -> distribution table
     scanner.py        finds affected call sites + dependency pins (ast, no LLM)
+    already_migrated.py  repo already on the new API with only stale tests (declarations,
+                      findings only in test files, new-API names in non-test code); scan
+                      reports it, fix stops before any LLM call / sandbox run (exit 3)
     migrations/       one package per migration; registry in __init__.py; guide.py splits
                       guides into `<!-- part: id -->` parts for per-job selection; optional
                       hooks `adjust_findings` (repo-level pass at the end of a scan) and
-                      `rewrite_checker` (migration checks of a whole-file rewrite)
+                      `rewrite_checker` (migration checks of a whole-file rewrite); attributes
+                      `first_version` / `target_name` and hook `new_api_uses` for
+                      already_migrated.py
       openai_v1/      rules.py (pure data tables, incl. guide-part selectors) + migration-
                       specific heuristics; guide.md (old -> new reference used in the prompts);
                       guide_parts.py (which parts / Resources rows a job's findings need);
@@ -206,6 +211,18 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   dict with `"message"` or `"text"`) are a [likely] `response_access` finding, without
   requiring an openai import. `dict(choices=...)` calls and dicts built step by step are
   missed; the same literal in a non-test file (fixtures modules, sample data) is not flagged.
+
+- Already migrated (`already_migrated.py`): all of (a) at least one declaration of the library,
+  and every one allows only `first_version` or later (`==1.12.0`, `>=1.0`, `~=1.3`; unpinned,
+  `>=0.27` or `<2` do not), (b) at least one finding and every finding in a test file
+  (`project.is_test_file`), (c) a name only 1.x has in a non-test Python file (openai-v1
+  `V1_ONLY_NAMES`: client classes and errors new in 1.x; `openai.chat` / `embeddings` / ...
+  module-level resources; resolved through openai imports, so `client.chat.completions.create`
+  on an unresolved client does not count). A dependency file that does not parse makes it
+  unknown (not reported). Conda entries and unrecognised files (`Pipfile.txt`) are not read, so
+  a conda pin of 0.x is missed. Directory scans only. `scan` keeps exit code 1; `fix` returns
+  outcome `already_migrated` (exit 3) before the price check, preflight or baseline. Stale-test
+  repair is not built (see docs/plans/already-migrated.md, "Later").
 
 ## Known limitations (sandbox)
 

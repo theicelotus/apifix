@@ -248,6 +248,29 @@ def entirely_below(clauses: Iterable[tuple[str, str]], bound: str) -> bool:
     return False
 
 
+def _lower_bound(op: str, version: str) -> Version | None:
+    """The lowest version one clause allows (inclusive for `>`: every allowed version is above
+    it), or None if the clause has no lower bound."""
+    if op in {"==", "==="} and version.endswith(".*"):
+        return parse_version(version[:-2])
+    if op in {"==", "===", ">=", ">", "~="}:
+        return parse_version(version)
+    return None
+
+
+def entirely_at_or_above(clauses: Iterable[tuple[str, str]], bound: str) -> bool:
+    """True if every version allowed by ``clauses`` is ``bound`` or higher (unconstrained:
+    False)."""
+    limit = parse_version(bound)
+    if limit is None:
+        return False
+    for op, version in clauses:
+        lb = _lower_bound(op, version)
+        if lb is not None and lb >= limit:
+            return True
+    return False
+
+
 def _clause_allows(op: str, spec: str, v: Version) -> bool:
     if spec.endswith(".*") and op in {"==", "===", "!="}:
         try:

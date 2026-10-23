@@ -44,6 +44,11 @@ class Migration(Protocol):
     package: str
     pin_spec: str
     companion_pins: Mapping[str, CompanionPin]
+    # The library's first version with the new API, and how reports name it ("openai 1.x"):
+    # a repo whose declarations all require `first_version` or later, with findings only in
+    # test files and the new API in its code, is already migrated (already_migrated.py).
+    first_version: str
+    target_name: str
 
     def job_guide(self, findings: list[Finding], root: Path | None = None) -> tuple[str, list[str]]:
         """The parts of `guide` these findings need, and the ids of those parts. `root`: the
@@ -68,6 +73,10 @@ class Migration(Protocol):
 
     def check_dependency(self, file: str, dep: DeclaredDependency) -> Finding | None:
         """Return a finding if a declared dependency must change, else None."""
+        ...
+
+    def new_api_uses(self, file: str, tree: ast.Module) -> list[tuple[int, str]]:
+        """(line, name) of every use of a name only the new API has, for one parsed file."""
         ...
 
     def adjust_findings(self, findings: list[Finding], root: Path | None = None) -> list[Finding]:

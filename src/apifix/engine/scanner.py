@@ -14,6 +14,7 @@ import tokenize
 from collections.abc import Iterable
 from pathlib import Path
 
+from apifix.engine.already_migrated import detect_already_migrated
 from apifix.engine.dependencies import is_dependency_file, parse_dependency_file
 from apifix.engine.migrations import Migration, get_migration
 from apifix.engine.models import ParseError, ScanResult
@@ -53,6 +54,8 @@ def scan(path: str | os.PathLike[str], migration: str | Migration) -> ScanResult
     adjust = getattr(migration, "adjust_findings", None)
     if callable(adjust):
         result.findings = sorted(adjust(result.findings, base))
+    if root.is_dir():
+        result.already_migrated = detect_already_migrated(root, migration, result.findings)
     return result
 
 

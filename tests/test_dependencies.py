@@ -10,6 +10,7 @@ from apifix.engine.dependencies import (
     build_system_requires,
     dependency_file_problem,
     distribution_candidates,
+    entirely_at_or_above,
     entirely_below,
     install_requirements,
     is_dependency_file,
@@ -74,6 +75,32 @@ def test_parse_version():
 )
 def test_entirely_below(clauses, below):
     assert entirely_below(clauses, "1.0") is below
+
+
+@pytest.mark.parametrize(
+    ("clauses", "above"),
+    [
+        ((("==", "1.12.0"),), True),
+        ((("==", "1.*"),), True),
+        ((("===", "1.0"),), True),
+        (((">=", "1.0"),), True),
+        (((">=", "1"),), True),
+        (((">=", "1.0"), ("<", "2")), True),
+        (((">", "1.0"),), True),
+        ((("~=", "1.3"),), True),
+        ((("<", "2"), (">=", "1.2")), True),
+        ((("==", "0.28.1"),), False),
+        ((("==", "0.*"),), False),
+        (((">=", "0.27"),), False),
+        (((">", "0.99"),), False),  # 0.99.1 is allowed
+        ((("~=", "0.27"),), False),
+        ((("<", "2"),), False),
+        ((("!=", "0.28"),), False),
+        ((), False),
+    ],
+)
+def test_entirely_at_or_above(clauses, above):
+    assert entirely_at_or_above(clauses, "1.0") is above
 
 
 def _openai(relpath, text):
