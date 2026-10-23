@@ -462,6 +462,11 @@ too, through the verifier (both are pure functions of the original tree, the fix
 findings): unrelated edits as a `warn` reason, dropped or ignored config as `reject`. This is the
 next step after this one.
 
+A `client_config` finding should count as resolved when the assignment is kept and the module's
+calls use the module-level client (`openai.X(...)`). djgpt-gptoss-4 kept the CLI's
+`openai.api_key` assignment and moved the call to the module-level client, as the suggestion
+says, and the verifier still reported the finding as remaining.
+
 ## Amendments
 
 all 12 decisions accepted as recommended
