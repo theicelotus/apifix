@@ -228,9 +228,63 @@ def test_scanner_reports_dependency_pins(tmp_path):
     assert result.files_scanned == 6
 
 
-def test_unpinned_openai_not_flagged(tmp_path):
-    (tmp_path / "requirements.txt").write_text("openai\n")
+@pytest.mark.parametrize(
+    ("line", "confidence", "says"),
+    [
+        ("openai", "likely", "the declaration has no version"),
+        ("openai[datalib]", "likely", "the declaration has no version"),
+        ("openai>=0.27", "likely", "`openai>=0.27` still allows 0.x"),
+        ("openai<2", "likely", "`openai<2` still allows 0.x"),
+        ("openai!=0.28.0", "likely", "still allows 0.x"),
+        ("openai==0.28.1", "certain", "Pin openai>=1.0"),
+    ],
+)
+def test_openai_declarations_that_allow_0x_are_flagged(tmp_path, line, confidence, says):
+    (tmp_path / "requirements.txt").write_text(f"{line}\n")
+    (finding,) = scan(tmp_path, "openai-v1").findings
+    assert (finding.category, finding.confidence) == ("dependency", confidence)
+    assert says in finding.suggestion and "openai>=1.0,<2" in finding.suggestion
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["openai>=1.0", "openai>=1.3,<2", "openai==1.12.0", "openai~=1.3", "openai @ git+https://x/o"],
+)
+def test_openai_declarations_on_1x_or_direct_are_not_flagged(tmp_path, line):
+    (tmp_path / "requirements.txt").write_text(f"{line}\n")
     assert scan(tmp_path, "openai-v1").findings == []
+
+
+def test_unpinned_openai_in_tables_flagged_unless_a_direct_reference(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        textwrap.dedent(
+            """\
+            [tool.poetry.dependencies]
+            openai = "*"
+            [tool.poetry.group.dev.dependencies]
+            openai = {git = "https://github.com/openai/openai-python"}
+            """
+        )
+    )
+    (tmp_path / "Pipfile").write_text('[packages]\nopenai = {path = "../openai"}\n')
+    findings = scan(tmp_path, "openai-v1").findings
+    assert [(f.file, f.line, f.confidence) for f in findings] == [("pyproject.toml", 2, "likely")]
+
+
+def test_direct_references_are_marked():
+    deps = parse_dependency_file("requirements.txt", "openai @ https://x/openai-0.28.whl\nopenai\n")
+    assert [(d.direct, d.clauses) for d in deps] == [(True, ()), (False, ())]
+    deps = parse_dependency_file(
+        "pyproject.toml",
+        '[tool.pixi.pypi-dependencies]\na = {git = "x"}\nb = {url = "x"}\nc = {version = "*"}\n'
+        'd = {extras = ["x"]}\n',
+    )
+    assert [(d.name, d.direct) for d in deps] == [
+        ("a", True),
+        ("b", True),
+        ("c", False),
+        ("d", False),
+    ]
 
 
 def test_malformed_dependency_file_recorded(tmp_path):

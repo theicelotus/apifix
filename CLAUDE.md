@@ -194,6 +194,11 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   make the calls. Other suggestion forms (resource classes, kwargs) are not rewritten. The guide
   part `client.config` is selected by a "Never drop" / "never drop it" suggestion.
 
+- Dependency findings (openai-v1): a declaration that allows nothing from 1.0 on is [certain];
+  one that allows 0.x and 1.x (no version, `*`, `>=0.27`, `<2`, `!=x`, Poetry `||` ranges,
+  which read as unconstrained) is [likely], also in a repo whose code is already on 1.x.
+  Direct references (`name @ url`, git/path/url tables: `DeclaredDependency.direct`) are never
+  flagged.
 - Dependency pins: pip entries only (pixi `pypi-dependencies` of every table, all platforms;
   an environment file's `pip:` list). Requirements-file lines are read without per-requirement
   options (`--hash=...`) and a trailing `\` (hash-pinned files, as pip-compile writes them). Conda entries (pixi `dependencies`, an environment's conda
@@ -275,6 +280,16 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
 - Everything left out is listed in the report ("Declared dependencies not installed") and in
   the trajectory's run summaries (`not_installed`), unless the package is installed anyway
   (from another source, or by apifix itself, e.g. pytest).
+- `--sandbox-requirements FILE` and the migrated library (`LibraryTarget`, passed by `verify()`):
+  in the fixed run only, when the fix did not change the library's detected requirement, every
+  line of the file for it that allows a version below `first_version` (not a direct reference)
+  becomes `name[extras]<pin_spec>[; marker]` (`InstallPlan.upgraded`, run summaries
+  `override_upgraded`, report "Fixed run: ... replaced by ..."). Companion pins in the file are
+  not raised. A failed smoke check whose exact pins on the library or its requirements are all
+  declared only by the file is `sandbox_requirements_pin` (unverified, an environment reason:
+  never sent to the model, not retried) instead of `smoke_check_failed`; while it is present,
+  `regression`, `regression_error` and `collection_error` are unverified instead of rejected.
+  With no pins, or any pin from the repo's files, it stays `smoke_check_failed`.
 - `--sandbox-requirements FILE` replaces detection (declared files, lockfile constraints) for
   the original code and the fix; apifix still adds the build backend's requirements and
   pytest. For the fix, each package whose detected requirements differ between the original and
@@ -400,7 +415,8 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   sandbox could not run at all, or tests fail while the original code's run failed
   (`unjudged_failures`); nothing the agent edits could change those. The report then suggests
   `apifix verify` on the diff for a later re-check (the baseline is not rerun in the job).
-  Nothing is retried, not even a rejection, when the verification has `environment_incomplete`;
+  Nothing is retried, not even a rejection, when the verification has `environment_incomplete`
+  or `sandbox_requirements_pin` (the report gives the `apifix verify` command for the latter);
   the report suggests `apifix verify ... --sandbox-requirements FILE`.
 - Reply budget: `max_tokens` is `--max-output-tokens` in agent mode; in whole-file mode
   `min(--max-output-tokens, 2 * est + 2,048)`, `est` = chars / 3 of the longer of the original

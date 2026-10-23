@@ -33,7 +33,7 @@ from typing import Literal
 
 from apifix.engine.dependencies import normalize_name
 from apifix.engine.docker import DockerCLI, DockerClient
-from apifix.engine.models import SmokeCheck
+from apifix.engine.models import LibraryTarget, SmokeCheck
 from apifix.engine.project import (
     DEFAULT_PYTHON,
     InstallPlan,
@@ -241,6 +241,8 @@ class SmokeResult:
     version: str | None = None  # installed version of the migrated library
     requires: dict[str, str | None] = field(default_factory=dict)  # its requirements, installed
     pins: list[str] = field(default_factory=list)  # exact pins on any of those, from the repo
+    # each of `pins` -> where it is declared (files, or the --sandbox-requirements label)
+    pin_sources: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -279,6 +281,8 @@ class SandboxResult:
     not_installed: list[NotInstalled] = field(default_factory=list)
     requirements_override: str | None = None
     override_replaced: list[str] = field(default_factory=list)
+    # its lines for the migrated library that the target spec replaced (InstallPlan.upgraded)
+    override_upgraded: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -433,13 +437,16 @@ class Sandbox:
         smoke: SmokeCheck | None = None,
         tests: TestPlan | None = None,
         original: str | os.PathLike[str] | None = None,
+        target: LibraryTarget | None = None,
     ) -> SandboxSession:
         """Install once, run the test phase as often as needed. Use as a context manager.
         `env` adds test-phase variables: literal placeholders chosen by apifix (e.g. a fake
         API key the repo's CI also sets), never values from the host environment. `smoke`
         runs once after the install (SmokeResult in every result). `tests` replaces the
         detected test plan. `original`: the tree `repo_path` is a fix of, so that with a
-        --sandbox-requirements file the fix's dependency edits still apply."""
+        --sandbox-requirements file the fix's dependency edits still apply, and (`target`,
+        the migrated library) the file's old pin of the library gets the target spec when the
+        fix did not change the library."""
         return SandboxSession(
             self,
             repo_path,
@@ -448,6 +455,7 @@ class Sandbox:
             smoke=smoke,
             tests=tests,
             original=original,
+            target=target,
         )
 
     def run(
@@ -459,9 +467,16 @@ class Sandbox:
         smoke: SmokeCheck | None = None,
         tests: TestPlan | None = None,
         original: str | os.PathLike[str] | None = None,
+        target: LibraryTarget | None = None,
     ) -> SandboxResult:
         with self.session(
-            repo_path, coverage=coverage, env=env, smoke=smoke, tests=tests, original=original
+            repo_path,
+            coverage=coverage,
+            env=env,
+            smoke=smoke,
+            tests=tests,
+            original=original,
+            target=target,
         ) as session:
             return session.run_tests()
 
@@ -653,7 +668,7 @@ class Sandbox:
             for k, v in (installed.get("requires") or {}).items()
         }
         names = {normalize_name(check.distribution), *map(normalize_name, requires)}
-        pins = exact_pins(plan)
+        pins = {line: name for name, line in exact_pins(plan).items() if name in names}
         return SmokeResult(
             "ok" if data.get("ok") else "failed",
             check.description,
@@ -661,7 +676,8 @@ class Sandbox:
             check.distribution,
             installed.get("version"),
             requires,
-            sorted(line for name, line in pins.items() if name in names),
+            sorted(pins),
+            {line: list(plan.declared.get(name, ())) for line, name in sorted(pins.items())},
         )
 
     def _phase(
@@ -747,9 +763,11 @@ class SandboxSession:
         smoke: SmokeCheck | None = None,
         tests: TestPlan | None = None,
         original: str | os.PathLike[str] | None = None,
+        target: LibraryTarget | None = None,
     ) -> None:
         self.sandbox = sandbox
         self.original = Path(original).resolve() if original is not None else None
+        self.target = target
         self.env = dict(env or {})
         for key, value in self.env.items():
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) or "\n" in value:
@@ -801,6 +819,7 @@ class SandboxSession:
             self.tests.runner,
             override=self.sandbox.config.requirements_override,
             original=self.original,
+            target=self.target,
         )
         if self.coverage and "coverage" not in plan.requirements:
             plan = dataclasses.replace(plan, requirements=(*plan.requirements, "coverage"))
@@ -811,6 +830,7 @@ class SandboxSession:
         base.not_installed = list(plan.not_installed)
         base.requirements_override = plan.override
         base.override_replaced = list(plan.replaced)
+        base.override_upgraded = list(plan.upgraded)
 
         usable, why = self.sandbox.docker.available()
         if not usable:

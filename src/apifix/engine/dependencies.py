@@ -32,6 +32,8 @@ class DeclaredDependency:
     clauses: tuple[tuple[str, str], ...]  # e.g. (("==", "0.28.1"),); empty = unconstrained
     line: int
     col: int
+    # a direct reference (`name @ url`, a git / path / url table): no version to compare or set
+    direct: bool = False
 
 
 def normalize_name(name: str) -> str:
@@ -399,9 +401,10 @@ def _from_requirement(req: str, line: int, col: int) -> DeclaredDependency | Non
     if not m:
         return None
     spec = m.group(3).strip()
-    if spec.startswith("@"):  # direct URL reference
-        spec = ""
-    return DeclaredDependency(normalize_name(m.group(1)), req, _pep440_clauses(spec), line, col)
+    direct = spec.startswith("@")  # direct URL reference
+    return DeclaredDependency(
+        normalize_name(m.group(1)), req, () if direct else _pep440_clauses(spec), line, col, direct
+    )
 
 
 def _from_requirement_list(text: str, reqs: Iterable[object]) -> Iterator[DeclaredDependency]:
@@ -438,6 +441,10 @@ def _parse_requirements(text: str) -> list[DeclaredDependency]:
     return deps
 
 
+# keys of a Poetry / Pipfile / pixi table entry that make it a direct reference
+_DIRECT_KEYS = ("git", "path", "url", "file", "hg", "svn", "bzr")
+
+
 def _poetry_table(
     text: str, table: object, header: str | None = None
 ) -> Iterator[DeclaredDependency]:
@@ -446,13 +453,17 @@ def _poetry_table(
     if not isinstance(table, dict):
         return
     for key, value in table.items():
+        direct = False
         if isinstance(value, dict):
+            direct = "version" not in value and any(k in value for k in _DIRECT_KEYS)
             value = value.get("version", "")
         if not isinstance(value, str):
             continue
         line, col = _locate_key(text, key, header)
         raw = f"{key} = {value!r}" if value else key
-        yield DeclaredDependency(normalize_name(key), raw, _poetry_clauses(value), line, col)
+        yield DeclaredDependency(
+            normalize_name(key), raw, _poetry_clauses(value), line, col, direct
+        )
 
 
 def _parse_pyproject(text: str) -> list[DeclaredDependency]:

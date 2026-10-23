@@ -1,0 +1,18 @@
+version = 1
+requires-python = ">=3.8"
+
+[[package]]
+name = "openai"
+version = "1.99.2"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "thriller"
+version = "1.0.0"
+source = { editable = "." }
+dependencies = [
+    { name = "openai" },
+    { name = "pytest" },
+    { name = "pyyaml" },
+    { name = "together" },
+]

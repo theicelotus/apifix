@@ -70,6 +70,11 @@ go to the model as before, and the report says why; hash-pinned requirements fil
 for a manual update. Conda entries and lockfiles are never edited: the report names conda
 entries that would conflict and lockfiles to regenerate.
 
+A declaration that still allows 0.x gets the pin too: `openai` with no version, `*`, or a
+range such as `openai>=0.27` or `openai<2` (a [likely] finding, since pip alone would pick a
+new release, but a lockfile or an existing environment can keep 0.x). Direct references
+(`openai @ https://...`, git or path entries) are left alone.
+
 ### Dependencies in the sandbox
 
 apifix reads `pyproject.toml` (`[project]`, dependency groups, Poetry, and pixi's
@@ -93,7 +98,13 @@ that, so the fix is not retried, and the model is never told to change pins beca
 with your own requirements file for both the original code and the fix. The fix's own
 dependency edits still apply: for every package whose declaration the fix changed, the fix's
 version replaces your line (e.g. your `openai==0.28` becomes the fix's `openai>=1.0`), and the
-report lists each replacement. The file may hold requirements and `--index-url` /
+report lists each replacement. When the fix leaves the library's declaration unchanged, your
+line for it still gets the migration's version in the fixed run if it allows the old one
+(`openai==0.28.1` becomes `openai>=1.0,<2`; the original code keeps your line), and the report
+says so. If the fixed code's smoke check then fails and the only pins that can hold the library
+back are in your file (e.g. `typing_extensions==4.5.0`), the verdict is "unverified" with
+`sandbox_requirements_pin`: a problem with the file, not the fix. The model is not told about
+it and the fix is not retried. The file may hold requirements and `--index-url` /
 `--extra-index-url` lines (e.g. a CPU-only torch index), but no includes, editables, local paths
 or URLs with credentials, since it is passed to pip in the networked install container.
 

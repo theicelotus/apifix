@@ -35,6 +35,16 @@ class SmokeCheck:
 
 
 @dataclass(frozen=True)
+class LibraryTarget:
+    """The migrated library and the version a fix needs (from the migration): `package`, its
+    first version with the new API, and the spec apifix writes for it (`>=1.0,<2`)."""
+
+    package: str
+    first_version: str
+    spec: str
+
+
+@dataclass(frozen=True)
 class CompanionPin:
     """What the migrated library needs from one of its own requirements: versions
     `>= minimum` and `< upper`. A repo pin that allows none of them holds the library back, and

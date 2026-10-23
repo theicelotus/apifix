@@ -58,6 +58,7 @@ from apifix.engine.verifier import (
     run_summary,
     sandbox_requirements_lines,
     sandbox_requirements_record,
+    upgraded_text,
     verify,
 )
 from apifix.engine.walk import copy_repo
@@ -1021,8 +1022,9 @@ class _Job:
         it: the repo has no tests, the sandbox could not run at all, or tests fail on the fix
         while the original code's run failed (no edit produces the missing baseline). Nothing
         is retried when the sandbox's environment lacks modules the original code's tests
-        need: the next attempt could not be judged either."""
-        if any(r.code == "environment_incomplete" for r in v.reasons):
+        need, or when only pins in the user's --sandbox-requirements file hold the library
+        back: the next attempt could not be judged either."""
+        if environment_incomplete(v) or sandbox_requirements_pin(v):
             return False
         if any(r.code == "incomplete_migration" and r.file in self.manual_files for r in v.reasons):
             return False  # a hash-pinned file nobody in the job may edit
@@ -1160,6 +1162,22 @@ def environment_incomplete(v: Verification) -> bool:
     return any(r.code == "environment_incomplete" for r in v.reasons)
 
 
+def sandbox_requirements_pin(v: Verification) -> bool:
+    return any(r.code == "sandbox_requirements_pin" for r in v.reasons)
+
+
+def _upgraded_lines(job: _Job) -> list[str]:
+    """Report lines for the --sandbox-requirements lines of the migrated library that the fixed
+    runs got the target spec for (one per distinct line)."""
+    seen: dict[str, str | None] = {}
+    for a in job.attempts:
+        v = a.verification
+        if v is not None:
+            for u in v.fixed.override_upgraded:
+                seen.setdefault(u, v.fixed.requirements_override)
+    return [f"- {upgraded_text(u, override)}" for u, override in seen.items()]
+
+
 def _one_line(text: str, limit: int = 300) -> str:
     flat = " ".join(line.strip().removeprefix("- ") for line in text.splitlines() if line.strip())
     return flat if len(flat) <= limit else flat[: limit - 3] + "..."
@@ -1240,6 +1258,7 @@ def report_markdown(
             f"CI sets it (`{workflow}`); the sandbox has no network"
         )
     lines += sandbox_requirements_lines(job.sandbox)
+    lines += _upgraded_lines(job)
     lines += [f"- apifix set: {pin_line(e)}" for f in job.pin_files for e in f.edits]
     lines += [f"- apifix could not set: {fallback_line(b)}" for b in job.pin_fallbacks]
     lines += [f"- {n}" for f in job.pin_files for n in f.notes]
@@ -1285,6 +1304,14 @@ def report_markdown(
             "the fix could not be judged and was not retried. To check it again with packages "
             f"you list: `apifix verify {job.repo} --migration {job.migration.name} --diff "
             "fix.diff --sandbox-requirements FILE`"
+        )
+    elif chosen and chosen.verification and sandbox_requirements_pin(chosen.verification):
+        lines.append(
+            "- Only pins in the --sandbox-requirements file hold "
+            f"{job.migration.package} back, so the fix could not be judged and was not "
+            "retried. Raise or drop those pins in the file and check again: `apifix verify "
+            f"{job.repo} --migration {job.migration.name} --diff fix.diff "
+            "--sandbox-requirements FILE`"
         )
     elif chosen and chosen.verification and not chosen.verification.delta.baseline_available:
         lines.append(

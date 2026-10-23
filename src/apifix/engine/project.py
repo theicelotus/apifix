@@ -21,6 +21,7 @@ from apifix.engine.dependencies import (
     NotInstalled,
     allows,
     build_system_requires,
+    entirely_at_or_above,
     has_pixi_manifest,
     install_requirements,
     is_dependency_file,
@@ -32,6 +33,7 @@ from apifix.engine.dependencies import (
     sandbox_requirement_lines,
     sandbox_requirements_problem,
 )
+from apifix.engine.models import LibraryTarget
 from apifix.engine.walk import iter_files
 
 SUPPORTED_PYTHONS = ("3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14")
@@ -480,6 +482,9 @@ class InstallPlan:
     not_installed: tuple[NotInstalled, ...] = ()
     override: str | None = None  # SandboxRequirements.label when a user's file replaced detection
     replaced: tuple[str, ...] = ()  # its lines the fix's declarations replaced ("name: a -> b")
+    # its lines for the migrated library that allow the old version, replaced by the target spec
+    # because no edit of the fix changed the library ("openai==0.28.1 -> openai>=1.0,<2")
+    upgraded: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -688,12 +693,15 @@ def build_install_plan(
     runner: Runner | None,
     override: SandboxRequirements | None = None,
     original: Path | None = None,
+    target: LibraryTarget | None = None,
 ) -> InstallPlan:
     """What to install for `repo`. With `override` (a user's requirements file), that file
     replaces the repo's declared dependencies; when `repo` is a fix of `original`, every name
-    whose declaration the fix changed takes the fix's declaration instead."""
+    whose declaration the fix changed takes the fix's declaration instead, and (with `target`)
+    the file's lines that hold the migrated library at its old version get the target spec
+    when the fix did not change the library."""
     if override is not None:
-        return _override_plan(repo, runner, override, original)
+        return _override_plan(repo, runner, override, original, target)
     notes: list[str] = []
     sources: list[str] = []
     reqs: list[str] = []
@@ -774,7 +782,11 @@ def _by_name(reqs: Iterable[str]) -> dict[str, list[str]]:
 
 
 def _override_plan(
-    repo: Path, runner: Runner | None, override: SandboxRequirements, original: Path | None
+    repo: Path,
+    runner: Runner | None,
+    override: SandboxRequirements,
+    original: Path | None,
+    target: LibraryTarget | None = None,
 ) -> InstallPlan:
     notes = [
         f"dependencies from {override.label} ({override.count} requirement(s)), replacing "
@@ -783,6 +795,7 @@ def _override_plan(
     reqs = list(override.lines)
     declared = {name: (override.label,) for line in reqs if (name := _req_name(line))}
     replaced = []
+    changed: set[str] = set()  # names whose declaration the fix changed
     if original is not None:
         # The fix's own dependency edits still count: compare what detection finds in both
         # trees, and let the fix's declaration win for every name it changed.
@@ -792,6 +805,7 @@ def _override_plan(
         for name in sorted(set(new) | set(old)):
             if new.get(name) == old.get(name):
                 continue
+            changed.add(name)
             before = [r for r in reqs if _req_name(r) == name]
             reqs = [r for r in reqs if _req_name(r) != name] + new.get(name, [])
             if name in new:
@@ -802,6 +816,9 @@ def _override_plan(
                 f"{name}: {', '.join(before) or 'not listed'} -> "
                 f"{', '.join(new.get(name, [])) or 'removed by the fix'}"
             )
+    upgraded: list[str] = []
+    if original is not None and target is not None:
+        reqs, upgraded = _upgrade_library(reqs, target, changed)
     reqs = _with_tooling(repo, runner, reqs, notes)
     return InstallPlan(
         requirements=tuple(dict.fromkeys(reqs)),
@@ -812,4 +829,34 @@ def _override_plan(
         declared=declared,
         override=override.label,
         replaced=tuple(replaced),
+        upgraded=tuple(upgraded),
     )
+
+
+def _upgrade_library(
+    reqs: list[str], target: LibraryTarget, changed: set[str]
+) -> tuple[list[str], list[str]]:
+    """The fixed run's requirements with every line for the migrated library that still allows
+    an old version (`openai==0.28.1`, `openai`) set to the target spec, unless the fix changed
+    the library's declaration itself (`changed`: names the fix's declarations replaced). Extras
+    and markers stay. Returns the requirements and "old -> new" for each line replaced."""
+    name = normalize_name(target.package)
+    if name in changed:
+        return reqs, []
+    out, upgraded = [], []
+    for req in reqs:
+        m = _REQ_NAME_RE.match(req)
+        direct = "@" in req.split(";", 1)[0]
+        if (
+            m is None
+            or direct
+            or normalize_name(m.group(1)) != name
+            or entirely_at_or_above(pep440_clauses(m.group(3)), target.first_version)
+        ):
+            out.append(req)
+            continue
+        marker = f"; {req.split(';', 1)[1].strip()}" if ";" in req else ""
+        new = f"{m.group(1)}{m.group(2) or ''}{target.spec}{marker}"
+        out.append(new)
+        upgraded.append(f"{req} -> {new}")
+    return out, upgraded

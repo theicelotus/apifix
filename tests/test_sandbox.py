@@ -13,7 +13,7 @@ import pytest
 
 from apifix.engine import sandbox as sandbox_mod
 from apifix.engine.docker import ProcResult
-from apifix.engine.models import SmokeCheck
+from apifix.engine.models import LibraryTarget, SmokeCheck
 from apifix.engine.project import SandboxRequirements, TestPlan
 from apifix.engine.sandbox import (
     CONTAINER_ENV,
@@ -732,6 +732,44 @@ def test_smoke_failure_records_versions_and_limiting_pins(flat_service):
     # flask==2.2.3 is pinned too, but is not openai or one of its requirements
     assert smoke.pins == ["openai==0.28.1", "typing_extensions==4.5.0"]
     assert "proxies" in smoke.output
+
+
+def test_smoke_pins_record_where_they_are_declared(flat_service):
+    out = smoke_output(
+        ok=False,
+        output="AttributeError: module 'openai' has no attribute 'OpenAI'\n",
+        version="0.28.1",
+        requires={"typing-extensions": "4.5.0"},
+    )
+    docker = FakeDocker(test=pytest_run(passed=1), smoke=lambda call: out)
+    smoke = Sandbox(docker=docker).run(flat_service, smoke=SMOKE).smoke
+    assert smoke.pin_sources == {
+        "openai==0.28.1": ["requirements.txt"],
+        "typing_extensions==4.5.0": ["requirements.txt"],
+    }
+
+
+def test_fixed_run_with_sandbox_requirements_gets_the_target_for_an_old_library_pin(
+    flat_service, tmp_path
+):
+    # SuspensePerception: the user's file pins openai==0.28.1 for the original code, and the
+    # fix did not change openai's declaration
+    override = SandboxRequirements("/home/u/reqs.txt", "0" * 64, ("openai==0.28.1", "flask"))
+    fixed = tmp_path / "fixed"
+    shutil.copytree(flat_service, fixed)
+    (fixed / "svc" / "server.py").write_text("def reply():\n    return 2\n")
+    docker = FakeDocker(test=pytest_run(passed=1))
+    sandbox = Sandbox(SandboxConfig(requirements_override=override), docker=docker)
+    target = LibraryTarget("openai", "1.0", ">=1.0,<2")
+    result = sandbox.run(fixed, original=flat_service, target=target)
+    assert result.override_upgraded == ["openai==0.28.1 -> openai>=1.0,<2"]
+    (manifest,) = docker.requirements
+    assert "openai>=1.0,<2\n" in manifest and "openai==0.28.1" not in manifest
+    # without `original` (the baseline) the user's line stays
+    docker = FakeDocker(test=pytest_run(passed=1))
+    sandbox = Sandbox(SandboxConfig(requirements_override=override), docker=docker)
+    assert sandbox.run(flat_service, target=target).override_upgraded == []
+    assert "openai==0.28.1\n" in docker.requirements[0]
 
 
 @pytest.mark.parametrize(

@@ -6,11 +6,15 @@ import ast
 from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 
-from apifix.engine.dependencies import DeclaredDependency, entirely_below
+from apifix.engine.dependencies import (
+    DeclaredDependency,
+    entirely_at_or_above,
+    entirely_below,
+)
 from apifix.engine.migrations.guide import full_guide
 from apifix.engine.migrations.openai_v1 import config_checks, guide_parts, repo_findings, rules
 from apifix.engine.migrations.openai_v1.python_checks import check_python, v1_api_uses
-from apifix.engine.models import CERTAIN, Finding, SmokeCheck
+from apifix.engine.models import CERTAIN, LIKELY, Finding, SmokeCheck
 
 
 class OpenAIV1Migration:
@@ -86,8 +90,21 @@ class OpenAIV1Migration:
         return config_checks.rewrite_checker(root, findings)
 
     def check_dependency(self, file: str, dep: DeclaredDependency) -> Finding | None:
-        if dep.name != rules.PACKAGE or not entirely_below(dep.clauses, rules.FIRST_V1):
+        """A declaration that allows a 0.x release: `certain` when it allows nothing else,
+        `likely` when it allows 1.x too (no version, `*`, `>=0.27`, `<2`). Direct references
+        have no version to set."""
+        if dep.name != rules.PACKAGE or dep.direct:
             return None
+        if entirely_at_or_above(dep.clauses, rules.FIRST_V1):
+            return None
+        below = entirely_below(dep.clauses, rules.FIRST_V1)
+        if below:
+            suggestion = rules.DEPENDENCY
+        else:
+            what = (
+                f"`{dep.raw}` still allows 0.x" if dep.clauses else "the declaration has no version"
+            )
+            suggestion = rules.LOOSE_DEPENDENCY.format(what=what)
         return Finding(
             file=file,
             line=dep.line,
@@ -96,8 +113,8 @@ class OpenAIV1Migration:
             end_col=dep.col + len(dep.raw),
             category="dependency",
             old_pattern=dep.raw,
-            suggestion=rules.DEPENDENCY,
-            confidence=CERTAIN,
+            suggestion=suggestion,
+            confidence=CERTAIN if below else LIKELY,
         )
 
 

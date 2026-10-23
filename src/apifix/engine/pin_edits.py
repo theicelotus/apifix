@@ -344,7 +344,8 @@ def _companion_spec(clauses: Clauses, pin: CompanionPin) -> str:
 # --- locating entries ---------------------------------------------------------------------------
 
 _REQ = re.compile(
-    r"^\s*(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*(?P<spec>[^;@#]*?)\s*(?:;.*)?$",
+    r"^\s*(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)\s*(?P<extras>\[[^\]]*\])?\s*"
+    r"(?P<spec>[^;@#]*?)\s*(?:;.*)?$",
     re.DOTALL,
 )
 _COMMENT = re.compile(r"(^|\s)#")
@@ -360,17 +361,22 @@ class _Req:
 
 def _requirement(req: str) -> _Req | None:
     """A PEP 508 requirement's name, clauses and the position of its version spec, or None
-    (direct references, options, unparseable text, no spec)."""
+    (direct references, options, unparseable text, a spec that is not one). With no spec at
+    all, the position is right after the name and extras (an empty span: the spec goes there)."""
     head = req.split(";", 1)[0]
     if "@" in head or not req.strip() or req.lstrip().startswith(("-", "git+", "http:", "https:")):
         return None
     m = _REQ.match(req)
-    if not m or not m.group("spec"):
+    if not m:
         return None
+    name = normalize_name(m.group("name"))
+    if not m.group("spec"):
+        at = m.end("extras") if m.group("extras") else m.end("name")
+        return _Req(name, (), (at, at), at)
     clauses = pep440_clauses(m.group("spec"))
     if not clauses:
         return None
-    return _Req(normalize_name(m.group("name")), clauses, m.span("spec"), m.end("spec"))
+    return _Req(name, clauses, m.span("spec"), m.end("spec"))
 
 
 def _req_entry(text: str, base: int, req: str, line: int, problem: str = "") -> _Entry | None:
@@ -701,9 +707,9 @@ def _toml_entries(name: str, text: str) -> list[_Entry]:
                 continue
             req_name, clauses, spec, shown_end = r.name, r.clauses, r.spec, r.end
         else:
+            # no clauses: `*`, "" or a range the parser does not read (`^0.27 || ^1.0`); the
+            # whole string is the spec either way
             clauses = poetry_clauses(value)
-            if not clauses:
-                continue
             req_name, spec, shown_end = normalize_name(str(key)), (0, len(value)), len(value)
         probe = "apifix-probe-1f3c"
         new_value = value[: spec[0]] + probe + value[spec[1] :]

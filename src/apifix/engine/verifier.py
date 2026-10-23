@@ -8,6 +8,7 @@ retry) and a Markdown section (for the pull request).
 
 from __future__ import annotations
 
+import dataclasses
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
@@ -21,7 +22,7 @@ from apifix.engine.dependencies import (
 )
 from apifix.engine.diffing import FileChange, diff_trees, read_text
 from apifix.engine.migrations import Migration, get_migration
-from apifix.engine.models import Finding
+from apifix.engine.models import Finding, LibraryTarget
 from apifix.engine.project import NotInstalled, is_test_file
 from apifix.engine.sandbox import PhaseResult, Sandbox, SandboxResult
 from apifix.engine.scanner import scan
@@ -70,8 +71,16 @@ INSTALL_OUTPUT_CHARS = 4_000
 # Reasons about the sandbox's environment, not the code: never sent to the model as feedback
 # (no edit can fix them, and they must not read as "fix the pins").
 ENVIRONMENT_REASONS = frozenset(
-    {"environment_incomplete", "missing_modules", "library_not_declared"}
+    {
+        "environment_incomplete",
+        "missing_modules",
+        "library_not_declared",
+        "sandbox_requirements_pin",
+    }
 )
+# Test outcomes a sandbox_requirements_pin explains (the fixed run got the wrong library
+# version): not judged, so unverified instead of rejected while that reason is present.
+LIBRARY_HELD_BACK = frozenset({"regression", "regression_error", "collection_error"})
 SANDBOX_REQUIREMENTS_HINT = (
     "pass --sandbox-requirements FILE listing the packages the tests need (for `apifix "
     "verify` on the diff too)"
@@ -292,6 +301,7 @@ def run_summary(run: SandboxResult) -> dict:
             {
                 "requirements_override": run.requirements_override,
                 "override_replaced": list(run.override_replaced),
+                "override_upgraded": list(run.override_upgraded),
             }
             if run.requirements_override
             else {}
@@ -334,6 +344,15 @@ def sandbox_requirements_record(sandbox: Sandbox) -> dict[str, Any] | None:
     if req is None:
         return None
     return {"path": req.path, "sha256": req.sha256, "lines": list(req.lines)}
+
+
+def upgraded_text(upgraded: str, override: str | None) -> str:
+    """Report words for one InstallPlan.upgraded entry ("old -> new")."""
+    old, new = upgraded.split(" -> ", 1)
+    return (
+        f"Fixed run: `{old}` from {override or '--sandbox-requirements'} replaced by `{new}` "
+        "(the migration's target; no edit of the fix changed this library)"
+    )
 
 
 def sandbox_requirements_lines(sandbox: Sandbox) -> list[str]:
@@ -902,6 +921,15 @@ def smoke_reasons(fixed: SandboxResult, baseline: SandboxResult | None = None) -
         + (f"; its dependencies: {deps}" if deps else "")
         + "."
     )
+    override = fixed.requirements_override
+    if smoke.pins and override and all(smoke.pin_sources.get(p) == [override] for p in smoke.pins):
+        message += (
+            f" The only exact pins that can hold {lib} back to an old release come from "
+            f"{override}: {', '.join(smoke.pins)}. This is a problem with that file, not with "
+            "the fix, and no edit to the code can change it: raise or drop those pins there "
+            "and check the diff again (`apifix verify ... --sandbox-requirements FILE`)."
+        )
+        return [Reason("sandbox_requirements_pin", "unverified", message)]
     if smoke.pins:
         message += (
             f" Exact pins in the dependency files on {lib} or its dependencies, which can hold "
@@ -909,6 +937,24 @@ def smoke_reasons(fixed: SandboxResult, baseline: SandboxResult | None = None) -
         )
     message += " Fix the dependency file(s): raise or drop the pins that conflict."
     return [Reason("smoke_check_failed", "reject", message)]
+
+
+def library_held_back(reasons: list[Reason], lib: str) -> list[Reason]:
+    """With a sandbox_requirements_pin, the fixed run had the wrong version of the library, so
+    the test outcomes that follow from it (regressions, modules that no longer import) are not
+    judged: unverified instead of rejected. Every other reason keeps its severity."""
+    if not any(r.code == "sandbox_requirements_pin" for r in reasons):
+        return reasons
+    return [
+        dataclasses.replace(
+            r,
+            severity="unverified",
+            message=f"{r.message} (not judged: --sandbox-requirements held {lib} back)",
+        )
+        if r.code in LIBRARY_HELD_BACK and r.severity == "reject"
+        else r
+        for r in reasons
+    ]
 
 
 def _not_installed_reason(
@@ -1095,7 +1141,10 @@ def verify(
         baseline = sandbox.run(original, env=env)
     rerun = None
     smoke = getattr(mig, "smoke_check", None)
-    with sandbox.session(fixed, coverage=True, env=env, smoke=smoke, original=original) as session:
+    target = LibraryTarget(mig.package, mig.first_version, mig.pin_spec)
+    with sandbox.session(
+        fixed, coverage=True, env=env, smoke=smoke, original=original, target=target
+    ) as session:
         fixed_run = session.run_tests()
         delta = compare_runs(baseline, fixed_run)
         if config.rerun_new_failures and (delta.newly_failing or delta.newly_erroring):
@@ -1116,6 +1165,7 @@ def verify(
         + environment_reasons(baseline, original)
         + _evidence_reasons(fixed_run, coverage, config)
     )
+    reasons = library_held_back(reasons, mig.package)
     verdict = decide(reasons)
     review = review_by_hand(changes, coverage) if verdict in REVIEW_VERDICTS else []
     return Verification(
@@ -1226,6 +1276,10 @@ def _report(v: Verification) -> str:
             line += " For the fix, its own dependency edits replaced: " + "; ".join(
                 f"`{r}`" for r in v.fixed.override_replaced
             )
+        line += "".join(
+            f" {upgraded_text(u, v.fixed.requirements_override)}."
+            for u in v.fixed.override_upgraded
+        )
         out.append(line)
     resolved = v.findings_before - len(v.remaining_findings)
     out += [

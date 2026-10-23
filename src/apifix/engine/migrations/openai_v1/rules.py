@@ -222,6 +222,12 @@ PACKAGE = "openai"
 FIRST_V1 = "1.0"
 PIN_SPEC = ">=1.0,<2"  # what apifix writes for a 0.x pin
 DEPENDENCY = f"Pin openai>=1.0 (e.g. openai{PIN_SPEC}) and migrate call sites"
+# a declaration that allows 0.x and 1.x alike: pip alone picks a new release, but a lockfile,
+# constraints file or existing environment can hold 0.x
+LOOSE_DEPENDENCY = (
+    f"Pin openai{PIN_SPEC}: {{what}}, so a lockfile or an existing environment can install "
+    "0.x, which the migrated code cannot use"
+)
 
 # openai's own requirements, from the metadata of 1.109.1 (the last release before 2.0; PyPI,
 # checked 2026-10-22). openai 1.0 accepted typing-extensions>=4.5, so an exact older pin makes

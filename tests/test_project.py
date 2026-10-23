@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from apifix.engine.models import LibraryTarget
 from apifix.engine.project import (
     PYTEST_COMMAND,
     SandboxRequirements,
@@ -719,6 +720,55 @@ def test_override_takes_the_fixs_declaration_for_every_name_the_fix_changed(tmp_
     # the original code gets the user's file unchanged
     base = build_install_plan(original, "pytest", override=OVERRIDE)
     assert "openai==0.28" in base.requirements and base.replaced == ()
+
+
+TARGET = LibraryTarget("openai", "1.0", ">=1.0,<2")
+
+
+def test_override_old_library_pin_gets_the_target_when_the_fix_did_not_change_it(tmp_path):
+    # SuspensePerception: the repo's declaration stays as it was, the user's file pins 0.x
+    files = {**PIXI_LIKE, "requirements.txt": "openai\ntyper\n"}
+    original = write(tmp_path / "original", files)
+    fixed = write(tmp_path / "fixed", {**files, "app.py": "import openai\n"})
+    plan = build_install_plan(fixed, "pytest", override=OVERRIDE, original=original, target=TARGET)
+    assert "openai>=1.0,<2" in plan.requirements and "openai==0.28" not in plan.requirements
+    assert plan.upgraded == ("openai==0.28 -> openai>=1.0,<2",) and plan.replaced == ()
+    assert plan.declared["openai"] == ("--sandbox-requirements reqs.txt",)
+    # the original code gets the user's line unchanged, target or not
+    base = build_install_plan(original, "pytest", override=OVERRIDE, target=TARGET)
+    assert "openai==0.28" in base.requirements and base.upgraded == ()
+
+
+def test_override_library_pin_the_fix_changed_takes_the_fixs_line(tmp_path):
+    files = {**PIXI_LIKE, "requirements.txt": "openai\n"}
+    original = write(tmp_path / "original", files)
+    fixed = write(tmp_path / "fixed", {**files, "requirements.txt": "openai>=1.0,<2\n"})
+    plan = build_install_plan(fixed, "pytest", override=OVERRIDE, original=original, target=TARGET)
+    assert plan.replaced == ("openai: openai==0.28 -> openai>=1.0,<2",)
+    assert plan.upgraded == ()
+
+
+@pytest.mark.parametrize(
+    ("line", "upgraded"),
+    [
+        ("openai==0.28.1", "openai>=1.0,<2"),
+        ("openai", "openai>=1.0,<2"),
+        (
+            "OpenAI[datalib]>=0.27 ; python_version < '3.12'",
+            "OpenAI[datalib]>=1.0,<2; python_version < '3.12'",
+        ),
+        ("openai>=1.3", None),
+        ("openai @ https://example.invalid/openai-0.28.1-py3-none-any.whl", None),
+    ],
+)
+def test_override_library_lines_that_allow_0x_are_upgraded(tmp_path, line, upgraded):
+    override = SandboxRequirements("/home/u/reqs.txt", "0" * 64, (line, "numpy"))
+    original = write(tmp_path / "original", PIXI_LIKE)
+    fixed = write(tmp_path / "fixed", {**PIXI_LIKE, "app.py": "x = 1\n"})
+    plan = build_install_plan(fixed, "pytest", override=override, original=original, target=TARGET)
+    expected = upgraded or line
+    assert plan.requirements[:2] == (expected, "numpy")
+    assert plan.upgraded == ((f"{line} -> {upgraded}",) if upgraded else ())
 
 
 # --- pixi and conda environment files ---------------------------------------------------------

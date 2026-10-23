@@ -57,10 +57,12 @@ from tests.test_verifier import (
     APP_NEW,
     APP_OLD,
     ORIGINAL,
+    OVERRIDE_LABEL,
     T_ASK,
     T_STRIP,
     TESTS_NEW,
     TESTS_OLD,
+    held_back_run,
     run,
     write_tree,
 )
@@ -109,7 +111,7 @@ class JudgingSandbox:
         self.envs.append(env)
         return self.baseline or self.judge(Path(repo))
 
-    def session(self, repo, *, coverage=False, env=None, smoke=None, original=None):
+    def session(self, repo, *, coverage=False, env=None, smoke=None, original=None, target=None):
         sandbox = self
         self.envs.append(env)
 
@@ -2290,3 +2292,65 @@ def test_whole_file_reverts_unrelated_text_and_sends_dropped_config_back(tmp_pat
         ("voicebot/assistant.py", 39),
         ("voicebot/cli.py", 13),
     ]
+
+
+def test_unpinned_openai_gets_the_pin_and_is_not_sent(tmp_path):
+    # SuspensePerception: pyproject.toml declares "openai" with no version, next to a uv.lock
+    files = {k: v for k, v in ORIGINAL.items() if k != "requirements.txt"}
+    files["pyproject.toml"] = '[project]\nname = "x"\ndependencies = ["openai", "pytest"]\n'
+    files["uv.lock"] = 'version = 1\n[[package]]\nname = "openai"\nversion = "1.99.2"\n'
+    repo = write_tree(tmp_path / "repo", files)
+    llm = FakeLLM(list(GOOD))
+    result = wf(repo, llm)
+    assert result.outcome == "verified", result.report_markdown
+    assert first_lines(llm) == ["Migrate this file: app.py", "Migrate this file: tests/test_app.py"]
+    assert (
+        "apifix has already set the openai pin (openai>=1.0,<2) in pyproject.toml"
+        in (llm.systems[0])
+    )
+    assert '-dependencies = ["openai", "pytest"]\n+dependencies = ["openai>=1.0,<2", "pytest"]' in (
+        result.diff
+    )
+    assert "uv.lock" not in result.diff
+    report = result.report_markdown
+    assert "- apifix set: pyproject.toml:3 openai -> openai>=1.0,<2" in report
+    assert "- not updated: uv.lock; regenerate it" in report
+
+
+# --- --sandbox-requirements and the migrated library ---------------------------------------------
+
+
+def test_only_sandbox_requirements_pins_holding_openai_back_is_not_retried(repo):
+    def held_back(tree: Path) -> SandboxResult:
+        if "openai.ChatCompletion" in (tree / "app.py").read_text():
+            return judge(tree)  # the original code, on 0.x: passes
+        return held_back_run({"typing_extensions==4.5.0": [OVERRIDE_LABEL]})
+
+    llm = FakeLLM(list(GOOD) + list(GOOD))
+    result = wf(repo, llm, JudgingSandbox(judge=held_back), max_retries=3)
+    assert result.outcome == "unverified", result.report_markdown
+    assert len(result.trajectory["attempts"]) == 1 and len(llm.requests) == 2
+    report = result.report_markdown
+    assert (
+        "- Only pins in the --sandbox-requirements file hold openai back, so the fix could not "
+        "be judged and was not retried. Raise or drop those pins in the file and check again: "
+        f"`apifix verify {repo} --migration openai-v1 --diff fix.diff --sandbox-requirements "
+        "FILE`" in report
+    )
+    assert "sandbox_requirements_pin" in report
+
+
+def test_report_lists_the_users_library_pin_the_fixed_run_replaced(repo):
+    def upgraded(tree: Path) -> SandboxResult:
+        result = judge(tree)
+        if "client.chat" in (tree / "app.py").read_text():
+            result.requirements_override = OVERRIDE_LABEL
+            result.override_upgraded = ["openai==0.28.1 -> openai>=1.0,<2"]
+        return result
+
+    result = wf(repo, FakeLLM(list(GOOD)), JudgingSandbox(judge=upgraded))
+    assert result.outcome == "verified", result.report_markdown
+    assert (
+        "- Fixed run: `openai==0.28.1` from --sandbox-requirements reqs.txt replaced by "
+        "`openai>=1.0,<2` (the migration's target; no edit of the fix changed this library)"
+    ) in result.report_markdown.splitlines()

@@ -476,3 +476,120 @@ def test_unparseable_file_falls_back(tmp_path):
     (root / "requirements.txt").write_bytes(b"\xff\xfe")
     (f,) = plan_pin_edits(root, findings, MIG).files
     assert f.fallbacks[0].reason == "not UTF-8 text"
+
+
+# --- unpinned and loose declarations ------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("rel", "content", "old", "new"),
+    [
+        ("requirements.txt", "openai\nnumpy\n", "openai", "openai>=1.0,<2"),
+        (
+            "requirements.txt",
+            "openai[datalib] ; python_version < '3.12'  # why\n",
+            "openai[datalib] ; python_version < '3.12'  # why",
+            "openai[datalib]>=1.0,<2 ; python_version < '3.12'  # why",
+        ),
+        ("requirements.txt", "openai >= 0.27, < 2\n", "openai >= 0.27, < 2", "openai >=1.0,<2"),
+        (
+            "pyproject.toml",
+            '[project]\nname = "x"\ndependencies = ["openai", "numpy"]\n',
+            'dependencies = ["openai", "numpy"]',
+            'dependencies = ["openai>=1.0,<2", "numpy"]',
+        ),
+        (
+            "pyproject.toml",
+            "[tool.poetry.dependencies]\nopenai = '*'\n",
+            "openai = '*'",
+            "openai = '>=1.0,<2'",
+        ),
+        (
+            "pyproject.toml",
+            '[tool.poetry.dependencies]\nopenai = {version = "*", extras = ["x"]}\n',
+            'openai = {version = "*", extras = ["x"]}',
+            'openai = {version = ">=1.0,<2", extras = ["x"]}',
+        ),
+        (
+            "pyproject.toml",
+            '[tool.poetry.dependencies]\nopenai = "^0.27 || ^1.0"\n',
+            'openai = "^0.27 || ^1.0"',
+            'openai = ">=1.0,<2"',
+        ),
+        ("Pipfile", '[packages]\nopenai = "*"\n', 'openai = "*"', 'openai = ">=1.0,<2"'),
+        (
+            "pixi.toml",
+            '[pypi-dependencies]\nopenai = "*"\n',
+            'openai = "*"',
+            'openai = ">=1.0,<2"',
+        ),
+        (
+            "setup.py",
+            'from setuptools import setup\nsetup(install_requires=["openai", "x"])\n',
+            'setup(install_requires=["openai", "x"])',
+            'setup(install_requires=["openai>=1.0,<2", "x"])',
+        ),
+        (
+            "setup.cfg",
+            "[options]\ninstall_requires =\n    openai\n    numpy\n",
+            "    openai",
+            "    openai>=1.0,<2",
+        ),
+        (
+            "environment.yml",
+            "dependencies:\n  - pip\n  - pip:\n    - openai\n",
+            "    - openai",
+            "    - openai>=1.0,<2",
+        ),
+    ],
+)
+def test_unpinned_and_loose_declarations_get_the_pin(tmp_path, rel, content, old, new):
+    f = one(tmp_path, rel, content)
+    assert f.complete and f.fallbacks == []
+    assert changed_lines(f) == [(old, new)]
+    assert [e.kind for e in f.edits] == ["migration"]
+
+
+def test_unpinned_entry_report_line(tmp_path):
+    f = one(tmp_path, "requirements.txt", "numpy\nopenai\n")
+    assert [pin_line(e) for e in f.edits] == ["requirements.txt:2 openai -> openai>=1.0,<2"]
+
+
+def test_unpinned_project_dependency_with_uv_lock_is_noted_not_edited(tmp_path):
+    # SuspensePerception: "openai" in [project] dependencies, uv.lock next to it
+    lock = 'version = 1\n[[package]]\nname = "openai"\nversion = "1.99.2"\n'
+    p = plan(
+        tmp_path,
+        {
+            "pyproject.toml": '[project]\nname = "x"\ndependencies = ["together", "openai"]\n',
+            "uv.lock": lock,
+        },
+    )
+    (f,) = p.files
+    assert f.text.endswith('dependencies = ["together", "openai>=1.0,<2"]\n')
+    assert f.notes == ["not updated: uv.lock; regenerate it"]
+    assert (tmp_path / "repo" / "uv.lock").read_text() == lock
+
+
+def test_direct_reference_and_1x_declarations_are_left_alone(tmp_path):
+    p = plan(
+        tmp_path,
+        {
+            "requirements.txt": "openai @ git+https://github.com/openai/openai-python\n",
+            "requirements-dev.txt": "openai>=1.3\n",
+        },
+    )
+    assert p.files == []
+
+
+def test_unpinned_fixture_gets_the_pin_and_a_lockfile_note():
+    root = Path(__file__).parent / "fixtures" / "unpinned_openai"
+    findings = scan(root, MIG).findings
+    deps = [f for f in findings if f.category == "dependency"]
+    assert [(f.file, f.line, f.old_pattern, f.confidence) for f in deps] == [
+        ("pyproject.toml", 9, "openai", "likely")
+    ]
+    assert any(f.category != "dependency" for f in findings)  # the 0.x calls
+    (f,) = plan_pin_edits(root, findings, MIG).files
+    assert changed_lines(f) == [('    "openai",', '    "openai>=1.0,<2",')]
+    assert f.complete and f.notes == ["not updated: uv.lock; regenerate it"]

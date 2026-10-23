@@ -9,9 +9,10 @@ from pathlib import Path
 
 import pytest
 
+from apifix.engine.models import LibraryTarget
 from apifix.engine.project import NotInstalled
 from apifix.engine.sandbox import PhaseResult, SandboxResult, SmokeResult
-from apifix.engine.test_results import FileCoverage, TestCaseResult, counts_from
+from apifix.engine.test_results import FileCoverage, TestCaseResult, TestCounts, counts_from
 from apifix.engine.verifier import (
     INSTALL_OUTPUT_CHARS,
     VerifierConfig,
@@ -88,16 +89,18 @@ class FakeSandbox:
     envs: list[dict | None] = field(default_factory=list)
     smokes: list[object] = field(default_factory=list)
     originals: list[object] = field(default_factory=list)
+    targets: list[object] = field(default_factory=list)
 
     def run(self, repo, *, coverage=False, env=None):
         self.baseline_runs += 1
         self.envs.append(env)
         return self.baseline
 
-    def session(self, repo, *, coverage=False, env=None, smoke=None, original=None):
+    def session(self, repo, *, coverage=False, env=None, smoke=None, original=None, target=None):
         self.envs.append(env)
         self.smokes.append(smoke)
         self.originals.append(original)
+        self.targets.append(target)
         self.session_coverage = coverage
         self.last_session = FakeSession(list(self.fixed))
         return self.last_session
@@ -872,6 +875,99 @@ def test_smoke_check_that_passed_or_could_not_run_does_not_reject(trees, status)
     v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(PASSING, [fixed_run]))
     assert "smoke_check_failed" not in codes(v)
     assert v.verdict == "verified"
+
+
+OVERRIDE_LABEL = "--sandbox-requirements reqs.txt"
+
+
+def held_back_run(pin_sources: dict[str, list[str]]) -> SandboxResult:
+    """The fixed run when the installed openai is 0.x: every test module fails to import."""
+    message = "ImportError: cannot import name 'OpenAI' from 'openai'"
+    fixed_run = run(("tests.test_app", "error", message))
+    fixed_run.requirements_override = OVERRIDE_LABEL
+    fixed_run.smoke = SmokeResult(
+        status="failed",
+        description='import openai; openai.OpenAI(api_key="<dummy key>")',
+        output="AttributeError: module 'openai' has no attribute 'OpenAI'\n",
+        distribution="openai",
+        version="0.28.1",
+        requires={"typing-extensions": "4.5.0"},
+        pins=sorted(pin_sources),
+        pin_sources=pin_sources,
+    )
+    return fixed_run
+
+
+def test_verify_passes_the_migrations_library_target_to_the_fixed_run(trees):
+    original, fixed = trees({})
+    sandbox = FakeSandbox(baseline=PASSING, fixed=[PASSING])
+    verify(original, fixed, "openai-v1", sandbox=sandbox)
+    assert sandbox.targets == [LibraryTarget("openai", "1.0", ">=1.0,<2")]
+
+
+def test_smoke_failure_from_sandbox_requirements_pins_only_is_not_the_fixs_problem(trees):
+    original, fixed = trees({})
+    fixed_run = held_back_run({"typing_extensions==4.5.0": [OVERRIDE_LABEL]})
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(PASSING, [fixed_run]))
+    assert "smoke_check_failed" not in codes(v)
+    r = reason(v, "sandbox_requirements_pin")
+    assert r.severity == "unverified"
+    assert (
+        "The only exact pins that can hold openai back to an old release come from "
+        "--sandbox-requirements reqs.txt: typing_extensions==4.5.0" in r.message
+    )
+    assert "apifix verify ... --sandbox-requirements FILE" in r.message
+    # the import errors follow from the wrong openai: not judged, not rejected
+    for code in ("collection_error",):
+        assert reason(v, code).severity == "unverified"
+        assert "not judged: --sandbox-requirements held openai back" in reason(v, code).message
+    assert v.verdict == "unverified"
+    # an environment reason: never sent to the model
+    assert "sandbox_requirements_pin" not in "\n".join(feedback_lines(v))
+    assert "sandbox_requirements_pin" in v.report_markdown()
+
+
+def test_sandbox_requirements_pin_leaves_independent_rejections(trees):
+    original, fixed = trees({"tests/test_app.py": None})  # the fix deleted the tests
+    fixed_run = held_back_run({"typing_extensions==4.5.0": [OVERRIDE_LABEL]})
+    fixed_run.tests, fixed_run.counts = [], TestCounts()
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(PASSING, [fixed_run]))
+    assert "sandbox_requirements_pin" in codes(v)
+    assert reason(v, "deleted_test").severity == "reject"
+    assert v.verdict == "rejected"
+
+
+@pytest.mark.parametrize(
+    "pin_sources",
+    [
+        # one of the pins is the repo's own: the model can change that one
+        {"openai==0.28.1": [OVERRIDE_LABEL], "typing_extensions==4.5.0": ["requirements.txt"]},
+        {},  # no pins at all
+    ],
+)
+def test_smoke_failure_with_repo_pins_or_none_stays_a_dependency_problem(trees, pin_sources):
+    original, fixed = trees({})
+    fixed_run = held_back_run(pin_sources)
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(PASSING, [fixed_run]))
+    assert "sandbox_requirements_pin" not in codes(v)
+    assert reason(v, "smoke_check_failed").severity == "reject"
+    assert reason(v, "collection_error").severity == "reject"
+    assert v.verdict == "rejected"
+
+
+def test_report_says_when_the_fixed_run_got_the_target_for_the_users_pin(trees):
+    original, fixed = trees({})
+    fixed_run = run((T_ASK, "passed"), (T_STRIP, "passed"), coverage=FULL_COVERAGE)
+    fixed_run.requirements_override = "--sandbox-requirements suspense-sandbox-reqs.txt"
+    fixed_run.override_upgraded = ["openai==0.28.1 -> openai>=1.0,<2"]
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(PASSING, [fixed_run]))
+    assert (
+        "Fixed run: `openai==0.28.1` from --sandbox-requirements suspense-sandbox-reqs.txt "
+        "replaced by `openai>=1.0,<2` (the migration's target; no edit of the fix changed this "
+        "library)." in v.report_markdown()
+    )
+    summary = v.to_dict()["runs"]["fixed"]
+    assert summary["override_upgraded"] == ["openai==0.28.1 -> openai>=1.0,<2"]
 
 
 def test_import_paths_are_in_the_report(trees):
