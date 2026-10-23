@@ -15,7 +15,9 @@ from apifix.engine.sandbox import PhaseResult, SandboxResult, SmokeResult
 from apifix.engine.test_results import FileCoverage, TestCaseResult, TestCounts, counts_from
 from apifix.engine.verifier import (
     INSTALL_OUTPUT_CHARS,
+    TestDelta,
     VerifierConfig,
+    _why_failing,
     compare_runs,
     decide,
     feedback_lines,
@@ -763,6 +765,37 @@ def test_compare_runs_unittest_collection_error():
     assert d.deleted == []
 
 
+def test_compare_runs_keeps_the_messages_of_no_signal_tests_only():
+    before = run(
+        ("m::pre", "failed", "KeyError: 'x'"),
+        ("m::ext", "error", "openai.error.APIConnectionError: x"),
+        ("m::fixed", "failed", "boom"),
+        ("m::new_fail", "passed"),
+        ("broken", "error", "collection failure\nImportError"),
+    )
+    after = run(
+        ("m::pre", "error", "TypeError: y"),
+        ("m::ext", "error", "openai.APIConnectionError: Connection error."),
+        ("m::fixed", "passed"),
+        ("m::new_fail", "failed", "nope"),
+        ("broken", "error", "collection failure\nSyntaxError"),
+    )
+    d = compare_runs(before, after)
+    assert d.no_signal_preexisting == ["m::pre", "broken"]
+    assert d.no_signal_external == ["m::ext"]
+    assert d.no_signal_messages == {
+        "m::pre": {"baseline": "KeyError: 'x'", "fixed": "TypeError: y"},
+        "m::ext": {
+            "baseline": "openai.error.APIConnectionError: x",
+            "fixed": "openai.APIConnectionError: Connection error.",
+        },
+        "broken": {
+            "baseline": "collection failure\nImportError",
+            "fixed": "collection failure\nSyntaxError",
+        },
+    }
+
+
 def test_new_failing_test_counts_as_failing():
     d = compare_runs(run(("m::a", "passed")), run(("m::a", "passed"), ("m::b", "failed")))
     assert d.newly_failing == ["m::b"]
@@ -1074,6 +1107,63 @@ def test_module_failing_to_collect_before_and_after_is_no_signal_with_its_file(t
     )
     assert reason(v, "no_signal_preexisting").tests == ("tests.test_heavy",)
     assert v.verdict == "verified"
+
+
+IMPORT_ERROR = (
+    "collection failure\nImportError while importing test module '/work/tests/test_heavy.py'.\n"
+    "Traceback:\n...\nE   " + NO_NLPAUG
+)
+
+
+def test_no_signal_tests_keep_why_they_fail_in_json_and_report(trees):
+    # SuspensePerception: 11 of 13 tests failed before and after, listed with names only
+    original, fixed = trees(HEAVY, {**ORIGINAL, **HEAVY})
+    key_error = "KeyError: 'api_key'\nmodel_config = {...}\n>   key = model_config['api_key']"
+    baseline = run(
+        (T_ASK, "passed"),
+        (T_STRIP, "passed"),
+        (T_LIVE, "failed", key_error),
+        ("tests.test_heavy", "error", IMPORT_ERROR, "nlpaug"),
+    )
+    fixed_run = run(
+        (T_ASK, "passed"),
+        (T_STRIP, "passed"),
+        (T_LIVE, "failed", "KeyError: 'api_key'\n(after the fix)"),
+        ("tests.test_heavy", "error", IMPORT_ERROR, "nlpaug"),
+        coverage=FULL_COVERAGE,
+    )
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(baseline, [fixed_run]))
+    assert v.delta.no_signal_preexisting == [T_LIVE, "tests.test_heavy"]
+    assert v.delta.no_signal_messages == {
+        T_LIVE: {"baseline": key_error, "fixed": "KeyError: 'api_key'\n(after the fix)"},
+        "tests.test_heavy": {"baseline": IMPORT_ERROR, "fixed": IMPORT_ERROR},
+    }
+    data = json.loads(json.dumps(v.to_dict()))
+    assert data["tests"]["no_signal_messages"][T_LIVE]["fixed"].endswith("(after the fix)")
+    md = v.report_markdown()
+    assert f"- `{T_LIVE}`: already failing before the fix: `KeyError: 'api_key'`\n" in md
+    # pytest's "collection failure" line says nothing: the line after it does
+    assert (
+        "- `tests.test_heavy`: already failing before the fix: `ImportError while importing "
+        "test module '/work/tests/test_heavy.py'.`\n"
+    ) in md
+
+
+@pytest.mark.parametrize(
+    ("message", "shown"),
+    [
+        ("", ""),
+        ("\n  \n", ""),
+        ("collection failure", ": `collection failure`"),
+        ("  AssertionError: `x` != 1\nmore", ": `` AssertionError: `x` != 1 ``"),
+        ("E" * 200, ": `" + "E" * 157 + "...`"),
+    ],
+)
+def test_report_first_line_of_a_no_signal_failure(message, shown):
+    delta = TestDelta(no_signal_preexisting=["m::a"])
+    delta.no_signal_messages["m::a"] = {"baseline": message, "fixed": "other"}
+    assert _why_failing(delta, "m::a") == shown
+    assert _why_failing(TestDelta(), "m::a") == ""
 
 
 def test_module_collecting_only_after_the_fix_is_fixed_by_change(trees):

@@ -65,6 +65,9 @@ MAX_LISTED = 15
 # of a hunk, at most this long)
 REVIEW_VERDICTS = frozenset({"verified_weak", "unverified"})
 REVIEW_CHARS = 100
+# first line of a no-signal test's failure message in the report
+MESSAGE_HEAD_CHARS = 160
+PYTEST_COLLECTION_FAILURE = "collection failure"
 # pip output kept per failed install phase in run summaries (the tail: that is where pip's
 # error is)
 INSTALL_OUTPUT_CHARS = 4_000
@@ -119,6 +122,9 @@ class TestDelta:
     new_tests: list[str] = field(default_factory=list)
     no_signal_external: list[str] = field(default_factory=list)
     no_signal_preexisting: list[str] = field(default_factory=list)
+    # each no_signal_* entry -> why it fails: {"baseline": ..., "fixed": ...}, the runs' failure
+    # messages (clipped when the test output is parsed, like every test's message)
+    no_signal_messages: dict[str, dict[str, str]] = field(default_factory=dict)
     # No usable baseline: tests that fail or error on the fixed code (collection errors as their
     # module), which cannot be compared with anything and so are never regressions.
     failing_without_baseline: list[str] = field(default_factory=list)
@@ -440,10 +446,12 @@ def compare_runs(
             if f is None:
                 if any(_in_module(t, module) for t in after):  # its tests ran this time
                     delta.fixed_by_change.append(module)
-            elif is_external_failure(b.message) or is_external_failure(f.message):
-                delta.no_signal_external.append(module)
             else:
-                delta.no_signal_preexisting.append(module)
+                if is_external_failure(b.message) or is_external_failure(f.message):
+                    delta.no_signal_external.append(module)
+                else:
+                    delta.no_signal_preexisting.append(module)
+                delta.no_signal_messages[module] = {"baseline": b.message, "fixed": f.message}
             continue
         f = after.get(test_id)
         if f is None:
@@ -464,10 +472,12 @@ def compare_runs(
                 delta.fixed_by_change.append(test_id)
             elif f.outcome == "skipped":
                 delta.newly_skipped.append(test_id)
-            elif is_external_failure(b.message) or is_external_failure(f.message):
-                delta.no_signal_external.append(test_id)
             else:
-                delta.no_signal_preexisting.append(test_id)
+                if is_external_failure(b.message) or is_external_failure(f.message):
+                    delta.no_signal_external.append(test_id)
+                else:
+                    delta.no_signal_preexisting.append(test_id)
+                delta.no_signal_messages[test_id] = {"baseline": b.message, "fixed": f.message}
 
     for test_id, f in after.items():
         if test_id in before or _is_collection_error(f, runner):
@@ -605,6 +615,22 @@ def review_by_hand(
                 }
             )
     return out
+
+
+def _why_failing(delta: TestDelta, test_id: str) -> str:
+    """ ": <first line of the original run's failure message>" for a no-signal test, or ""."""
+    message = delta.no_signal_messages.get(test_id, {}).get("baseline", "")
+    lines = [line.strip() for line in message.splitlines() if line.strip()]
+    if lines and lines[0] == PYTEST_COLLECTION_FAILURE and len(lines) > 1:
+        lines = lines[1:]  # pytest's JUnit message for every collection error says only that
+    if not lines:
+        return ""
+    head = (
+        lines[0]
+        if len(lines[0]) <= MESSAGE_HEAD_CHARS
+        else lines[0][: MESSAGE_HEAD_CHARS - 3] + "..."
+    )
+    return f": {_code(head)}"
 
 
 def _code(text: str) -> str:
@@ -1362,7 +1388,7 @@ def _report(v: Verification) -> str:
             "",
             "These fail with and without the fix, so they are not counted as passes.",
             "",
-        ] + _bullets([f"`{t}`: {why}" for t, why in no_signal])
+        ] + _bullets([f"`{t}`: {why}{_why_failing(d, t)}" for t, why in no_signal])
         out.append("")
     if d.failing_without_baseline:
         out += [

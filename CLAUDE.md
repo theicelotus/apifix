@@ -386,6 +386,11 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   before and after -> `no_signal_preexisting` (or `no_signal_external`); before only, with
   tests of the module run after -> `fixed_by_change`; after only -> `collection_error`
   (reject). `PYTEST_ADDOPTS` and plugins that stop sessions are not read.
+- No-signal tests keep both runs' failure messages (`tests.no_signal_messages`, clipped at
+  parsing like every message, 500 characters); the report shows the first line of the
+  original's, skipping pytest's bare "collection failure" line, at most 160 characters. With
+  the unittest runner (only from a caller's plan) that line is "Traceback (most recent call
+  last):", not the error.
 - Flakiness: newly failing tests are rerun once (whole test phase); a regression that fails
   intermittently can pass the rerun and be reported as flaky.
 - When the fixed code's tests never ran (install failed, test phase did not start), there is
