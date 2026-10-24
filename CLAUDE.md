@@ -238,6 +238,20 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   `delta.get("content")` are not recognised. The 1.x form is flagged too (`hasattr` is always
   true there), so a repo already on 1.x with such a check has a non-test finding and is not
   `already_migrated`; the verifier's completeness check also sees one left in a fix.
+  Not flagged: `"content" [not] in D` where D is known to be a dict (`hasattr` stays flagged):
+  inside a dict guard, `isinstance(G, dict | Mapping | MutableMapping)` (any module prefix, or
+  a tuple of only those), on D itself or on the name D is read from through subscripts /
+  attributes (names assigned in the guarded code, else anywhere in the scope); guards: the
+  `if` / `elif` body, the `else` of `if not isinstance(...)`, statements after `if not
+  isinstance(...): continue` (break / return / raise), later operands of `isinstance(...) and
+  ...`, a conditional expression's first branch. Or D derives (every value of each name) from
+  `json.loads` / `json.load` (not of `model_dump_json()` without exclude flags), `to_dict()` /
+  `to_json()` (openai's default leaves unset fields out; not with `exclude_unset=False`), or
+  `model_dump(exclude_unset=True | exclude_none=True)`. Still flagged: plain `model_dump()`
+  (keeps `content: None`), TypedDict annotations (0.x code annotates its dict chunks, e.g.
+  genai's `Iterator[StreamCompletion]`), `dict(delta)`, `type(x) is dict`. Known miss: 0.x
+  code whose only stream handling sits under `isinstance(chunk, dict)` (0.x chunks were dict
+  subclasses; in 1.x the branch never runs) loses that finding; its call is still flagged.
 - No `getattr(openai, ...)` or other dynamic-attribute detection.
 - String references (e.g. `mock.patch` targets) are found with any module prefix
   (`app.openai.ChatCompletion.create`, `src.x.openai.error.RateLimitError`; [likely]), unless
@@ -728,7 +742,9 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   delta's content always exists and is None on role and final chunks, so `<check>` must become
   `if <delta>.content is not None:` (or `<delta>.content or ""`)". Exempt: the same check text
   already in an original without an openai import (another SDK's stream; the scanner reports
-  none there). `if delta.content:` passes (it skips "" too). Whole-file mode only; agent mode
+  none there), and `in` checks on deltas known to be dicts (the scanner's exemptions above:
+  genai-gptoss-7's `if isinstance(chunk, dict):` branch for the 0.x mocks). `if delta.content:`
+  passes (it skips "" too). Whole-file mode only; agent mode
   and `apifix verify` rely on the verifier's completeness check (the scanner finding).
 - Undefined names (`code_checks.py`, Python files): pyflakes `UndefinedName` messages only, and
   only names the original did not already use undefined (star imports and builtins never

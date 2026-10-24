@@ -102,6 +102,161 @@ def test_other_key_checks_and_scopes_are_not_deltas():
     )
 
 
+# --- deltas known to be dicts (docs/plans/genai-run-7.md) ---------------------------------------
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # genai-gptoss-7's rewrite: a branch for dict-shaped chunks, the object form after it
+        """
+        if isinstance(chunk, dict):
+            delta = chunk["choices"][0]["delta"]
+            if "content" in delta:
+                yield delta["content"]
+            continue
+        delta = chunk.choices[0].delta
+        if delta.content is not None:
+            yield delta.content
+        """,
+        """
+        delta = chunk["choices"][0]["delta"]
+        if isinstance(delta, collections.abc.Mapping) and "content" in delta:
+            yield delta["content"]
+        """,
+        """
+        if not isinstance(chunk, (dict, Mapping)):
+            yield chunk.choices[0].delta.content or ""
+        else:
+            choice = chunk["choices"][0]
+            yield choice["delta"]["content"] if "content" in choice["delta"] else ""
+        """,
+        """
+        if not isinstance(chunk, typing.MutableMapping):
+            continue
+        delta = chunk["choices"][0]["delta"]
+        if "content" not in delta:
+            continue
+        """,
+        """
+        if chunk is None:
+            continue
+        elif isinstance(chunk, dict):
+            if "content" in chunk["choices"][0]["delta"]:
+                yield chunk["choices"][0]["delta"]["content"]
+        """,
+        """
+        delta = chunk["choices"][0]["delta"]
+        yield delta["content"] if isinstance(delta, dict) and "content" in delta else ""
+        """,
+    ],
+)
+def test_key_checks_on_dict_guarded_deltas_are_not_flagged(body):
+    source = "def deltas(stream):\n    for chunk in stream:\n" + textwrap.indent(
+        textwrap.dedent(body).strip("\n"), "        "
+    )
+    assert checks_in(source) == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        # parsed from the wire, as 0.x's dicts were: content only when it has a value
+        """
+        def deltas(lines):
+            for line in lines:
+                data = json.loads(line)
+                if "content" in data["choices"][0]["delta"]:
+                    yield data["choices"][0]["delta"]["content"]
+        """,
+        """
+        def deltas(stream):
+            for chunk in stream:
+                delta = chunk.to_dict()["choices"][0]["delta"]
+                if "content" in delta:
+                    yield delta["content"]
+        """,
+        """
+        def deltas(stream):
+            for chunk in stream:
+                for choice in chunk.model_dump(exclude_none=True)["choices"]:
+                    if "content" in choice["delta"]:
+                        yield choice["delta"]["content"]
+        """,
+        """
+        def deltas(stream):
+            for chunk in stream:
+                delta = json.loads(chunk.to_json())["choices"][0]["delta"]
+                if "content" in delta:
+                    yield delta["content"]
+        """,
+    ],
+)
+def test_key_checks_on_deltas_from_dict_sources_are_not_flagged(source):
+    assert checks_in(source) == []
+
+
+def test_key_checks_that_are_not_known_dicts_stay_flagged():
+    assert [
+        line
+        for line, _, _ in checks_in(
+            """
+            from typing import Iterator, TypedDict
+
+            Delta = TypedDict("Delta", {"content": str})
+            Chunk = TypedDict("Chunk", {"choices": list})
+
+            def a(completion: Iterator[Chunk]):  # an annotation: 0.x code carries these
+                for chunk in completion:
+                    delta: Delta = chunk["choices"][0]["delta"]
+                    if "content" in delta:
+                        yield delta["content"]
+
+            def b(stream):
+                for chunk in stream:
+                    if isinstance(chunk, dict):
+                        continue
+                    if hasattr(chunk.choices[0].delta, "content"):  # objects past the guard
+                        yield chunk.choices[0].delta.content
+                    delta = chunk.choices[0].delta
+                    if "content" in delta:  # after a guard that skips dicts
+                        yield delta.content
+
+            def c(stream, other):
+                for chunk in stream:
+                    delta = chunk["choices"][0]["delta"]
+                    if isinstance(other, dict) and "content" in delta:  # another name
+                        yield 1
+                    if isinstance(chunk, (dict, Model)) and "content" in delta:  # not only dicts
+                        yield 2
+                    if isinstance(chunk, dict):
+                        pass
+                    else:
+                        if "content" in delta:  # the non-dict branch
+                            yield 3
+
+            def d(stream):
+                for chunk in stream:
+                    # model_dump() keeps content: None, as do to_dict(exclude_unset=False) and a
+                    # JSON dump that keeps None
+                    if "content" in chunk.model_dump()["choices"][0]["delta"]:
+                        yield 1
+                    if "content" in chunk.to_dict(exclude_unset=False)["choices"][0]["delta"]:
+                        yield 2
+                    if "content" in json.loads(chunk.model_dump_json())["choices"][0]["delta"]:
+                        yield 3
+
+            def e(stream):
+                for chunk in stream:
+                    delta = chunk["choices"][0]["delta"]  # one value is a dict, one is not
+                    delta = json.loads(chunk["choices"][0]["delta"]) if chunk else delta
+                    if "content" in delta:
+                        yield 1
+            """
+        )
+    ] == [10, 17, 20, 26, 28, 33, 40, 42, 44, 51]
+
+
 # --- scanner ------------------------------------------------------------------------------------
 
 
@@ -277,6 +432,35 @@ def test_check_candidate_records_the_streaming_check():
     bad = checked(migrated('if hasattr(delta, "content"):'))
     assert bad.error_checks == ["streaming"]
     assert bad.checks["streaming"] == bad.errors[0]
+
+
+def both_styles() -> str:
+    """genai-gptoss-7's rewrite of deltas(): dict-shaped chunks (the 0.x mocks) kept in a branch."""
+    return migrated().replace(
+        "    for chunk in completion:\n        delta = chunk.choices[0].delta\n",
+        "    for chunk in completion:\n"
+        "        if isinstance(chunk, dict):\n"
+        '            delta = chunk["choices"][0]["delta"]\n'
+        '            if "content" in delta:\n'
+        '                yield delta["content"]\n'
+        "            continue\n"
+        "        delta = chunk.choices[0].delta\n",
+    )
+
+
+def test_a_branch_for_dict_chunks_passes_the_check_and_leaves_no_finding(tmp_path):
+    text = both_styles()
+    assert 'if "content" in delta:' in text and "if delta.content is not None:" in text
+    assert stream_check_errors(GENERATE, ORIGINAL, text) == []
+    repo = tmp_path / "repo"
+    shutil.copytree(FIXTURE, repo)
+    (repo / GENERATE).write_text(text)
+    # the verifier's completeness check scans the fixed tree: no finding is left there
+    assert not [f for f in scan(repo, "openai-v1").findings if f.file == GENERATE]
+    # the same branch around the original 0.x key check, without a guard, is still flagged
+    unguarded = text.replace("        if isinstance(chunk, dict):\n", "        if chunk:\n")
+    (error,) = stream_check_errors(GENERATE, ORIGINAL, unguarded)
+    assert error.startswith("line 18: in 1.x a stream delta's content always exists")
 
 
 # --- whole-file mode ----------------------------------------------------------------------------

@@ -8,16 +8,27 @@ dict). A delta is recognised by its shape, 0.x or 1.x form: `<x>.choices[i].delt
 `<c>["delta"]` where `c` was assigned from `<x>.choices[i]` or bound by `for c in <x>.choices`.
 Names are per function scope and flow-insensitive. Used by the scanner (0.x code) and the
 `streaming` rewrite check (whole-file mode).
+
+`"content" [not] in D` is left alone where D is known to be a dict, since a key check is the
+right test there: inside a dict guard (`isinstance(G, dict)`, `Mapping`, `MutableMapping`, a
+tuple of those) on D or on the name D is read from by subscripts/attributes (a 1.x rewrite that
+keeps a branch for dict-shaped chunks), or when D comes from `json.loads` / `json.load`, from
+`to_dict()` (openai leaves out unset fields) or from `model_dump(exclude_unset=True |
+exclude_none=True)`. A plain `model_dump()` keeps `content: None`, so it stays flagged, and so
+does a TypedDict annotation, which the 0.x code itself carries for its dict chunks.
 """
 
 from __future__ import annotations
 
 import ast
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 
 _MAX_SOURCE = 80
 _SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+_DICT_TYPES = frozenset({"dict", "Mapping", "MutableMapping"})
+_EXITS = (ast.Continue, ast.Break, ast.Return, ast.Raise)
+_DEPTH = 5  # name -> value steps followed back to a dict
 
 
 @dataclass(frozen=True)
@@ -119,15 +130,170 @@ class _Scope:
         )
 
 
+# --- deltas known to be dicts ---------------------------------------------------------------
+
+
+def _dict_type(node: ast.AST) -> bool:
+    if isinstance(node, ast.Tuple):
+        return bool(node.elts) and all(_dict_type(e) for e in node.elts)
+    name = node.attr if isinstance(node, ast.Attribute) else getattr(node, "id", None)
+    return name in _DICT_TYPES
+
+
+def _guarded(test: ast.AST) -> set[str]:
+    """Names a true `test` shows to be dicts: `isinstance(x, dict)`, also inside `and`."""
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+        return set().union(*(_guarded(v) for v in test.values))
+    if (
+        isinstance(test, ast.Call)
+        and isinstance(test.func, ast.Name)
+        and test.func.id == "isinstance"
+        and len(test.args) == 2
+        and isinstance(test.args[0], ast.Name)
+        and _dict_type(test.args[1])
+    ):
+        return {test.args[0].id}
+    return set()
+
+
+def _negated(test: ast.AST) -> set[str]:
+    """Names a false `test` shows to be dicts: `not isinstance(x, dict)`."""
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        return _guarded(test.operand)
+    return set()
+
+
+def _guards(node: ast.AST, parents: dict[int, ast.AST]) -> list[tuple[set[str], list[ast.AST]]]:
+    """(dict-guarded names, the guarded code) for each guard around `node` in its scope: the
+    body of `if isinstance(x, dict):` (the else of `if not isinstance(...)`), statements after
+    `if not isinstance(x, dict): continue` (or break / return / raise), later operands of
+    `isinstance(x, dict) and ...`, the first branch of a conditional expression."""
+    out: list[tuple[set[str], list[ast.AST]]] = []
+    child = node
+    while (parent := parents.get(id(child))) is not None and not isinstance(parent, _SCOPES):
+        if isinstance(parent, ast.If | ast.IfExp):
+            body = parent.body if isinstance(parent.body, list) else [parent.body]
+            orelse = parent.orelse if isinstance(parent.orelse, list) else [parent.orelse]
+            if any(child is b for b in body):
+                out.append((_guarded(parent.test), body))
+            elif any(child is b for b in orelse):
+                out.append((_negated(parent.test), orelse))
+        elif isinstance(parent, ast.BoolOp) and isinstance(parent.op, ast.And):
+            i = next(i for i, v in enumerate(parent.values) if v is child)
+            out.append((set().union(*(_guarded(v) for v in parent.values[:i])), [parent]))
+        for field in ("body", "orelse", "finalbody"):
+            stmts = getattr(parent, field, None)
+            if not isinstance(stmts, list) or not any(child is s for s in stmts):
+                continue
+            i = next(i for i, s in enumerate(stmts) if s is child)
+            for j, s in enumerate(stmts[:i]):
+                if isinstance(s, ast.If) and not s.orelse and isinstance(s.body[-1], _EXITS):
+                    out.append((_negated(s.test), stmts[j + 1 :]))
+        child = parent
+    return [(names, code) for names, code in out if names]
+
+
+def _assignments(nodes: Iterable[ast.AST]) -> dict[str, list[ast.AST]]:
+    """name -> the values assigned to it (for a loop target: what it iterates)."""
+    out: dict[str, list[ast.AST]] = {}
+    for node in nodes:
+        pairs: list[tuple[ast.AST, ast.AST]] = []
+        if isinstance(node, ast.Assign):
+            pairs = [(t, node.value) for t in node.targets]
+        elif isinstance(node, ast.AnnAssign | ast.NamedExpr) and node.value is not None:
+            pairs = [(node.target, node.value)]
+        elif isinstance(node, ast.For | ast.AsyncFor | ast.comprehension):
+            pairs = [(node.target, node.iter)]
+        for target, value in pairs:
+            if isinstance(target, ast.Name):
+                out.setdefault(target.id, []).append(value)
+    return out
+
+
+def _flag(call: ast.Call, name: str, default: bool) -> bool:
+    for kw in call.keywords:
+        if kw.arg == name:
+            return isinstance(kw.value, ast.Constant) and kw.value.value is True
+    return default
+
+
+def _dict_source(node: ast.AST) -> bool:
+    """A call whose result holds `content` only when it has a value (as 0.x's dicts did):
+    json.loads / json.load (of anything but a dump that keeps None), to_dict() / to_json()
+    unless exclude_unset=False, model_dump() / model_dump_json() with exclude_unset=True or
+    exclude_none=True."""
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+        return False
+    func = node.func
+    if isinstance(func.value, ast.Name) and func.value.id == "json":
+        if func.attr not in ("loads", "load") or len(node.args) != 1:
+            return False
+        arg = node.args[0]
+        dump = isinstance(arg, ast.Call) and isinstance(arg.func, ast.Attribute)
+        if dump and arg.func.attr in ("model_dump_json", "to_json"):  # type: ignore[union-attr]
+            return _dict_source(arg)
+        return True
+    none = _flag(node, "exclude_none", False)
+    if func.attr in ("to_dict", "to_json"):
+        return none or _flag(node, "exclude_unset", True)
+    if func.attr in ("model_dump", "model_dump_json"):
+        return none or _flag(node, "exclude_unset", False)
+    return False
+
+
+def _derives(
+    node: ast.AST,
+    is_root: Callable[[ast.AST], bool],
+    near: dict[str, list[ast.AST]],
+    scope: dict[str, list[ast.AST]],
+    depth: int = _DEPTH,
+) -> bool:
+    """`node`, stripped of subscripts and attributes, is a root, or a name every value of
+    which derives from one (values assigned in the guarded code if any, else in the scope)."""
+    while isinstance(node, ast.Subscript | ast.Attribute):
+        node = node.value
+    if is_root(node):
+        return True
+    if not isinstance(node, ast.Name) or depth == 0:
+        return False
+    values = near.get(node.id) or scope.get(node.id) or []
+    return bool(values) and all(_derives(v, is_root, near, scope, depth - 1) for v in values)
+
+
+def _known_dict(
+    check: ast.AST, delta: ast.AST, parents: dict[int, ast.AST], scope: dict[str, list[ast.AST]]
+) -> bool:
+    if _derives(delta, _dict_source, {}, scope):
+        return True
+    for names, code in _guards(check, parents):
+        near = _assignments(n for c in code for n in _own_nodes(c))
+        guard = lambda n, names=names: isinstance(n, ast.Name) and n.id in names  # noqa: E731
+        if _derives(delta, guard, near, scope):
+            return True
+    return False
+
+
+def _own_nodes(node: ast.AST) -> Iterator[ast.AST]:
+    """`node` and its descendants, without nested scopes."""
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        yield cur
+        stack += [c for c in ast.iter_child_nodes(cur) if not isinstance(c, _SCOPES)]
+
+
 def _is_content(node: ast.AST) -> bool:
     return isinstance(node, ast.Constant) and node.value == "content"
 
 
 def content_checks(tree: ast.Module, text: str) -> list[ContentCheck]:
-    """Every `hasattr(<delta>, "content")` and `"content" [not] in <delta>`, in source order."""
+    """Every `hasattr(<delta>, "content")` and `"content" [not] in <delta>`, in source order,
+    except `in` checks on a delta known to be a dict (module docstring)."""
+    parents = {id(c): p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
     out = []
     for nodes in _scopes(tree):
         scope = _Scope(nodes)
+        assigned: dict[str, list[ast.AST]] | None = None
         for node in nodes:
             delta: ast.AST | None = None
             if (
@@ -145,6 +311,10 @@ def content_checks(tree: ast.Module, text: str) -> list[ContentCheck]:
                 and _is_content(node.left)
             ):
                 delta = node.comparators[0]
+                if scope.delta(delta):
+                    assigned = assigned if assigned is not None else _assignments(nodes)
+                    if _known_dict(node, delta, parents, assigned):
+                        continue
             if delta is not None and scope.delta(delta):
                 out.append(ContentCheck(node, _source(node, text), _source(delta, text)))  # type: ignore[arg-type]
     return sorted(out, key=lambda c: (c.node.lineno, c.node.col_offset))
