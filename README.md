@@ -343,6 +343,7 @@ their code, the diff and the trajectory are copied here only when the repo's lic
 | 2026-10-23 | [HCAI-Lab-GT/SuspensePerception](https://github.com/HCAI-Lab-GT/SuspensePerception) | `openai/gpt-oss-120b` (hosted free tier, $0) | whole-file | hosted | 1 | 271 s | 16,168 | verified_weak | not published (repo has no license) |
 | 2026-10-23 | [biobootloader/wolverine](https://github.com/biobootloader/wolverine) | `openai/gpt-oss-120b` (hosted free tier, $0) | whole-file | hosted | 1 | 153 s | 17,571 | verified | [folder](benchmark/live/2026-10-23-wolverine-gptoss/) |
 | 2026-10-23 | [openai/bugbounty-gpt](https://github.com/openai/bugbounty-gpt) | `openai/gpt-oss-120b` (hosted free tier, $0) | whole-file | hosted | 1 | 317 s | 13,972 | verified | [folder](benchmark/live/2026-10-23-bugbounty-gpt-gptoss/) |
+| 2026-10-24 | [rgbkrk/genai](https://github.com/rgbkrk/genai) | `openai/gpt-oss-120b` (hosted free tier, $0) | whole-file | hosted | 1 | 579 s | 43,599 | verified | [folder](benchmark/live/2026-10-24-genai-gptoss/) |
 
 2026-10-22: a Flask app on openai 0.28.1, CRLF line endings, tests in `backend/testapp.py`.
 Time: LLM 57 s, sandbox 82 s with the pip cache warm. All 8 findings resolved, 100%
@@ -377,6 +378,18 @@ Poetry dependencies and `poetry.lock`. Time: LLM 54 s (40 s of it rate-limit wai
 255 s, mostly first-time downloads. 25 of 25 tests pass before and after the fix and run every
 changed line. apifix set the Poetry pin `openai = "0.28.1"` -> `">=1.0,<2"` itself and noted
 `poetry.lock` for regenerating.
+
+2026-10-24 (genai): a BSD-3-Clause IPython extension that asks GPT for help with code,
+DataFrames and exceptions, with Poetry dependencies and `poetry.lock`. This repo drove region
+edits ([plan](docs/plans/region-edits.md)), the streaming checks and the mock-target suggestions
+(genai runs [3](docs/plans/genai-run-3.md), [4](docs/plans/genai-run-4.md), [5](docs/plans/genai-run-5.md), [6](docs/plans/genai-run-6.md), [7](docs/plans/genai-run-7.md), [8](docs/plans/genai-run-8.md), [9](docs/plans/genai-run-9.md)).
+Time: LLM 400 s (155 s of it rate-limit waits and 90 s waiting out dropped connections), sandbox
+176 s. 38 tests pass before and after the fix; 6 others need the network or were already failing,
+so they count as no signal. The tests run 92% of the changed lines, and all 24 findings are
+resolved: 23 in 5 Python files, plus the pin. Two test files over 8 KB were sent as regions. The
+streaming code checks `delta.content is not None`. apifix set the Poetry pin
+`openai = "^0.27.0"` -> `">=1.55.3,<2"` itself, noted `poetry.lock` for regenerating, and
+reverted two stray comment edits the model made.
 
 `verified_weak` means the tests pass but do not exercise the migrated code, so the fix still
 needs a human review.

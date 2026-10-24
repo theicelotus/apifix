@@ -1,0 +1,499 @@
+diff --git a/genai/generate.py b/genai/generate.py
+--- a/genai/generate.py
++++ b/genai/generate.py
+@@ -1,6 +1,6 @@
+ from typing import Any, Dict, Iterator, List, TypedDict
+ 
+-import openai
++from openai import OpenAI
+ 
+ from genai.prompts import PromptStore
+ 
+@@ -13,7 +13,8 @@
+ 
+ 
+ def content(completion: Completion):
+-    return completion["choices"][0]["message"]["content"]
++    # In OpenAI 1.x the response is an object, not a dict.
++    return completion.choices[0].message.content  # type: ignore[attr-defined]
+ 
+ 
+ Delta = TypedDict(
+@@ -39,11 +40,15 @@
+ )
+ 
+ 
+-def deltas(completion: Iterator[StreamCompletion]) -> Iterator[str]:
++def deltas(completion: Iterator[Any]) -> Iterator[str]:
+     for chunk in completion:
+-        delta = chunk["choices"][0]["delta"]
+-        if "content" in delta:
+-            yield delta["content"]
++        # Some chunks may have an empty `choices` list (e.g., Azure first chunk or final usage chunk)
++        if not getattr(chunk, "choices", []):
++            continue
++        delta = chunk.choices[0].delta
++        # In 1.x `delta.content` is always present; it is `None` for role‑only or final chunks
++        if delta.content is not None:
++            yield delta.content
+ 
+ 
+ def generate_next_from_history(
+@@ -51,7 +56,8 @@
+     text: str,
+     stream: bool = False,
+ ) -> Iterator[str]:
+-    response = openai.ChatCompletion.create(
++    client = OpenAI()
++    response = client.chat.completions.create(
+         model="gpt-3.5-turbo",
+         messages=[
+             # Establish the context of the conversation
+@@ -111,7 +117,8 @@
+         },
+     )
+ 
+-    response = openai.ChatCompletion.create(
++    client = OpenAI()
++    response = client.chat.completions.create(
+         model="gpt-3.5-turbo",
+         messages=messages,
+         stream=stream,
+diff --git a/pyproject.toml b/pyproject.toml
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -33,7 +33,7 @@
+ 
+ [tool.poetry.dependencies]
+ python = "^3.8"
+-openai = "^0.27.0"
++openai = ">=1.55.3,<2"
+ ipython = "^8.10.0"
+ tabulate = "^0.9.0"
+ tiktoken = "^0.3.2"
+diff --git a/tests/test_context.py b/tests/test_context.py
+--- a/tests/test_context.py
++++ b/tests/test_context.py
+@@ -2,6 +2,7 @@
+ 
+ import pandas as pd
+ import pytest
++from types import SimpleNamespace
+ 
+ from genai.context import (
+     PastAssists,
+@@ -149,21 +150,30 @@
+     assert markdown_repr == expected
+ 
+ 
+-@patch(
+-    "openai.ChatCompletion.create",
+-    return_value={
+-        "choices": [
+-            {
+-                "message": {
+-                    "role": "assistant",
+-                    "content": "superplot(df)",
+-                },
+-            },
+-        ],
+-    },
+-    autospec=True,
+-)
+-def test_build_context_assistance(create, ip):
++@patch("genai.generate.OpenAI")
++def test_build_context_assistance(OpenAIMock, ip):
++    # Prepare mock responses as SimpleNamespace objects
++    first_resp = SimpleNamespace(
++        choices=[
++            SimpleNamespace(
++                message=SimpleNamespace(role="assistant", content="superplot(df)")
++            )
++        ]
++    )
++    second_resp = SimpleNamespace(
++        choices=[
++            SimpleNamespace(
++                message=SimpleNamespace(
++                    role="assistant", content="You should probably define b"
++                )
++            )
++        ]
++    )
++    OpenAIMock.return_value.chat.completions.create.side_effect = [
++        first_resp,
++        second_resp,
++    ]
++
+     # Test build_context with assistance
+     ip.run_cell("a = 1", store_history=True)
+     ip.run_cell(
+@@ -174,16 +184,6 @@
+ """.strip(),
+         store_history=True,
+     )
+-    create.return_value = {
+-        "choices": [
+-            {
+-                "message": {
+-                    "role": "assistant",
+-                    "content": "You should probably define b",
+-                },
+-            },
+-        ],
+-    }
+     ip.run_cell("a * b", store_history=True)
+ 
+     context = build_context(ip.history_manager)
+diff --git a/tests/test_generate.py b/tests/test_generate.py
+--- a/tests/test_generate.py
++++ b/tests/test_generate.py
+@@ -1,39 +1,34 @@
+ import sys
+ from unittest import mock
++from types import SimpleNamespace
+ 
+ from genai import generate
+ 
+ 
+ def mock_deltas():
+-    yield {
+-        "choices": [
+-            {
+-                "delta": {
+-                    "role": "assistant",
+-                    "content": "Here's",
+-                },
+-            },
++    yield SimpleNamespace(
++        choices=[
++            SimpleNamespace(
++                delta=SimpleNamespace(role="assistant", content="Here's")
++            )
+         ]
+-    }
+-
+-    yield {
+-        "choices": [
+-            {
+-                "delta": {
+-                    "role": "assistant",
+-                    "content": "Something",
+-                },
+-            },
++    )
++    yield SimpleNamespace(
++        choices=[
++            SimpleNamespace(
++                delta=SimpleNamespace(role="assistant", content="Something")
++            )
+         ]
+-    }
++    )
+ 
+ 
+-@mock.patch(
+-    "openai.ChatCompletion.create",
+-    return_value=mock_deltas(),
+-    autospec=True,
+-)
+-def test_generate_exception_suggestion(create):
++@mock.patch("genai.generate.OpenAI")
++def test_generate_exception_suggestion(OpenAI):
++    # Set up a mock OpenAI client that returns our mock streaming chunks
++    mock_client = mock.Mock()
++    OpenAI.return_value = mock_client
++    mock_client.chat.completions.create.return_value = mock_deltas()
++
+     try:
+         raise Exception("this is just a test")
+     except Exception:
+diff --git a/tests/test_magics.py b/tests/test_magics.py
+--- a/tests/test_magics.py
++++ b/tests/test_magics.py
+@@ -1,28 +1,26 @@
+ from unittest import mock
++from types import SimpleNamespace
+ 
+ from genai.context import PastAssists
+ from genai.prompts import PromptStore
+ 
+ 
+-@mock.patch(
+-    "openai.ChatCompletion.create",
+-    return_value={
+-        "choices": [
+-            {
+-                "message": {
+-                    "role": "assistant",
+-                    "content": "Here's a suggestion",
+-                },
+-            },
+-        ],
+-    },
+-    autospec=True,
+-)
+-def test_assist_magic(create, ip):
++@mock.patch("genai.generate.OpenAI")
++def test_assist_magic(OpenAI, ip):
++    # Mock the client and its response
++    mock_client = OpenAI.return_value
++    mock_client.chat.completions.create.return_value = SimpleNamespace(
++        choices=[
++            SimpleNamespace(
++                message=SimpleNamespace(role="assistant", content="Here's a suggestion")
++            )
++        ]
++    )
++
+     ip.run_cell_magic(magic_name="assist", line="", cell="create a scatterplot from df")
+ 
+     # Check that create was called with the correct arguments
+-    create.assert_called_once_with(
++    mock_client.chat.completions.create.assert_called_once_with(
+         model="gpt-3.5-turbo",
+         messages=[
+             {
+@@ -38,21 +36,18 @@
+     )
+ 
+ 
+-@mock.patch(
+-    "openai.ChatCompletion.create",
+-    return_value={
+-        "choices": [
+-            {
+-                "message": {
+-                    "role": "assistant",
+-                    "content": "just like code better",
+-                },
+-            },
+-        ],
+-    },
+-    autospec=True,
+-)
+-def test_assist_magic_with_args(create, ip):
++@mock.patch("genai.generate.OpenAI")
++def test_assist_magic_with_args(OpenAI, ip):
++    # Mock the client and its response
++    mock_client = OpenAI.return_value
++    mock_client.chat.completions.create.return_value = SimpleNamespace(
++        choices=[
++            SimpleNamespace(
++                message=SimpleNamespace(role="assistant", content="just like code better")
++            )
++        ]
++    )
++
+     ip.run_cell_magic(
+         magic_name="assist",
+         line="--verbose",
+@@ -61,7 +56,7 @@
+     execution_count = ip.execution_count
+ 
+     # Check that create was called with the correct arguments
+-    create.assert_called_once_with(
++    mock_client.chat.completions.create.assert_called_once_with(
+         model="gpt-3.5-turbo",
+         messages=[
+             {
+@@ -82,28 +77,25 @@
+     assert assist.message == "just like code better"
+ 
+ 
+-@mock.patch(
+-    "openai.ChatCompletion.create",
+-    return_value={
+-        "choices": [
+-            {
+-                "message": {
+-                    "role": "assistant",
+-                    "content": "superplot(df)",
+-                },
+-            },
+-        ],
+-    },
+-    autospec=True,
+-)
+-def test_assist_magic_with_fresh_arg(create, ip):
++@mock.patch("genai.generate.OpenAI")
++def test_assist_magic_with_fresh_arg(OpenAI, ip):
++    # Mock the client and its response
++    mock_client = OpenAI.return_value
++    mock_client.chat.completions.create.return_value = SimpleNamespace(
++        choices=[
++            SimpleNamespace(
++                message=SimpleNamespace(role="assistant", content="superplot(df)")
++            )
++        ]
++    )
++
+     ip.run_cell_magic(
+         magic_name="assist",
+         line="--fresh",
+         cell="create a scatterplot from df",
+     )
+ 
+-    create.assert_called_once_with(
++    mock_client.chat.completions.create.assert_called_once_with(
+         model="gpt-3.5-turbo",
+         messages=[
+             {
+diff --git a/tests/test_suggestions.py b/tests/test_suggestions.py
+--- a/tests/test_suggestions.py
++++ b/tests/test_suggestions.py
+@@ -1,5 +1,6 @@
+ import sys
+ from unittest import mock
++from types import SimpleNamespace
+ 
+ from genai import suggestions
+ from genai.context import PastErrors
+@@ -18,21 +19,21 @@
+     "IPython.core.display_functions.display",
+     autospec=True,
+ )
+-@mock.patch(
+-    "openai.ChatCompletion.create",
+-    return_value={
+-        "choices": [
+-            {
+-                "message": {
+-                    "role": "assistant",
+-                    "content": "Here's a suggestion",
+-                },
+-            },
+-        ],
+-    },
+-    autospec=True,
+-)
+-def test_custom_exc(create, display, ip):
++@mock.patch("genai.generate.OpenAI")
++def test_custom_exc(OpenAI, display, ip):
++    # configure the mock response
++    OpenAI.return_value.chat.completions.create.return_value = SimpleNamespace(
++        choices=[
++            SimpleNamespace(
++                message=SimpleNamespace(
++                    role="assistant",
++                    content="Here's a suggestion",
++                )
++            )
++        ]
++    )
++    create = OpenAI.return_value.chat.completions.create
++
+     try:
+         raise Exception("this is just a test")
+     except Exception:
+@@ -92,21 +93,21 @@
+     "IPython.core.display_functions.display",
+     autospec=True,
+ )
+-@mock.patch(
+-    "openai.ChatCompletion.create",
+-    return_value={
+-        "choices": [
+-            {
+-                "message": {
+-                    "role": "assistant",
+-                    "content": "Here's a suggestion",
+-                },
+-            },
+-        ],
+-    },
+-    autospec=True,
+-)
+-def test_custom_exc_fallback_on_In(create, display, ip):
++@mock.patch("genai.generate.OpenAI")
++def test_custom_exc_fallback_on_In(OpenAI, display, ip):
++    # configure the mock response
++    OpenAI.return_value.chat.completions.create.return_value = SimpleNamespace(
++        choices=[
++            SimpleNamespace(
++                message=SimpleNamespace(
++                    role="assistant",
++                    content="Here's a suggestion",
++                )
++            )
++        ]
++    )
++    create = OpenAI.return_value.chat.completions.create
++
+     try:
+         raise Exception("this is just a test")
+     except Exception:
+@@ -160,21 +161,21 @@
+     "IPython.core.display_functions.display",
+     autospec=True,
+ )
+-@mock.patch(
+-    "openai.ChatCompletion.create",
+-    return_value={
+-        "choices": [
+-            {
+-                "message": {
+-                    "role": "assistant",
+-                    "content": "When you hear 'aaaaaa' you know it's the intro to a 90s Nickolodeon show about monsters.",
+-                },
+-            },
+-        ],
+-    },
+-    autospec=True,
+-)
+-def test_custom_exc_long_traceback(create, display, ip):
++@mock.patch("genai.generate.OpenAI")
++def test_custom_exc_long_traceback(OpenAI, display, ip):
++    # configure the mock response
++    OpenAI.return_value.chat.completions.create.return_value = SimpleNamespace(
++        choices=[
++            SimpleNamespace(
++                message=SimpleNamespace(
++                    role="assistant",
++                    content="When you hear 'aaaaaa' you know it's the intro to a 90s Nickolodeon show about monsters.",
++                )
++            )
++        ]
++    )
++    create = OpenAI.return_value.chat.completions.create
++
+     try:
+         raise Exception("a" * 2000)
+     except Exception:
+@@ -240,21 +241,21 @@
+     autospec=True,
+ )
+ @mock.patch("builtins.print")
+-@mock.patch(
+-    "openai.ChatCompletion.create",
+-    return_value={
+-        "choices": [
+-            {
+-                "message": {
+-                    "role": "assistant",
+-                    "content": "Here's a suggestion",
+-                },
+-            },
+-        ],
+-    },
+-    autospec=True,
+-)
+-def test_custom_exc_error_inside(create, print, display, ip):
++@mock.patch("genai.generate.OpenAI")
++def test_custom_exc_error_inside(OpenAI, print, display, ip):
++    # configure the mock response (though this test does not inspect it)
++    OpenAI.return_value.chat.completions.create.return_value = SimpleNamespace(
++        choices=[
++            SimpleNamespace(
++                message=SimpleNamespace(
++                    role="assistant",
++                    content="Here's a suggestion",
++                )
++            )
++        ]
++    )
++    # create = OpenAI.return_value.chat.completions.create  # not used directly
++
+     ip.showtraceback = mock.MagicMock()
+ 
+     try:
