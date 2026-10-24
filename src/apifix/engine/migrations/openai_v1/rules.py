@@ -324,10 +324,16 @@ MOCK_RESPONSES: dict[str, str] = {
     "audio.transcriptions.create": 'SimpleNamespace(text="hello")',
 }
 
-# Test files: dict literals shaped like a 0.x response ({"choices": [{"message"/"text": ...}]}).
+# Test files: dict literals shaped like a 0.x response ({"choices": [{"message"/"text": ...}]})
+# or a 0.x stream chunk ({"choices": [{"delta": ...}]}).
 MOCK_DICT_RESPONSE = (
     "1.x responses are objects: build mock responses with attribute access "
     "(e.g. SimpleNamespace), not dicts."
 )
+MOCK_DICT_CHUNK = (
+    "1.x stream chunks are objects: build mock chunks with attribute access (e.g. "
+    "SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=...))])), not dicts."
+)
 RESPONSE_DICT_KEY = "choices"
 RESPONSE_CHOICE_KEYS = frozenset({"message", "text"})
+CHUNK_CHOICE_KEY = "delta"

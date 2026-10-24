@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 import tomllib
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -25,6 +25,39 @@ PRICES_ENV = "APIFIX_PRICES"
 
 class LLMError(RuntimeError):
     """The provider failed (network, auth, rate limit after retries, bad request, ...)."""
+
+
+# An endpoint that answered earlier in the job and now cannot be reached (DNS failure, connection
+# refused or reset) is waited out between tries, these many seconds each, before the request
+# fails. Before its first answer nothing is waited (a server that is not running fails at once).
+OUTAGE_WAITS_S = (30.0, 60.0, 120.0)
+OUTAGE_NOTE = "endpoint unreachable mid-job"
+
+
+class OutageWaits:
+    """A provider's waits for an endpoint that stopped answering mid-job, kept as one job note
+    (`notes`, replaced as the total grows) with the running count and total."""
+
+    def __init__(self, notes: list[str], sleep: Callable[[float], None]) -> None:
+        self.notes, self.sleep = notes, sleep
+        self.count = 0
+        self.total_s = 0.0
+
+    def wait(self, seconds: float, error: str) -> None:
+        self.sleep(seconds)
+        self.count += 1
+        self.total_s += seconds
+        self.notes[:] = [n for n in self.notes if not n.startswith(OUTAGE_NOTE)]
+        self.notes.append(
+            f"{OUTAGE_NOTE} {self.count} time(s); apifix waited {self.total_s:,.0f} s in total "
+            f"and retried (request durations include the waits; last error: {error[:200]})"
+        )
+
+    @staticmethod
+    def gave_up(waits: Sequence[float]) -> str:
+        """The words for an error after waiting `waits` (seconds) for one request."""
+        shown = ", ".join(f"{w:,.0f}" for w in waits)
+        return f" (it answered earlier in this job; apifix waited {shown} s and tried again)"
 
 
 class RequestTooLarge(LLMError):

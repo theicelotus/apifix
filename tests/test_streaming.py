@@ -338,3 +338,124 @@ def test_whole_file_sends_streaming_only_with_the_streaming_file(tmp_path):
     entry = result.trajectory["attempts"][0]["files"][0]
     assert entry["path"] == GENERATE and entry["accepted"]
     assert [r["checks"]["streaming"] == "ok" for r in entry["replies"]] == [False, True]
+
+
+# --- mocked stream chunks in test files (docs/plans/genai-run-3.md) ---------------------------
+
+CHUNK_TESTS = """\
+import sys
+from unittest import mock
+
+from chatpad import generate
+
+
+def mock_deltas():
+    yield {
+        "choices": [
+            {
+                "delta": {
+                    "role": "assistant",
+                    "content": "Here's",
+                },
+            },
+        ]
+    }
+
+    yield {
+        "choices": [
+            {
+                "delta": {
+                    "role": "assistant",
+                    "content": "Something",
+                },
+            },
+        ]
+    }
+
+
+@mock.patch(
+    "openai.ChatCompletion.create",
+    return_value=mock_deltas(),
+    autospec=True,
+)
+def test_generate(create):
+    for text in generate.generate_reply([], "hi", stream=True):
+        assert text in ["Here's", "Something"]
+"""
+# The shape of the reply genai-gptoss-3 had rejected twice as unrelated edits.
+CHUNK_TESTS_MIGRATED = """\
+import sys
+from unittest import mock
+from types import SimpleNamespace
+
+from chatpad import generate
+
+
+def mock_deltas():
+    yield SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(role="assistant", content="Here's")
+            )
+        ]
+    )
+    yield SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(role="assistant", content="Something")
+            )
+        ]
+    )
+
+
+@mock.patch("chatpad.generate.openai.OpenAI")
+def test_generate(OpenAI):
+    OpenAI.return_value.chat.completions.create.return_value = mock_deltas()
+    for text in generate.generate_reply([], "hi", stream=True):
+        assert text in ["Here's", "Something"]
+"""
+
+
+def chunk_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    shutil.copytree(FIXTURE, repo)
+    (repo / TESTS).write_text(CHUNK_TESTS)
+    return repo
+
+
+def test_dict_stream_chunks_in_a_test_file_are_likely_findings(tmp_path):
+    findings = scan(chunk_repo(tmp_path), "openai-v1").findings
+    chunks = [f for f in findings if f.file == TESTS and f.category == "response_access"]
+    assert [(f.line, f.confidence, f.suggestion) for f in chunks] == [
+        (8, "likely", rules.MOCK_DICT_CHUNK),
+        (19, "likely", rules.MOCK_DICT_CHUNK),
+    ]
+    assert "streaming" in selected_parts(chunks)  # the suggestion names the delta
+    # the same chunks in a non-test module (sample data, no tests) are not flagged
+    samples = CHUNK_TESTS.split("\n\n\n@mock")[0]
+    assert findings_of(samples, "chatpad/samples.py") == []
+
+
+def test_converting_mocked_chunks_to_objects_is_migration_work(tmp_path):
+    repo = chunk_repo(tmp_path)
+    findings = scan(repo, "openai-v1").findings
+
+    def checked(own):
+        return check_candidate(
+            TESTS,
+            CHUNK_TESTS,
+            CHUNK_TESTS_MIGRATED,
+            required=False,
+            library_modules=MIGRATION.api_modules,
+            known_imports=MIGRATION.known_imports,
+            findings=own,
+            rewrite_checks=MIGRATION.rewrite_checker(repo, findings),
+        )
+
+    own = [f for f in findings if f.file == TESTS]
+    result = checked(own)
+    assert result.ok and result.checks["unrelated_edits"] == "ok" and result.reverted == []
+    # without the chunk findings (as before), the same reply was unrelated to the migration
+    before = checked([f for f in own if f.category != "response_access"])
+    assert before.error_checks[:1] == ["unrelated_edits"]
+    assert "original line 8: changed code unrelated to the migration" in before.errors[0]

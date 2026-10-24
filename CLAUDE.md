@@ -95,7 +95,8 @@ src/apifix/
                       changed-line coverage, environment (missing modules, library not
                       declared) -> verdict + reasons + PR report section (with a per-hunk
                       "Review by hand" list for verified_weak / unverified)
-    llm.py            provider-neutral LLM interface, model/price table (TOML-overridable)
+    llm.py            provider-neutral LLM interface, model/price table (TOML-overridable),
+                      waits for an endpoint unreachable mid-job (both providers)
     llm_anthropic.py  Claude via the official `anthropic` SDK (optional extra)
     llm_openai_compat.py  any OpenAI-compatible endpoint (Ollama, LM Studio, vLLM, hosted);
                       stdlib HTTP, preflight tool-call check, context-window guards,
@@ -243,8 +244,9 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   `patch.object(app.openai.ChatCompletion, "create")` (repo-module attributes are not resolved).
 - `.ipynb` notebooks are not scanned yet.
 - openai-v1, test files only (`project.is_test_file`): dict literals shaped like a 0.x response (`"choices"` holding a
-  dict with `"message"` or `"text"`) are a [likely] `response_access` finding, without
-  requiring an openai import. `dict(choices=...)` calls and dicts built step by step are
+  dict with `"message"` or `"text"`) or a 0.x stream chunk (a choice with `"delta"`; its own
+  suggestion, `rules.MOCK_DICT_CHUNK`, which selects the Streaming part) are a [likely]
+  `response_access` finding, without requiring an openai import. `dict(choices=...)` calls and dicts built step by step are
   missed; the same literal in a non-test file (fixtures modules, sample data) is not flagged.
 
 - Already migrated (`already_migrated.py`): all of (a) at least one declaration of the library,
@@ -496,7 +498,10 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   counted a resent prompt 79 tokens higher than its first refusal implied) if that leaves at
   least `est`
   (agent mode: 1,024) and is lower; else, or if refused again, the job stops
-  (`provider_error`). Not remembered: the next request starts from its own budget again.
+  (`provider_error`). The limit is kept for the job: every later request whose estimate
+  (prompt characters / the job's lowest characters per token, plus the margin) leaves less
+  than its `max_tokens` is sent with `max_tokens` lowered to fit in advance, when that still
+  leaves `est` (`max_tokens_capped_from` on the response); otherwise as before.
 - `apifix verify`: needs the `git` binary; `git apply` with `GIT_CEILING_DIRECTORIES` and no
   user/system git config, so it never looks above the copy and refuses paths outside it.
   Symlink modes (120000) are refused; changes only in dirs the walker skips (venvs, build,
@@ -739,10 +744,15 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   it with `from`, is rejected. Whole-file mode only.
 - A failing candidate gets its error back once (`check_retry`) as a fresh request: the file's
   request again, with the rejected candidate as a diff against the original and the error (not
-  the conversation, which would carry the whole rejected file). A second failure ends the
-  attempt (`check_failed`, not verified). The next attempt resends that file first (the same
-  form) and then the files after it. Several errors where one has an example are sent as a
-  bullet list. Code-block nudges still continue the conversation.
+  the conversation, which would carry the whole rejected file). A second failure (or a parse
+  error) sets the file aside for the rest of the attempt: the other pending files are still
+  sent, and the attempt ends `check_failed` (not verified) once all were tried. Test files
+  that reach a non-test module set aside in the same attempt through imports
+  (`context.reachable_modules`) are held back without a request (`attempts[].deferred`,
+  report "not sent: ... (it imports ..., which failed)"); tests that reach it otherwise are
+  still sent. The next attempt sends only the files that failed or were held back, in the
+  same order and form. Several errors where one has an example are sent as a bullet list.
+  Code-block nudges still continue the conversation.
 - A retry note also lists the file's earlier check errors in this job (any attempt) that the
   current reply does not have, under "Keep these fixed", compared and shown by first line
   without the `line N:` prefix (also `original line N:`, `after original line N:`), so the
@@ -750,7 +760,8 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
 - Repeated errors: each file entry records `failed_checks` ([check, error key] of its last
   reply, when that failed a check; `regions` for region splice errors). Per file and pair, a
   streak counts the consecutive attempts the file ended failing with it (consecutive tries:
-  an attempt that ends before the file is sent does not break it); acceptance, or an attempt
+  an attempt that ends before the file is sent, or holds it back, does not break it); a
+  repeated-error stop ends the attempt at once; acceptance, or an attempt
   ending without the pair (also a reply without a code block), ends it. After two in a row,
   the file's next requests (the first, and a check retry that has the error again) say "This
   is the same error as last time (attempts 2 and 3); your previous fix did not change the
@@ -827,14 +838,28 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   "R1, line K of your block"; mock and library target messages to the regions whose text quotes
   the target; anything else to the batch's regions. The retry is a fresh request with the
   affected regions (original text), their rejected versions as one diff, IMPORTS as last
-  returned, and the other regions' changes read-only; once per batch. An error caused by an
-  unchanged region's interplay with a changed one goes to whichever region it names.
+  returned, and the other regions' changes read-only; once per request of a batch. An error
+  caused by an unchanged region's interplay with a changed one goes to whichever region it
+  names. Errors are attributed whole: the undefined-names check reports all names in one
+  error, attributed by its first line only.
 - Batches: regions in file order, packed greedily within `--max-file-bytes` minus IMPORTS and,
   with a known token limit, an estimate (system prompt, feedback, 1,500 characters, IMPORTS,
   names, outline; per region character 1/chars-per-token + 1/3 tokens). Each batch is checked
   on the file spliced so far (the "changed" check only on the last); only the last batch's
   checked file is written, so reverts and auto-imports are computed on the complete file. A
   batch's check retry may resend regions of earlier batches.
+- Groups (every request of a region-edited file, once a limit is known): a request whose
+  estimate (the request as built, previous diffs, context and feedback included, plus the
+  reply estimate) does not fit the limit, or that the server refuses when fewer reply tokens
+  cannot help, is split into groups of its regions packed greedily in file order (each group
+  estimated with the smallest context and a full 1,500-character diff of the other changes;
+  IMPORTS with the first), sent one after the other, each spliced over the ones before and
+  checked on the whole file ("changed" only after the file's last request). Regions of groups
+  not sent yet stay at their original text. Applies to a batch's first request (later
+  attempts: previous diffs) and to check retries (each group with its own regions' errors; a
+  split retry is one `check_retry` nudge, and a failed group fails the batch). Recorded per
+  batch as `splits` (`ids`, `groups`, `reason` `limit` | `refused`, `check_retry`). A single
+  region that does not fit is sent as it is (a refusal then stops the job).
 - Later attempts send every region from the original with per-region previous diffs (a file
   last accepted as a whole file gets the whole-file diff), plus regions the verification points
   at in that file: the definitions of its newly failing or erroring tests (`module[.Class]::name`,
@@ -904,7 +929,15 @@ Known limitations:
   hosted ones and for Claude. It is a socket timeout, so it bounds the wait for the reply, not
   the request's total time. A timeout is reported as one ("timed out after N s ... Raise the
   limit with --request-timeout") and is not retried; refused/reset connections are "no
-  server" (resets retried twice).
+  server" (resets and DNS failures retried twice, after 1 and 4 s).
+- Outages mid-job (`llm.OUTAGE_WAITS_S`): once the endpoint has sent any HTTP response in the
+  job, a connection that fails (DNS, refused, reset; after the quick retries) is waited out
+  30, 60 and 120 s before the request fails ("... (it answered earlier in this job; apifix
+  waited 30, 60, 120 s and tried again)"). One job note keeps the count and total ("endpoint
+  unreachable mid-job N time(s) ..."); waits count in `duration_s`. Before the first response
+  (preflight, a server that is not running) nothing is waited. Requests that do not retry
+  (model list, `/api/ps`) do not wait. Claude: the SDK's own retries first, then the same
+  waits for an `APIConnectionError` that is not a timeout, after a first response.
 - HTTP 429: waited out inside the provider (the agent sees one slow request): `retry-after-ms`,
   `Retry-After` (seconds or HTTP date), or "try again in <Go duration>" in the message, at
   least 1 s; else backoff 2, 4, 8, 16, 32, 60 s. At most 6 waits per request, each at most

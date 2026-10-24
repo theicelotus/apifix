@@ -191,7 +191,10 @@ function the test calls, nor a library name such as `openai.OpenAI` that a modul
 target, by the path the tests import it by); the error names the target to patch instead
 where it can (when the patched module never touches the library, the modules the test reaches
 that do, each with its own target), and a failing file gets it back once (a fresh request with the rejected version as a diff, not the
-whole rejected file). A file that fails a check with the same error on two attempts in a row
+whole rejected file). A file that fails again is set aside for that attempt while the
+others are still sent (tests importing a module that failed wait for the next attempt), and
+the next attempt sends only what failed, so one stubborn file does not use up the attempts
+before anything is verified. A file that fails a check with the same error on two attempts in a row
 is told so; on the third, the job stops instead of spending the remaining attempts. Edits away from the migration are caught as well: a changed string,
 docstring or comment far from any finding (a word slipped into a prompt) is put back by apifix
 and listed in the report ("apifix reverted: ..."); unrelated code changes, or string literals
@@ -215,7 +218,9 @@ methods and statements that hold a finding, plus the import block, each in a lab
 block, with the names they use and an outline of the rest as read-only context. The model
 returns each region in its own labelled block, apifix splices them back by position, and the
 complete file goes through all the checks above. A failing check resends only the regions it
-concerns; regions too large for one request go in several; a later attempt also sends the
+concerns; regions too large for one request go in several, and once a per-minute limit is
+known every request, retries and later attempts included, is split into groups that fit it
+(a refused one too); a later attempt also sends the
 regions of tests that failed. `--file-edits whole|regions` forces either form. The model can
 only change those regions (and add imports, assignments and helper functions at the top), so
 a fix that needs other code outside them is out of reach until a test failure points there.
@@ -296,8 +301,14 @@ as that leaves room for the file; otherwise the file is sent again as regions. F
 apifix keeps the limit and trims requests to fit it: each file gets only its own guide
 sections, less failing-test output, and test files see the other changed files as their changed
 statements or just the lines that use the library; a file that would not fit whole goes as
-regions. If even that is refused, the job stops and says why; use a model with a higher limit
-then.
+regions, and regions that would not fit one request (a retry, or a later attempt with each
+region's previous version) go in groups, with the reply allowance lowered in advance instead of
+waiting for a refusal. If a single region is still refused, the job stops and says why; use a
+model with a higher limit then.
+
+Network blips: once the endpoint has answered, a connection that fails mid-job (DNS failure,
+refused, reset) is retried after 30, 60 and 120 s before the job stops; the report notes the
+waits. A server that is not reachable at the start (not running, wrong URL) still fails at once.
 
 `apifix cleanup` removes sandbox containers and temp dirs that an interrupted run (crash,
 kill, power loss) left behind. Runs that are still in progress are not touched: each one holds

@@ -425,3 +425,90 @@ def test_a_later_attempt_adds_regions_the_verifier_points_at(big):
     assert "+import openai" in result.diff and '+    client = openai.OpenAI(api_key="x")' in (
         result.diff
     )
+
+
+# --- requests under a known limit after the first one (docs/plans/genai-run-3.md) ------------
+
+
+def test_a_refused_region_request_is_split_into_groups_that_fit(big):
+    llm = FakeLLM(
+        [
+            block(APP_NEW),
+            too_large(600, 100_000),  # fewer reply tokens cannot fix it: the limit is learnt
+            regions(("IMPORTS", IMPORTS_NEW), ("R1", R1_NEW)),
+            regions(("R2", R2_NEW)),
+        ]
+    )
+    result = wf(big, llm)
+    assert result.outcome == "verified"
+    entry = files_of(result)[1]
+    assert entry["batches"][0]["splits"] == [
+        {"ids": ["R1", "R2"], "groups": [["R1"], ["R2"]], "reason": "refused", "check_retry": False}
+    ]
+    first_group, second_group = request_texts(llm)[2:]
+    assert "Region R1:" in first_group and "Region R2:" not in first_group
+    assert "Region R2:" in second_group and "Region R1:" not in second_group
+    assert "def completion(text):" in second_group  # IMPORTS as the first group left it
+    assert "b/tests/test_app.py R1" in second_group  # the first group's changes, read-only
+    assert result.trajectory["job"]["limits"]["per_minute"] == 600
+
+
+def test_a_check_retry_that_is_refused_is_resent_in_groups(big):
+    bad_r1 = R1_NEW.replace("def test_ask", "def test_ask_renamed")  # an error per region
+    bad_r2 = R2_NEW.replace("def test_strips", "def test_strips_renamed")
+    llm = FakeLLM(
+        [
+            block(APP_NEW),
+            regions(("IMPORTS", IMPORTS_NEW), ("R1", bad_r1), ("R2", bad_r2)),
+            too_large(600, 100_000),  # the retry of R1 and R2
+            regions(("R1", R1_NEW)),
+            regions(("R2", R2_NEW)),
+        ]
+    )
+    result = wf(big, llm)
+    assert result.outcome == "verified"
+    attempt = result.trajectory["attempts"][0]
+    (retry,) = [n for n in attempt["nudges"] if n["kind"] == "check_retry"]  # one retry
+    assert retry["regions_resent"] == ["R1", "R2"]
+    (split,) = files_of(result)[1]["batches"][0]["splits"]
+    assert (split["groups"], split["reason"], split["check_retry"]) == (
+        [["R1"], ["R2"]],
+        "refused",
+        True,
+    )
+    r1_retry, r2_retry = request_texts(llm)[3:]
+    assert "Your previous version of R1 was rejected: R1: return exactly def test_ask" in r1_retry
+    assert "R2: return" not in r1_retry  # each group gets its own regions' errors
+    assert "Your previous version of R2 was rejected: R2: return exactly def test_strips" in (
+        r2_retry
+    )
+    assert "b/tests/test_app.py R1" in r2_retry  # the fixed R1, read-only
+    assert '+    create.return_value = completion("x\\n")' in result.diff
+
+
+def test_a_failed_group_of_a_retry_fails_the_batch(big):
+    bad_r1 = R1_NEW.replace("def test_ask", "def test_ask_renamed")
+    bad_r2 = R2_NEW.replace("def test_strips", "def test_strips_renamed")
+    first = regions(("IMPORTS", IMPORTS_NEW), ("R1", bad_r1), ("R2", bad_r2))
+    llm = FakeLLM([block(APP_NEW), first, too_large(600, 100_000), regions(("R1", bad_r1))])
+    result = wf(big, llm, max_retries=0)
+    entry = files_of(result)[1]
+    assert not entry["accepted"] and entry["error"].startswith("R1: return exactly def test_ask")
+    assert len(llm.requests) == 4  # R2's group is not sent
+
+
+def test_a_request_over_a_known_limit_is_split_before_it_is_sent(big, monkeypatch):
+    from apifix.engine.agent import _Job
+
+    # a batch plan that underestimates (as before previous diffs and context were counted)
+    monkeypatch.setattr(_Job, "_batches", lambda self, path, original, plan: [list(plan.ids)])
+    app_budget = 2 * -(-len(APP_OLD) // 3) + 2048
+    batch1 = regions(("IMPORTS", IMPORTS_NEW), ("R1", R1_NEW))
+    llm = FakeLLM([lowered(600, app_budget), block(APP_NEW), batch1, regions(("R2", R2_NEW))])
+    result = wf(big, llm)
+    assert result.outcome == "verified"
+    entry = files_of(result)[1]
+    assert [b["ids"] for b in entry["batches"]] == [["R1", "R2"]]
+    assert entry["batches"][0]["splits"][0]["reason"] == "limit"
+    assert entry["batches"][0]["splits"][0]["groups"] == [["R1"], ["R2"]]
+    assert len(llm.requests) == 4  # nothing refused: split before sending

@@ -319,6 +319,47 @@ def test_transient_errors_are_retried():
     assert len(http.requests) == 3
 
 
+HOSTED = "https://api.example.com/v1"
+REFUSED = ConnectFailed("[Errno 111] Connection refused")
+
+
+def test_an_outage_mid_job_is_waited_out_and_noted():
+    dns = ConnectFailed("[Errno -3] Temporary failure in name resolution")
+    llm, http, waits = make_timed(reply("first"), REFUSED, dns, reply("back"), base_url=HOSTED)
+    assert complete(llm).text == "first"
+    assert complete(llm).text == "back"
+    assert waits == [30.0, 1.0]  # refused: the outage wait; DNS then gets a quick retry first
+    assert llm.notes[-1] == (
+        "endpoint unreachable mid-job 1 time(s); apifix waited 30 s in total and retried "
+        "(request durations include the waits; last error: [Errno 111] Connection refused)"
+    )
+
+
+def test_an_outage_mid_job_fails_after_three_waits():
+    llm, http, waits = make_timed(reply("first"), *[REFUSED] * 4, base_url=HOSTED)
+    complete(llm)
+    with pytest.raises(LLMError) as exc:
+        complete(llm)
+    assert waits == [30.0, 60.0, 120.0]
+    assert str(exc.value) == (
+        f"no server at {HOSTED}: [Errno 111] Connection refused (it answered earlier in this "
+        "job; apifix waited 30, 60, 120 s and tried again)"
+    )
+    assert "apifix waited 210 s in total" in llm.notes[-1]
+
+
+def test_no_outage_waits_before_the_first_answer_or_without_retries():
+    llm, http, waits = make_timed(REFUSED, base_url=HOSTED)
+    with pytest.raises(LLMError, match="no server at"):
+        complete(llm)
+    assert waits == []  # a server that is not running fails at once
+    llm, http, waits = make_timed(reply("first"), REFUSED, base_url=HOSTED)
+    complete(llm)
+    with pytest.raises(LLMError, match="no server at"):
+        llm.list_models()
+    assert waits == []  # the model list does not wait
+
+
 def test_retries_are_bounded():
     llm, http = make(error(503, "busy"), error(503, "busy"), error(503, "still busy"))
     with pytest.raises(LLMError, match="HTTP 503 .*still busy"):

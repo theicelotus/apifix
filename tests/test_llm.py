@@ -261,6 +261,33 @@ def test_sdk_errors_become_llm_errors():
         complete(AnthropicLLM("claude-opus-5-5", client=client))
 
 
+def test_a_connection_error_mid_job_is_waited_out():
+    request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+    ok = sdk_message([{"type": "text", "text": "done"}])
+    lost = anthropic.APIConnectionError(request=request)
+    waits: list[float] = []
+    client = FakeClient(ok, lost, lost, ok, lost, lost, lost, lost)
+    llm = AnthropicLLM("claude-opus-5-5", client=client, sleep=waits.append)
+    complete(llm)
+    assert complete(llm).text == "done"
+    assert waits == [30.0, 60.0]
+    assert llm.notes[-1].startswith("endpoint unreachable mid-job 2 time(s); apifix waited 90 s")
+    with pytest.raises(LLMError, match=r"apifix waited 30, 60, 120 s and tried again\)$"):
+        complete(llm)
+
+
+def test_a_timeout_mid_job_is_not_waited_out():
+    request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+    ok = sdk_message([{"type": "text", "text": "done"}])
+    waits: list[float] = []
+    client = FakeClient(ok, anthropic.APITimeoutError(request=request))
+    llm = AnthropicLLM("claude-opus-5-5", client=client, sleep=waits.append)
+    complete(llm)
+    with pytest.raises(LLMError, match="APITimeoutError"):
+        complete(llm)
+    assert waits == []
+
+
 def test_api_key_comes_from_the_host_environment_only(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     with pytest.raises(LLMError, match="ANTHROPIC_API_KEY is not set"):

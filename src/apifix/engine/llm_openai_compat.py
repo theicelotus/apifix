@@ -38,10 +38,12 @@ from urllib.parse import urlsplit, urlunsplit
 
 from apifix import __version__
 from apifix.engine.llm import (
+    OUTAGE_WAITS_S,
     LLMError,
     LLMResponse,
     Message,
     ModelInfo,
+    OutageWaits,
     RequestTooLarge,
     StopReason,
     ToolCall,
@@ -237,6 +239,8 @@ class OpenAICompatLLM:
         self._usage_estimated = False
         self.rate_limit_waits = 0
         self.rate_limit_wait_s = 0.0
+        self.answered = False  # the endpoint sent an HTTP response in this job
+        self.outage = OutageWaits(self.notes, self.sleep)
 
         self._key = os.environ.get(api_key_env) or None
         if self._key and parts.scheme == "http" and not self.local:
@@ -313,6 +317,9 @@ class OpenAICompatLLM:
         )
         delays = list(RETRY_DELAYS_S) if retry else []
         backoff = list(RATE_LIMIT_BACKOFF_S) if retry else []
+        # mid-job (the endpoint answered before): an outage is waited out before giving up
+        outage = list(OUTAGE_WAITS_S) if retry and self.answered else []
+        waited: list[float] = []
         while True:
             try:
                 resp = self.transport(req)
@@ -320,9 +327,14 @@ class OpenAICompatLLM:
                 if delays and "refused" not in str(exc).lower():
                     self.sleep(delays.pop(0))
                     continue
-                hint = " (is Ollama running? `ollama serve`)" if self.local else ""
+                if outage:
+                    waited.append(outage.pop(0))
+                    self.outage.wait(waited[-1], self._scrub(str(exc)))
+                    continue
+                hint = " (is Ollama running? `ollama serve`)" if self.local and not waited else ""
+                after = OutageWaits.gave_up(waited) if waited else ""
                 raise LLMError(
-                    f"no server at {self.endpoint}{hint}: {self._scrub(str(exc))}"
+                    f"no server at {self.endpoint}{hint}: {self._scrub(str(exc))}{after}"
                 ) from None
             except RequestTimedOut:
                 # Not retried: the server is up but slow, and a retry would wait just as long.
@@ -332,6 +344,7 @@ class OpenAICompatLLM:
                     "slow or CPU-only machine can take longer). Raise the limit with "
                     "--request-timeout SECONDS"
                 ) from None
+            self.answered = True
             try:
                 data = json.loads(resp.body.decode("utf-8")) if resp.body else None
             except (UnicodeDecodeError, ValueError):

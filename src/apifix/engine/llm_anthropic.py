@@ -13,15 +13,18 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from apifix.engine.llm import (
     ANTHROPIC_MODELS,
+    OUTAGE_WAITS_S,
     LLMError,
     LLMResponse,
     Message,
     ModelInfo,
+    OutageWaits,
     StopReason,
     ToolCall,
     ToolSpec,
@@ -51,12 +54,17 @@ class AnthropicLLM:
         fallback: bool = False,
         timeout_s: float = 600.0,
         max_retries: int = 3,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.model = model
         self.models = dict(models)
         self.effort = effort
         self.fallback = fallback
         self.notes: list[str] = []
+        # the SDK retries a failed connection a few times within seconds; once the API has
+        # answered in this job, a longer outage is waited out too
+        self.answered = False
+        self.outage = OutageWaits(self.notes, sleep)
         if client is None:
             key = os.environ.get(API_KEY_ENV)
             if not key:
@@ -138,13 +146,34 @@ class AnthropicLLM:
             temperature=temperature,
         )
         create = self.client.beta.messages.create if self.fallback else self.client.messages.create
-        try:
-            response = create(**kwargs)
-        except Exception as exc:
-            if _is_sdk_error(exc):
-                raise LLMError(f"{type(exc).__name__}: {exc}") from exc
-            raise
+        outage = list(OUTAGE_WAITS_S) if self.answered else []
+        waited: list[float] = []
+        while True:
+            try:
+                response = create(**kwargs)
+                break
+            except Exception as exc:
+                if outage and _is_connection_error(exc):
+                    waited.append(outage.pop(0))
+                    self.outage.wait(waited[-1], f"{type(exc).__name__}: {exc}")
+                    continue
+                if _is_sdk_error(exc):
+                    after = OutageWaits.gave_up(waited) if waited else ""
+                    raise LLMError(f"{type(exc).__name__}: {exc}{after}") from exc
+                raise
+        self.answered = True
         return from_anthropic(response)
+
+
+def _is_connection_error(exc: Exception) -> bool:
+    """The API could not be reached (not a timeout: then it was reached, and is slow)."""
+    try:
+        import anthropic
+    except ImportError:
+        return False
+    return isinstance(exc, anthropic.APIConnectionError) and not isinstance(
+        exc, anthropic.APITimeoutError
+    )
 
 
 def _is_sdk_error(exc: Exception) -> bool:

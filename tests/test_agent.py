@@ -1283,6 +1283,56 @@ def test_second_check_failure_fails_the_attempt_and_the_file_goes_first_next_tim
     assert second["kept_files"] == ["requirements.txt"]  # set by apifix
     assert second["files"][1]["context_files"] == ["app.py"]
     assert "- Attempt 1 (check_failed): `app.py` failed: it is" in result.report_markdown
+    # the test file imports app.py, which failed: held back without a request
+    assert first["deferred"] == [{"path": "tests/test_app.py", "module": "app.py"}]
+    assert (
+        "; not sent: `tests/test_app.py` (it imports `app.py`, which failed)"
+        in result.report_markdown
+    )
+
+
+HELPER_OLD = """\
+import openai
+
+
+def embed(text):
+    return openai.Embedding.create(model="m", input=text)
+"""
+HELPER_NEW = """\
+import openai
+
+client = openai.OpenAI(api_key="test")
+
+
+def embed(text):
+    return client.embeddings.create(model="m", input=text)
+"""
+
+
+def test_a_failed_file_is_set_aside_and_the_others_are_still_sent(repo):
+    (repo / "helper.py").write_text(HELPER_OLD)  # no test imports it
+    llm = FakeLLM(
+        [block(APP_NEW), block(HELPER_OLD), block(HELPER_OLD), block(TESTS_NEW)]  # attempt 1
+        + [block(HELPER_NEW)]  # attempt 2: only the file that failed
+    )
+    sandbox = JudgingSandbox()
+    result = wf(repo, llm, sandbox, max_retries=1)
+    assert result.outcome == "verified" and result.reason == "verified on attempt 2"
+    first, second = result.trajectory["attempts"]
+    assert [(f["path"], f["accepted"]) for f in first["files"]] == [
+        ("app.py", True),
+        ("helper.py", False),
+        ("tests/test_app.py", True),
+    ]
+    assert first["result"] == "check_failed" and first["deferred"] == []
+    assert [f["path"] for f in second["files"]] == ["helper.py"]
+    assert second["kept_files"] == ["requirements.txt", "app.py", "tests/test_app.py"]
+    assert "Your previous version of helper.py was identical" in llm.requests[4][0].text
+    assert len(sandbox.runs) == 2  # baseline + attempt 2: nothing verified in attempt 1
+    assert (
+        "- Attempt 1 (check_failed): `app.py` ok, `helper.py` failed: it is identical"
+        in result.report_markdown
+    )
 
 
 def test_unchanged_likely_only_file_is_accepted(repo):
@@ -1913,9 +1963,14 @@ def test_request_over_the_per_minute_limit_is_sent_again_with_fewer_reply_tokens
     result = wf(repo, llm)
     assert result.outcome == "verified"
     lowered = 3000 - 2000 - 256
-    assert llm.max_tokens_seen == [first, lowered, budget(TESTS_OLD)]  # per request
+    assert llm.max_tokens_seen[:2] == [first, lowered]  # per request
     response = result.trajectory["attempts"][0]["responses"][0]
     assert (response["max_tokens"], response["max_tokens_lowered_from"]) == (lowered, first)
+    # the limit is known from then on: the next request is lowered before it is sent
+    tests_response = result.trajectory["attempts"][0]["responses"][1]
+    assert tests_response["max_tokens_capped_from"] == budget(TESTS_OLD)
+    assert tests_response["max_tokens"] == llm.max_tokens_seen[2] < budget(TESTS_OLD)
+    assert "max_tokens_lowered_from" not in tests_response
     note = (
         "1 request(s) refused by the server's per-minute token limit (3,000) were sent again "
         "with fewer reply tokens (max_tokens lowered to fit)"
@@ -1994,11 +2049,15 @@ def test_a_second_refusal_stops_the_job(repo):
     assert f"(already sent again with max_tokens lowered from {first:,} to 744)" in result.reason
 
 
-def test_agent_mode_request_is_lowered_once_and_later_requests_use_the_maximum(repo):
+def test_agent_mode_request_is_lowered_once_and_later_requests_are_capped_by_estimate(repo):
     llm = FakeLLM([too_large(10_000, 4000 + 16_000), tools(FIX_APP, FIX_TESTS), done()])
     result = go(repo, llm)
     assert result.outcome == "verified"
-    assert llm.max_tokens_seen == [16_000, 10_000 - 4000 - 300, 16_000]
+    assert llm.max_tokens_seen[:2] == [16_000, 10_000 - 4000 - 300]
+    # the limit is known: the next request's max_tokens is lowered before it is sent
+    later = result.trajectory["attempts"][0]["responses"][1]
+    assert later["max_tokens_capped_from"] == 16_000
+    assert 1_024 <= llm.max_tokens_seen[2] == later["max_tokens"] < 10_000 - 300
 
 
 def test_agent_mode_needs_room_for_a_reply(repo):

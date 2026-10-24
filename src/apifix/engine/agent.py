@@ -60,6 +60,7 @@ from apifix.engine.project import ci_env_vars, is_test_file
 from apifix.engine.regions import (
     IMPORTS,
     RegionPlan,
+    SpliceResult,
     apply_blocks,
     attribute_errors,
     coverage,
@@ -96,6 +97,7 @@ from apifix.engine.whole_file import (
     REGION_COVERAGE_MAX,
     REPLY_CHARS_PER_TOKEN,
     CheckResult,
+    RegionRequest,
     as_file,
     attempts_text,
     check_candidate,
@@ -224,8 +226,10 @@ class Attempt:
     nudges: list[dict[str, Any]] = field(default_factory=list)
     edits: list[EditRecord] = field(default_factory=list)
     files: list[dict[str, Any]] = field(default_factory=list)  # whole-file mode: one per request
-    # whole-file mode: files not sent in this attempt (accepted earlier and still in place)
+    # whole-file mode: files not sent in this attempt (accepted earlier and still in place),
+    # and test files held back because a module they import failed its checks in it
     kept_files: list[str] = field(default_factory=list)
+    deferred: list[dict[str, str]] = field(default_factory=list)
     diff: str = ""
     verification: Verification | None = None
     result: str = ""  # a verdict, "no_changes", "check_failed" (whole-file) or "aborted"
@@ -245,6 +249,7 @@ class Attempt:
             "edits": [asdict(e) for e in self.edits],
             "files": self.files,
             "kept_files": self.kept_files,
+            "deferred": self.deferred,
             "diff": self.diff,
             "verification": self.verification.to_dict() if self.verification else None,
             "verification_duration_s": round(self.verification_duration_s, 3),
@@ -538,6 +543,14 @@ class _Job:
         max_tokens = max_tokens or self.config.max_output_tokens
         self._check_budget_before_call(messages, max_tokens, system)
         prompt_chars = self._input_chars(messages, system)
+        capped_from = None
+        if self.token_limit is not None:
+            # a known per-minute limit counts max_tokens: lower it in advance (by estimate)
+            # rather than be refused first, if that leaves the reply what it needs
+            room = self.token_limit - token_limit_margin(self.token_limit)
+            room -= self._tokens(prompt_chars)
+            if need_tokens <= room < max_tokens:
+                capped_from, max_tokens = max_tokens, room
         lowered_from: int | None = None
         start = time.monotonic()
         try:
@@ -584,6 +597,7 @@ class _Job:
                 "duration_s": round(duration, 3),
                 "max_tokens": max_tokens,
             }
+            | ({"max_tokens_capped_from": capped_from} if capped_from else {})
             | ({"max_tokens_lowered_from": lowered_from} if lowered_from else {})
             | ({"refusal": response.refusal} if response.refusal else {})
         )
@@ -710,24 +724,52 @@ class _Job:
 
     def _whole_file_attempt(self, attempt: Attempt) -> bool:
         """One pass over the pending files, each in its own conversation. True when all were
-        accepted (the tree is ready to verify); False when one failed its checks, which ends
-        the attempt: that file and the ones after it stay pending for the next attempt."""
+        accepted (the tree is ready to verify). A file that fails its checks is set aside for
+        the rest of the attempt and the others are still sent; it stays pending, with its
+        rejected candidate and error, for the next attempt. Only a repeated-error stop (or an
+        abort) ends the pass early."""
         pending = self.wf_pending
         attempt.kept_files = [p for p in self.wf_all if p not in pending]
-        for i, path in enumerate(pending):
+        failed: list[str] = []
+        previous: dict[str, tuple[str | None, str]] = {}
+        aside: list[str] = []  # non-test Python files that failed in this attempt
+        for path in pending:
+            blocked = self._blocked_by(path, aside)
+            if blocked:  # its checks would judge it against the module's old version
+                attempt.deferred.append({"path": path, "module": blocked})
+                failed.append(path)
+                if path in self.wf_previous:
+                    previous[path] = self.wf_previous[path]
+                continue
             if self._form(path)[0] == "regions":
                 entry, candidate = self._region_request(attempt, path)
             else:
                 entry, candidate = self._whole_file_request(attempt, path)
             if not entry["accepted"]:
-                rest = {p: self.wf_previous[p] for p in pending[i + 1 :] if p in self.wf_previous}
-                self.wf_pending = pending[i:]
-                self.wf_previous = {path: (candidate, entry["error"]), **rest}
+                failed.append(path)
+                previous[path] = (candidate, entry["error"])
+                if path.endswith(".py") and not is_test_file(path, root=self.repo):
+                    aside.append(path)
                 self._count_repeats(attempt.number, path, entry)
-                return False
+                if self.wf_stop:
+                    break  # the job stops: the files after this one are not sent
+                continue
             self.wf_streaks.pop(path, None)
-        self.wf_pending, self.wf_previous, self.wf_region_previous = [], {}, {}
-        return True
+            self.wf_region_previous.pop(path, None)
+        self.wf_pending = failed
+        self.wf_previous = previous
+        self.wf_region_previous = {p: t for p, t in self.wf_region_previous.items() if p in failed}
+        return not failed
+
+    def _blocked_by(self, path: str, aside: Sequence[str]) -> str | None:
+        """The first of the modules set aside in this attempt (`aside`) that test file `path`
+        reaches through imports, or None (also for non-test files)."""
+        if not aside or not is_test_file(path, root=self.repo):
+            return None
+        reader = self._working_copy_reader(path, self._read(self.work, path))
+        roots = module_roots(path, self.baseline.import_paths if self.baseline else ())
+        found = reachable_modules(path, reader, roots, set(aside))
+        return found[0] if found else None
 
     def _count_repeats(self, number: int, path: str, entry: dict[str, Any]) -> None:
         """After `path` failed in attempt `number`: extend the streaks of the (check, error)
@@ -1291,106 +1333,306 @@ class _Job:
         count: int,
         sent: list[Message],
     ) -> _BatchOutcome:
+        """One batch's requests, as a queue of _Sends. A request that does not fit a known
+        token limit (by estimate before it is sent, or because the server refused it and fewer
+        reply tokens cannot help) is split into groups of its regions that fit, sent in file
+        order, each spliced over the ones before and checked on the whole file. A failed check
+        is sent back (max_check_retries_per_file per request) with only the regions its errors
+        concern, split the same way."""
         original = self._read(self.repo, path)
         last = number == count
         required = must_change(path, self.findings)
-        names = names_context(original, plan, ids)
         outline_text = outline(original, plan)
         guide = self._extra_guide(path)
         system, system_guide, sections = self._system_for(path)
-        imports_bytes = len(region_text(original, plan.imports).encode("utf-8"))
-        own_bytes = imports_bytes + sum(
-            len(region_text(original, plan.get(i)).encode("utf-8")) for i in ids
-        )
-        options = self._context_options(path, own_bytes, is_test_file(path, root=self.repo))
-        context: Sequence[tuple[str, str]] = options[-1].context
+        test_file = is_test_file(path, root=self.repo)
+        imports_original = region_text(original, plan.imports)
 
-        def budget(send: Sequence[str]) -> tuple[int, int]:
-            shown = [texts.get(IMPORTS, region_text(original, plan.imports))]
-            shown += [region_text(original, plan.get(i)) for i in send if i != IMPORTS]
+        def size(rid: str) -> int:
+            return len(region_text(original, plan.get(rid)).encode("utf-8"))
+
+        imports_bytes = len(imports_original.encode("utf-8"))
+        base = dict(texts)  # the regions' texts so far (earlier batches and groups)
+
+        def build(send: _Send, *, smallest: bool = False) -> _Built:
+            own = imports_bytes + sum(size(i) for i in send.ids if i != IMPORTS)
+            options = self._context_options(path, own, test_file)
+            imports_text = send.imports_text if send.imports_text is not None else base.get(IMPORTS)
+            shown = [imports_text if imports_text is not None else imports_original]
+            shown += [region_text(original, plan.get(i)) for i in send.ids if i != IMPORTS]
             tokens = file_tokens("".join(shown))
-            return tokens, reply_budget(tokens, self.config.max_output_tokens)
+            others = [i for i in base if i != IMPORTS and i not in send.ids]
+            kept = regions_diff(path, original, plan, base, others, limit=KEPT_DIFF_CHARS)
+            if send.rejected is None:
+                note = self._first_note(path, original, plan, send.ids)
+            else:
+                note = region_previous_note(
+                    path,
+                    original,
+                    plan,
+                    send.rejected,
+                    send.ids,
+                    send.error,
+                    send.keep_fixed,
+                    _repeated_text(send.repeated),
+                )
+            names = names_context(original, plan, send.ids)
 
-        def request(
-            send: Sequence[str], previous: str, kept: str, imports_text: str | None
-        ) -> tuple[Message, dict[str, int]]:
-            built = region_prompt(
-                path,
-                original,
-                plan,
-                send,
-                self.findings,
-                summary=self.migration.summary,
-                imports_text=imports_text,
-                names=names,
-                outline_text=outline_text,
-                context=context,
-                required=required,
-                feedback=self._feedback(False),
-                previous=previous,
-                kept=kept,
-                guide=guide,
+            def make(context: Sequence[tuple[str, str]]) -> RegionRequest:
+                return region_prompt(
+                    path,
+                    original,
+                    plan,
+                    send.ids,
+                    self.findings,
+                    summary=self.migration.summary,
+                    imports_text=imports_text,
+                    names=names,
+                    outline_text=outline_text,
+                    context=context,
+                    required=required,
+                    feedback=self._feedback(False),
+                    previous=note,
+                    kept=kept,
+                    guide=guide,
+                )
+
+            chosen = options[-1]
+            if not smallest:
+                for option in options:  # the fullest context that fits a known limit
+                    if self._fits(len(system) + len(make(option.context).text), tokens):
+                        chosen = option
+                        break
+            built = make(chosen.context)
+            parts = {"rules": len(system) - len(system_guide), "guide": len(system_guide)}
+            return _Built(
+                Message("user", text=built.text),
+                {**parts, **built.parts},
+                chosen,
+                tokens,
+                reply_budget(tokens, self.config.max_output_tokens),
+                note,
+                len(system) + len(built.text),
+                len(kept),
             )
-            parts = {
-                "rules": len(system) - len(system_guide),
-                "guide": len(system_guide),
-                **built.parts,
-            }
-            return Message("user", text=built.text), parts
 
-        earlier = [i for i in texts if i != IMPORTS and i not in ids]
-        kept = regions_diff(path, original, plan, texts, earlier, limit=KEPT_DIFF_CHARS)
-        send: list[str] = list(ids)
-        tokens, max_tokens = budget(send)
-        note = self._first_note(path, original, plan, ids)
-        chosen = options[-1]
-        for option in options:  # the fullest context that fits a known limit
-            context = option.context
-            first, parts = request(send, note, kept, texts.get(IMPORTS))
-            if self._fits(len(system) + len(first.text), tokens):
-                chosen = option
-                break
-        context = chosen.context
-        first, parts = request(send, note, kept, texts.get(IMPORTS))
-        entry["batches"].append(
-            {"number": number, "ids": list(ids), "max_tokens": max_tokens, "prompt_parts": parts}
-        )
-        entry["bytes_sent"] += own_bytes
+        def fits(built: _Built, *, grouped: bool = False) -> bool:
+            # a group also shows the changes of the groups before it (at most KEPT_DIFF_CHARS)
+            extra = KEPT_DIFF_CHARS - built.kept_chars if grouped else 0
+            return self._fits(built.chars + max(extra, 0), built.tokens)
+
+        def split(send: _Send) -> list[_Send]:
+            """`send`'s regions in groups whose requests fit the known limit, packed greedily
+            in file order (IMPORTS with the first); one group when they cannot be split."""
+            head = [IMPORTS] if IMPORTS in send.ids else []
+            groups: list[list[str]] = []
+            for rid in [i for i in send.ids if i != IMPORTS]:
+                if groups:
+                    trial = [*groups[-1], rid]
+                    trial_send = dataclasses.replace(send, ids=trial)
+                    if fits(build(trial_send, smallest=True), grouped=True):
+                        groups[-1] = trial
+                        continue
+                groups.append([*(head if not groups else []), rid])
+            out = []
+            for group in groups:
+                errors = [e for e, where in send.attributed if set(where) & set(group)]
+                error = join_errors(errors) if errors and send.rejected is not None else send.error
+                out.append(dataclasses.replace(send, ids=group, error=error))
+            return out or [send]
+
+        def requeue(send: _Send, reason: str, queue: list[_Send]) -> bool:
+            groups = split(send)
+            if len(groups) < 2:
+                return False
+            batch = entry["batches"][-1] if entry["batches"] else None
+            record = {
+                "ids": list(send.ids),
+                "groups": [g.ids for g in groups],
+                "reason": reason,
+                "check_retry": send.rejected is not None,
+            }
+            if batch is not None and batch["number"] == number:
+                batch.setdefault("splits", []).append(record)
+            else:
+                pending_splits.append(record)
+            queue[:0] = groups
+            return True
+
+        pending_splits: list[dict[str, Any]] = []
+        entry["bytes_sent"] += imports_bytes + sum(size(i) for i in ids)
+        if sections is not None:
+            entry["guide_sections"] = sections
+        queue = [_Send(list(ids))]
+        retry_recorded: set[int] = set()  # ids of the retries whose nudge was recorded
+        while queue:
+            send = queue.pop(0)
+            built = build(send)
+            if not fits(built) and requeue(send, "limit", queue):
+                continue
+            self._record_request(entry, built)
+            if not any(b["number"] == number for b in entry["batches"]):
+                entry["batches"].append(
+                    {
+                        "number": number,
+                        "ids": list(ids),
+                        "max_tokens": built.max_tokens,
+                        "prompt_parts": built.parts,
+                    }
+                    | ({"splits": pending_splits} if pending_splits else {})
+                )
+                if number == 1:
+                    entry["max_tokens"], entry["prompt_parts"] = built.max_tokens, built.parts
+                    repeated = self._repeated(path)
+                    if repeated and built.note:
+                        entry["repeated_errors"] = repeated
+            retry = send.retry_of
+            if retry is not None and id(retry) not in retry_recorded:
+                retry_recorded.add(id(retry))
+                attempt.nudges.append(
+                    {
+                        "kind": "check_retry",
+                        "file": path,
+                        "error": retry.error,
+                        "keep_fixed": retry.keep_fixed,
+                        "response": retry.response,
+                        "message": built.note,
+                        "prompt_parts": built.parts,
+                        "regions_resent": list(retry.ids),
+                        "attributed": [{"error": e, "regions": w} for e, w in retry.attributed],
+                        **({"repeated_errors": retry.repeated} if retry.repeated else {}),
+                    }
+                )
+            messages = [built.message]
+            sent.append(built.message)
+            try:
+                outcome = self._region_exchange(
+                    attempt,
+                    entry,
+                    path,
+                    plan,
+                    send,
+                    messages,
+                    sent,
+                    system,
+                    built,
+                    base,
+                    final=last and not queue,
+                )
+            except _Abort as abort:
+                if abort.limit is None or not requeue(send, "refused", queue):
+                    raise
+                continue
+            if outcome.batch is not None:
+                return outcome.batch
+            applied, result = outcome.applied, outcome.result
+            assert applied is not None
+            errors, checks = outcome.errors, outcome.checks
+            if not errors and queue:
+                # an earlier group passed: the others are checked over it
+                base = dict(applied.texts)
+                if IMPORTS in outcome.blocks:
+                    for later in queue:
+                        later.imports_text = None
+                continue
+            if not errors:
+                return _BatchOutcome(texts=applied.texts, result=result)
+            rejected = {**outcome.blocks, **applied.texts}  # checked texts where they passed
+            attributed = attribute_errors(
+                errors,
+                plan,
+                applied.spliced,
+                result.text if result else "",
+                rejected,
+                fallback=[i for i in send.ids if i != IMPORTS] or plan.ids,
+            )
+            shown = [e for e, _ in attributed]
+            error = join_errors(shown)
+            affected = ordered_ids(plan, [i for _, where in attributed for i in where])
+            reply = entry["replies"][-1]
+            reply["attributed"] = [{"error": e, "regions": where} for e, where in attributed]
+            entry["failed_checks"] = _failed_checks(shown, checks)
+            history = self.wf_error_history.setdefault(path, [])
+            current = {error_key(e) for e in shown}
+            keep_fixed = [k for k in history if k not in current]
+            history += [k for k in dict.fromkeys(map(error_key, shown)) if k not in history]
+            if send.retries >= self.config.max_check_retries_per_file:
+                return _BatchOutcome(error=error, candidate=applied.text or None, rejected=rejected)
+            again = self._repeated(path, list(current))
+            base = dict(applied.texts)
+            for i in affected:
+                base.pop(i, None)
+            # the regions of groups not sent yet stay at their original text
+            for later in queue:
+                for i in later.ids:
+                    base.pop(i, None)
+            retry_send = _Send(
+                affected,
+                retries=send.retries + 1,
+                error=error,
+                keep_fixed=keep_fixed,
+                repeated=again,
+                rejected=rejected,
+                imports_text=rejected.get(IMPORTS),
+                attributed=attributed,
+                response=reply["response"],
+            )
+            retry_send.retry_of = retry_send
+            queue.insert(0, retry_send)
+        raise AssertionError("a region batch ends with a result")  # pragma: no cover
+
+    def _record_request(self, entry: dict[str, Any], built: _Built) -> None:
+        """A region request's context in the file's entry (merged over its requests)."""
+        context = built.context.context
         entry["context_files"] = list(
             dict.fromkeys([*entry["context_files"], *(p.split(" ", 1)[0] for p, _ in context)])
         )
-        entry["context_forms"] = {**entry.get("context_forms", {}), **chosen.forms}
+        entry["context_forms"] = {**entry.get("context_forms", {}), **built.context.forms}
         entry["context_left_out"] = list(
-            dict.fromkeys([*entry["context_left_out"], *chosen.left_out])
+            dict.fromkeys([*entry["context_left_out"], *built.context.left_out])
         )
-        if sections is not None:
-            entry["guide_sections"] = sections
-        if number == 1:
-            entry["max_tokens"], entry["prompt_parts"] = max_tokens, parts
-            repeated = self._repeated(path)
-            if repeated and note:
-                entry["repeated_errors"] = repeated
-        messages = [first]
-        sent.append(first)
-        retries = 0
-        base = dict(texts)
+
+    def _region_exchange(
+        self,
+        attempt: Attempt,
+        entry: dict[str, Any],
+        path: str,
+        plan: RegionPlan,
+        send: _Send,
+        messages: list[Message],
+        sent: list[Message],
+        system: str,
+        built: _Built,
+        base: dict[str, str],
+        *,
+        final: bool,
+    ) -> _Exchange:
+        """One region request and its format nudges (same conversation): the batch's end (a
+        whole file returned that passed, or a parse error), or the spliced reply and its check
+        errors. `final`: the file's last request (the "changed" check applies)."""
+        original = self._read(self.repo, path)
+        required = must_change(path, self.findings)
         while True:
             response = self._call_llm(
-                attempt, messages, max_tokens=max_tokens, need_tokens=tokens, system=system
+                attempt,
+                messages,
+                max_tokens=built.max_tokens,
+                need_tokens=built.tokens,
+                system=system,
             )
             sent.append(messages[-1])
             if response.stop_reason == "refusal":
                 raise _Abort("refusal", f"the model declined the request ({response.refusal})")
             parsed = parse_region_blocks(
                 response.text,
-                send,
+                send.ids,
                 original=original,
                 truncated=response.stop_reason == "max_tokens",
             )
             reply: dict[str, Any] = {
                 "response": len(attempt.responses) - 1,
                 "parse": parsed.outcome,
-                "batch": number,
+                "batch": entry["batches"][-1]["number"],
             }
             if parsed.labels:
                 reply["labels"] = parsed.labels
@@ -1404,14 +1646,14 @@ class _Job:
                 reply["form_returned"] = "whole"
                 reply["checks"] = whole.checks
                 if whole.ok:
-                    return _BatchOutcome(whole=whole)
+                    return _Exchange(batch=_BatchOutcome(whole=whole))
                 problem = (
                     "You returned the whole file, and it failed apifix's checks ("
                     f"{join_errors(whole.errors)}). Return only the regions."
                 )
             if parsed.outcome in ("no_block", "labels", "whole"):
                 if self._nudges(attempt, "code_block") < self.config.max_code_block_nudges:
-                    nudge = labels_nudge(send, problem)
+                    nudge = labels_nudge(send.ids, problem)
                     attempt.nudges.append(
                         {
                             "kind": "code_block",
@@ -1425,70 +1667,28 @@ class _Job:
                     sent.append(messages[-1])
                     continue
                 error = _REGION_PARSE_ERRORS[parsed.outcome]
-                return _BatchOutcome(error=f"{error}: {problem}" if problem else error)
+                return _Exchange(
+                    batch=_BatchOutcome(error=f"{error}: {problem}" if problem else error)
+                )
             if parsed.outcome == "truncated":
-                return _BatchOutcome(error=_REGION_PARSE_ERRORS["truncated"])
+                return _Exchange(batch=_BatchOutcome(error=_REGION_PARSE_ERRORS["truncated"]))
             applied = apply_blocks(original, plan, parsed.blocks, base)
             result: CheckResult | None = None
             errors = applied.errors
             checks = ["regions"] * len(errors)
             if not errors:
-                result = self._check(path, original, applied.text, required=required and last)
+                result = self._check(path, original, applied.text, required=required and final)
                 reply["checks"] = result.checks
                 reply["auto_imports"] = result.auto_imports
                 reply["reverted"] = result.reverted
                 errors, checks = result.errors, result.error_checks
-            if not errors:
-                return _BatchOutcome(texts=applied.texts, result=result)
-            rejected = {**parsed.blocks, **applied.texts}  # checked texts where they passed
-            attributed = attribute_errors(
-                errors,
-                plan,
-                applied.spliced,
-                result.text if result else "",
-                rejected,
-                fallback=[i for i in send if i != IMPORTS] or plan.ids,
+            return _Exchange(
+                applied=applied,
+                result=result,
+                errors=list(errors),
+                checks=list(checks),
+                blocks=dict(parsed.blocks),
             )
-            shown = [e for e, _ in attributed]
-            error = join_errors(shown)
-            affected = ordered_ids(plan, [i for _, where in attributed for i in where])
-            reply["attributed"] = [{"error": e, "regions": where} for e, where in attributed]
-            entry["failed_checks"] = _failed_checks(shown, checks)
-            history = self.wf_error_history.setdefault(path, [])
-            current = {error_key(e) for e in shown}
-            keep_fixed = [k for k in history if k not in current]
-            history += [k for k in dict.fromkeys(map(error_key, shown)) if k not in history]
-            if retries >= self.config.max_check_retries_per_file:
-                return _BatchOutcome(error=error, candidate=applied.text or None, rejected=rejected)
-            retries += 1
-            again = self._repeated(path, list(current))
-            note = region_previous_note(
-                path, original, plan, rejected, affected, error, keep_fixed, _repeated_text(again)
-            )
-            others = [i for i in rejected if i not in affected and i != IMPORTS]
-            kept = regions_diff(path, original, plan, rejected, others, limit=KEPT_DIFF_CHARS)
-            base = dict(applied.texts)
-            for i in affected:
-                base.pop(i, None)
-            send = affected
-            tokens, max_tokens = budget(send)
-            retry, retry_parts = request(send, note, kept, rejected.get(IMPORTS))
-            attempt.nudges.append(
-                {
-                    "kind": "check_retry",
-                    "file": path,
-                    "error": error,
-                    "keep_fixed": keep_fixed,
-                    "response": reply["response"],
-                    "message": note,
-                    "prompt_parts": retry_parts,
-                    "regions_resent": list(send),
-                    "attributed": reply["attributed"],
-                    **({"repeated_errors": again} if again else {}),
-                }
-            )
-            messages = [retry]
-            sent.append(retry)
 
     def _extra_guide(self, path: str) -> str:
         """Guide parts a file's request needs that the job's system prompt left out (per-file
@@ -1901,6 +2101,54 @@ def feedback_lines_in(path: str, original: str, fixed: str, v: Verification) -> 
 
 
 @dataclass
+class _Send:
+    """One region request of a batch: the regions it sends (IMPORTS among them when it must
+    come back). A check retry also has how many retries led to it, its errors, the rejected
+    texts (for the previous version's diff) and IMPORTS as last returned, which regions each
+    error concerns, the reply it answers, and the retry it is a group of (itself if unsplit)."""
+
+    ids: list[str]
+    retries: int = 0
+    error: str = ""
+    keep_fixed: list[str] = field(default_factory=list)
+    repeated: list[dict[str, Any]] = field(default_factory=list)
+    rejected: dict[str, str] | None = None
+    imports_text: str | None = None
+    attributed: list[tuple[str, list[str]]] = field(default_factory=list)
+    response: int | None = None
+    retry_of: _Send | None = None
+
+
+@dataclass
+class _Built:
+    """A region request as built: the message, its parts' sizes, the context it shows, the
+    reply estimate and budget, its previous-version note, its characters (with the system
+    prompt) and those of its read-only diff of the file's other changes."""
+
+    message: Message
+    parts: dict[str, int]
+    context: _Context
+    tokens: int
+    max_tokens: int
+    note: str
+    chars: int
+    kept_chars: int
+
+
+@dataclass
+class _Exchange:
+    """How one region request ended: the batch's outcome (a whole file returned that passed,
+    or a parse error), or the spliced reply with its check errors and the blocks returned."""
+
+    batch: _BatchOutcome | None = None
+    applied: SpliceResult | None = None
+    result: CheckResult | None = None
+    errors: list[str] = field(default_factory=list)
+    checks: list[str] = field(default_factory=list)
+    blocks: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class _BatchOutcome:
     """How one batch of a region-edited file ended: its regions' texts and the checked file
     (passed), the whole file the model returned instead (passed its checks), or an error with
@@ -2138,7 +2386,11 @@ def report_markdown(
                 kept = (
                     f"; kept: {', '.join(f'`{p}`' for p in a.kept_files)}" if a.kept_files else ""
                 )
-                lines.append(f"- Attempt {a.number} ({a.result}): {files}{kept}")
+                deferred = "".join(
+                    f"; not sent: `{d['path']}` (it imports `{d['module']}`, which failed)"
+                    for d in a.deferred
+                )
+                lines.append(f"- Attempt {a.number} ({a.result}): {files}{deferred}{kept}")
     lines += [f"- Note: {n}" for n in job.llm.notes]
     if chosen and chosen.verification and environment_incomplete(chosen.verification):
         lines.append(
