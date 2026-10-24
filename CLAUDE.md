@@ -123,7 +123,9 @@ src/apifix/
                       mock.patch targets missing from repo modules or patching the code under
                       test, with the concrete target, mock chain and response shape instead;
                       library targets (`openai.OpenAI`) that modules importing the name with
-                      `from openai import` never see
+                      `from openai import` never see; when the patched module gives no target,
+                      the repo modules that call the library (those the test reaches first),
+                      each with the target that fits how it binds the library
 benchmark/            real repos + scoring
 docs/plans/           approved plans, one file per step (request, plan, amendments)
 tests/                pytest; fixtures/ holds realistic sample code
@@ -655,6 +657,23 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   call-path match; split over 3 lines when long), and the message then says mock responses
   must be objects, naming the test file's top-level functions that `return` a dict literal.
   Calls with no known shape keep a `<the test's mock response>` placeholder.
+- Suggestions from other modules: when the patched module's own code gives none (genai: the
+  test patched `genai.context.OpenAI`, and context.py never touches openai), the message lists
+  where a patch would reach the library: the patched module first if it calls the library,
+  then the non-test modules the test file reaches through imports (`context.reachable_modules`:
+  absolute and relative imports, each package's `__init__.py`, transitively), or all of them
+  when it reaches none ("the test reaches none of them through its imports"); at most 3, the
+  rest named "(also: ...)". A module counts when the first library call in its top-level
+  functions (source order) is recognised as above; its target follows how it binds the
+  library: `from openai import OpenAI` -> `<module>.OpenAI`; `import openai [as oa]` +
+  `openai.OpenAI()` -> `openai.OpenAI` (the library's own path); module-level resource calls
+  -> `openai.chat.completions.create` (chain `create.return_value`); a module-level client ->
+  `<module>.client.chat.completions.create`; a factory -> `<module>.get_client`. Module path:
+  the one the tests import it by (as for library targets). Text from the working copy (files
+  accepted so far); modules with findings that no reply has been accepted for yet (skipped
+  files) are left out, since their 0.x calls are no 1.x target. One example, for the first
+  module. Not sources: methods (`self.client = OpenAI()` in `__init__`), module-level script
+  code, imports inside functions.
 - Mock targets (test files): string first arguments of `patch`, `mock.patch`,
   `unittest.mock.patch`, `mocker.patch` that are new versus the original. The longest prefix
   naming a repo module (`a/b.py` or `a/b/__init__.py`, looked up in the test file's own dir, the
@@ -693,6 +712,19 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   current reply does not have, under "Keep these fixed", compared and shown by first line
   without the `line N:` prefix (also `original line N:`, `after original line N:`), so the
   same problem on another line counts as the same.
+- Repeated errors: each file entry records `failed_checks` ([check, error key] of its last
+  reply, when that failed a check; `regions` for region splice errors). Per file and pair, a
+  streak counts the consecutive attempts the file ended failing with it (consecutive tries:
+  an attempt that ends before the file is sent does not break it); acceptance, or an attempt
+  ending without the pair (also a reply without a code block), ends it. After two in a row,
+  the file's next requests (the first, and a check retry that has the error again) say "This
+  is the same error as last time (attempts 2 and 3); your previous fix did not change the
+  target. Patch what the error says:" (mock targets; other checks: "did not change it. Do
+  something different this time:") with the error key (`repeated_errors` on the entry and the
+  nudge). After three, the job stops: `repeated_check_error: <file> failed the <check> check
+  with the same error on attempts 2, 3 and 4 (<key, 160 characters>); stopped with N
+  attempt(s) left` (outcome aborted), or the best attempt's outcome with "; stopped early:
+  ..." appended when an earlier attempt was verified.
 - After a failed verification every Python file is resent with the verifier's reasons and
   failing test output (at most 10 tests, 2,000 characters each, 8,000 in total). A dependency
   file (accepted, or set by apifix) is resent only when a reason or remaining finding names

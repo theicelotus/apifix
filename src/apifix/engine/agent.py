@@ -97,6 +97,7 @@ from apifix.engine.whole_file import (
     REPLY_CHARS_PER_TOKEN,
     CheckResult,
     as_file,
+    attempts_text,
     check_candidate,
     context_candidates,
     error_key,
@@ -109,6 +110,7 @@ from apifix.engine.whole_file import (
     previous_version_note,
     region_previous_note,
     region_prompt,
+    repeated_errors_note,
     reply_budget,
     select_context,
     select_files,
@@ -150,6 +152,11 @@ LOWERED_NOTE = "sent again with fewer reply tokens"
 # characters a region request has besides its regions, context and feedback.
 DEFAULT_CHARS_PER_TOKEN = 3.0
 REGION_REQUEST_OVERHEAD_CHARS = 1_500
+# whole-file: a file that failed a check with the same error on REPEATED_ERROR_NOTE_AT consecutive
+# attempts is told so in its next request; on REPEATED_ERROR_STOP_AT, the job stops
+REPEATED_ERROR_NOTE_AT = 2
+REPEATED_ERROR_STOP_AT = 3
+REPEATED_KEY_CHARS = 160  # of the error in the stop reason
 
 
 def token_limit_margin(limit: int) -> int:
@@ -402,6 +409,13 @@ class _Job:
         # whole-file: every check error of every reply so far, per file (error_key form), for
         # the "keep these fixed" part of a retry message; and the imports apifix may add
         self.wf_error_history: dict[str, list[str]] = {}
+        # whole-file: per file, each (check, error_key) its consecutive failed attempts had, with
+        # their numbers (acceptance, or a failure without that error, ends a streak); the files
+        # accepted so far (the others with findings are still on the old API); why the job
+        # stopped early ("" when it did not)
+        self.wf_streaks: dict[str, dict[tuple[str, str], list[int]]] = {}
+        self.wf_accepted: set[str] = set()
+        self.wf_stop = ""
         self.known_imports = import_table(STDLIB_IMPORTS, migration.known_imports)
         # Variables the repo's CI sets that the sandbox's test phase gets placeholders for
         # (name -> workflow file), in the baseline and in every verification.
@@ -709,9 +723,41 @@ class _Job:
                 rest = {p: self.wf_previous[p] for p in pending[i + 1 :] if p in self.wf_previous}
                 self.wf_pending = pending[i:]
                 self.wf_previous = {path: (candidate, entry["error"]), **rest}
+                self._count_repeats(attempt.number, path, entry)
                 return False
+            self.wf_streaks.pop(path, None)
         self.wf_pending, self.wf_previous, self.wf_region_previous = [], {}, {}
         return True
+
+    def _count_repeats(self, number: int, path: str, entry: dict[str, Any]) -> None:
+        """After `path` failed in attempt `number`: extend the streaks of the (check, error)
+        pairs its last reply failed with (`failed_checks`), drop the others, and stop the job
+        when one reaches REPEATED_ERROR_STOP_AT."""
+        before = self.wf_streaks.get(path, {})
+        streaks = {
+            (check, key): [*before.get((check, key), []), number]
+            for check, key in entry.get("failed_checks", [])
+        }
+        self.wf_streaks[path] = streaks
+        for (check, key), numbers in streaks.items():
+            if len(numbers) >= REPEATED_ERROR_STOP_AT:
+                shown = key if len(key) <= REPEATED_KEY_CHARS else key[:REPEATED_KEY_CHARS] + "..."
+                left = self.config.max_retries + 1 - number
+                self.wf_stop = (
+                    f"{path} failed the {check} check with the same error on attempts "
+                    f"{attempts_text(numbers)} ({shown})"
+                    + (f"; stopped with {left} attempt(s) left" if left else "")
+                )
+                return
+
+    def _repeated(self, path: str, current: Sequence[str] | None = None) -> list[dict[str, Any]]:
+        """The errors `path` failed with on at least REPEATED_ERROR_NOTE_AT consecutive
+        attempts before this one (only those among `current`, error_key form, when given)."""
+        return [
+            {"check": check, "error": key, "attempts": numbers}
+            for (check, key), numbers in self.wf_streaks.get(path, {}).items()
+            if len(numbers) >= REPEATED_ERROR_NOTE_AT and (current is None or key in current)
+        ]
 
     def _after_rejection(self, number: int, v: Verification) -> None:
         """Whole-file: what the next attempt sends. Every file again, from the original with
@@ -853,9 +899,12 @@ class _Job:
         required = must_change(path, self.findings)
         own_bytes = len(original.encode("utf-8"))
         previous = ""
+        repeated = self._repeated(path)
         if path in self.wf_previous:
             text, reason = self.wf_previous[path]
-            previous = previous_version_note(path, original, text, reason)
+            previous = previous_version_note(
+                path, original, text, reason, repeated=_repeated_text(repeated)
+            )
         tokens = file_tokens(original, self._read(self.work, path))
         max_tokens = reply_budget(tokens, self.config.max_output_tokens)
         guide = self._extra_guide(path)
@@ -922,6 +971,8 @@ class _Job:
         }
         if sections is not None:
             entry["guide_sections"] = sections
+        if repeated and previous:
+            entry["repeated_errors"] = repeated
         attempt.files.append(entry)
         retries = 0
         candidate: str | None = None
@@ -942,6 +993,7 @@ class _Job:
                     "parse": parsed.outcome,
                 }
                 entry["replies"].append(reply)
+                entry.pop("failed_checks", None)
                 if parsed.outcome != "ok":
                     if (
                         parsed.outcome != "truncated"
@@ -969,6 +1021,7 @@ class _Job:
                 candidate = result.text
                 if not result.ok:
                     error = join_errors(result.errors)
+                    entry["failed_checks"] = _failed_checks(result.errors, result.error_checks)
                     history = self.wf_error_history.setdefault(path, [])
                     current = {error_key(e) for e in result.errors}
                     keep_fixed = [k for k in history if k not in current]
@@ -977,7 +1030,10 @@ class _Job:
                     ]
                     if retries < self.config.max_check_retries_per_file:
                         retries += 1
-                        note = previous_version_note(path, original, candidate, error, keep_fixed)
+                        again = self._repeated(path, list(current))
+                        note = previous_version_note(
+                            path, original, candidate, error, keep_fixed, _repeated_text(again)
+                        )
                         retry, retry_parts = request(note)
                         attempt.nudges.append(
                             {
@@ -988,6 +1044,7 @@ class _Job:
                                 "response": reply["response"],
                                 "message": note,
                                 "prompt_parts": retry_parts,
+                                **({"repeated_errors": again} if again else {}),
                             }
                         )
                         messages = [retry]
@@ -1016,6 +1073,7 @@ class _Job:
         entry["reverted"] = result.reverted
         entry["accepted"] = True
         entry["changed"] = result.text != original
+        self.wf_accepted.add(path)
 
     def _check(self, path: str, original: str, candidate: str, *, required: bool) -> CheckResult:
         """check_candidate with the job's settings."""
@@ -1033,6 +1091,7 @@ class _Job:
             test_files=self.wf_test_files,
             findings=[f for f in self.findings if f.file == path],
             rewrite_checks=self.rewrite_checks,
+            unmigrated_modules={f.file for f in self.open_findings} - self.wf_accepted - {path},
         )
 
     def _updated_context(self, path: str) -> list[tuple[str, str]]:
@@ -1215,9 +1274,10 @@ class _Job:
             return ""
         text, reason = self.wf_previous[path]
         texts = self.wf_region_previous.get(path)
+        repeated = _repeated_text(self._repeated(path))
         if texts is None and text is not None:  # the last version was a whole file
-            return previous_version_note(path, original, text, reason)
-        return region_previous_note(path, original, plan, texts, ids, reason)
+            return previous_version_note(path, original, text, reason, repeated=repeated)
+        return region_previous_note(path, original, plan, texts, ids, reason, repeated=repeated)
 
     def _region_batch(
         self,
@@ -1307,6 +1367,9 @@ class _Job:
             entry["guide_sections"] = sections
         if number == 1:
             entry["max_tokens"], entry["prompt_parts"] = max_tokens, parts
+            repeated = self._repeated(path)
+            if repeated and note:
+                entry["repeated_errors"] = repeated
         messages = [first]
         sent.append(first)
         retries = 0
@@ -1332,6 +1395,7 @@ class _Job:
             if parsed.labels:
                 reply["labels"] = parsed.labels
             entry["replies"].append(reply)
+            entry.pop("failed_checks", None)
             problem = parsed.problem
             if parsed.outcome == "whole":
                 whole = self._check(
@@ -1367,12 +1431,13 @@ class _Job:
             applied = apply_blocks(original, plan, parsed.blocks, base)
             result: CheckResult | None = None
             errors = applied.errors
+            checks = ["regions"] * len(errors)
             if not errors:
                 result = self._check(path, original, applied.text, required=required and last)
                 reply["checks"] = result.checks
                 reply["auto_imports"] = result.auto_imports
                 reply["reverted"] = result.reverted
-                errors = result.errors
+                errors, checks = result.errors, result.error_checks
             if not errors:
                 return _BatchOutcome(texts=applied.texts, result=result)
             rejected = {**parsed.blocks, **applied.texts}  # checked texts where they passed
@@ -1388,6 +1453,7 @@ class _Job:
             error = join_errors(shown)
             affected = ordered_ids(plan, [i for _, where in attributed for i in where])
             reply["attributed"] = [{"error": e, "regions": where} for e, where in attributed]
+            entry["failed_checks"] = _failed_checks(shown, checks)
             history = self.wf_error_history.setdefault(path, [])
             current = {error_key(e) for e in shown}
             keep_fixed = [k for k in history if k not in current]
@@ -1395,7 +1461,10 @@ class _Job:
             if retries >= self.config.max_check_retries_per_file:
                 return _BatchOutcome(error=error, candidate=applied.text or None, rejected=rejected)
             retries += 1
-            note = region_previous_note(path, original, plan, rejected, affected, error, keep_fixed)
+            again = self._repeated(path, list(current))
+            note = region_previous_note(
+                path, original, plan, rejected, affected, error, keep_fixed, _repeated_text(again)
+            )
             others = [i for i in rejected if i not in affected and i != IMPORTS]
             kept = regions_diff(path, original, plan, rejected, others, limit=KEPT_DIFF_CHARS)
             base = dict(applied.texts)
@@ -1415,6 +1484,7 @@ class _Job:
                     "prompt_parts": retry_parts,
                     "regions_resent": list(send),
                     "attributed": reply["attributed"],
+                    **({"repeated_errors": again} if again else {}),
                 }
             )
             messages = [retry]
@@ -1543,6 +1613,8 @@ class _Job:
                 if self.whole_file:
                     attempt.result = "check_failed"
                     attempt.diff = unified_diff(self.repo, self.work)
+                    if self.wf_stop:
+                        break  # the same check error again: more attempts would repeat it
                 else:
                     attempt.result = "no_changes"
                 continue
@@ -1573,14 +1645,17 @@ class _Job:
 
         best = self.best_attempt()
         if best is None:
+            if self.wf_stop:
+                return "aborted", f"repeated_check_error: {self.wf_stop}"
             if self.whole_file:
                 return "aborted", "check_failed: no attempt's files passed the checks"
             return "aborted", "no_changes: the model made no edits in any attempt"
         self._restore(best.snapshot)
         outcome: Outcome = "rejected" if best.result == "rejected" else "unverified"
+        stopped = f"; stopped early: {self.wf_stop}" if self.wf_stop else ""
         return outcome, (
             f"not verified after {len(self.attempts)} attempt(s); best was attempt "
-            f"{best.number} ({best.result})"
+            f"{best.number} ({best.result}){stopped}"
         )
 
     def _set_pins(self) -> None:
@@ -1834,6 +1909,16 @@ class _BatchOutcome:
     error: str = ""
     candidate: str | None = None
     rejected: dict[str, str] | None = None
+
+
+def _failed_checks(errors: Sequence[str], checks: Sequence[str]) -> list[list[str]]:
+    """[check, error_key] of each error, once each, in order (an entry's `failed_checks`)."""
+    pairs = dict.fromkeys((check, error_key(e)) for e, check in zip(errors, checks, strict=True))
+    return [list(pair) for pair in pairs]
+
+
+def _repeated_text(repeated: Sequence[dict[str, Any]]) -> str:
+    return repeated_errors_note([(r["check"], r["error"], r["attempts"]) for r in repeated])
 
 
 _REGION_PARSE_ERRORS = {

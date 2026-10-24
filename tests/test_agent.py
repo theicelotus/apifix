@@ -44,6 +44,7 @@ from apifix.engine.scanner import scan
 from apifix.engine.test_results import FileCoverage
 from tests.integration.tiny_repo import ORIGINAL as TINY
 from tests.test_code_checks import (
+    INDIRECT,
     LIVE2_CODE_UNDER_TEST_WF,
     LIVE2_TESTS,
     LIVE_APP,
@@ -53,6 +54,7 @@ from tests.test_code_checks import (
     RUN3_FIXED_TESTS,
     RUN3_TESTS_1,
     SUGGESTED_FIX,
+    indirect_test,
 )
 from tests.test_verifier import (
     APP_NEW,
@@ -2459,3 +2461,136 @@ def test_whole_file_sends_a_library_patch_that_misses_from_imports_back(tmp_path
     )
     assert [f["accepted"] for f in attempt["files"]] == [True, True, True, True]
     assert '+    with patch("src.storyteller.llm.OpenAI") as mock_class:' in result.diff
+
+
+# --- whole-file: a test that reaches the library only indirectly (indirect_reach fixture) -----
+
+
+def _indirect_migrated(rel: str, binding: str) -> str:
+    """The fixture's notebook/<rel> on 1.x: `binding` replaces `import openai`."""
+    text = (INDIRECT / rel).read_text().replace("import openai\n", f"{binding}\n")
+    client = "OpenAI()" if binding.startswith("from") else "openai.OpenAI()"
+    text = text.replace(
+        "    response = openai.ChatCompletion.create(",
+        f"    client = {client}\n    response = client.chat.completions.create(",
+    )
+    return text.replace(
+        'response["choices"][0]["message"]["content"]', "response.choices[0].message.content"
+    )
+
+
+INDIRECT_MODULES = (
+    ("notebook/batch.py", "import openai"),
+    ("notebook/generate.py", "from openai import OpenAI"),
+)
+INDIRECT_LIBRARY = tuple(block(_indirect_migrated(rel, b)) for rel, b in INDIRECT_MODULES)
+
+
+def _indirect_library(file_edits: str) -> tuple[LLMResponse, ...]:
+    """The library modules' replies: whole files, or their import block and function (R1)."""
+    if file_edits != "regions":
+        return INDIRECT_LIBRARY
+    replies = []
+    for rel, binding in INDIRECT_MODULES:
+        function = _indirect_migrated(rel, binding).split("\n\n\n", 1)[1]
+        replies.append(done(f"```python IMPORTS\n{binding}\n```\n\n```python R1\n{function}```"))
+    return tuple(replies)
+
+
+INDIRECT_R1 = """\
+@patch("{target}")
+def test_assist_adds_the_reply_to_the_context(OpenAI, shell):
+    OpenAI.return_value.chat.completions.create.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(role="assistant", content="plot(df)"))]
+    )
+    shell.run_cell("a = 1")
+    shell.run_cell("%%assist\\nMake a plot")
+
+    context = build_context(shell.history)
+
+    assert context[-1] == {{"role": "assistant", "content": "plot(df)"}}
+    assert OpenAI.return_value.chat.completions.create.call_count == 1
+"""
+
+
+def _indirect_reply(file_edits: str, target: str) -> LLMResponse:
+    if file_edits == "regions":
+        return done(f"```python R1\n{INDIRECT_R1.format(target=target)}```")
+    return block(indirect_test(target))
+
+
+def _indirect_job(tmp_path, file_edits: str, *test_replies: str, **config):
+    repo = tmp_path / "repo"
+    shutil.copytree(INDIRECT, repo)
+    test = "tests.test_context::test_assist_adds_the_reply_to_the_context"
+    replies = [_indirect_reply(file_edits, t) for t in test_replies]
+    llm = FakeLLM([*_indirect_library(file_edits), *replies])
+    sandbox = JudgingSandbox(judge=lambda tree: run((test, "passed")))
+    return llm, wf(repo, llm, sandbox, file_edits=file_edits, **config)
+
+
+WRONG_TARGET = "notebook.context.OpenAI"
+
+
+@pytest.mark.parametrize("file_edits", ["auto", "regions"])
+def test_the_same_check_error_on_three_attempts_stops_the_job(tmp_path, file_edits):
+    llm, result = _indirect_job(tmp_path, file_edits, *[WRONG_TARGET] * 6, max_retries=4)
+    attempts = result.trajectory["attempts"]
+    assert [a["result"] for a in attempts] == ["check_failed"] * 3 and llm.script == []
+    assert result.outcome == "aborted"
+    assert result.reason.startswith(
+        "repeated_check_error: tests/test_context.py failed the mock_targets check with the "
+        "same error on attempts 1, 2 and 3 (mock target 'notebook.context.OpenAI': "
+        "notebook/context.py has no top-level name 'OpenAI'"
+    )
+    assert result.reason.endswith("...); stopped with 2 attempt(s) left")
+    assert f"- Outcome: {result.reason}" in result.report_markdown
+    # each failure named the module the test reaches, with its target
+    first = attempts[0]["nudges"][0]
+    assert first["file"] == "tests/test_context.py"
+    assert (
+        '    notebook/generate.py: generate_reply() creates client = OpenAI(): patch("'
+        in (first["error"])
+    )
+    assert "notebook/batch.py" not in first["error"]  # the test does not reach it
+    (key,) = {k for _, k in attempts[0]["files"][2]["failed_checks"]}
+    assert key.startswith("mock target 'notebook.context.OpenAI'") and key.endswith("uses it:")
+    # attempt 2 follows one failed attempt: no note; attempt 3 follows two
+    assert "same error as last time" not in llm.requests[4][0].text
+    assert "repeated_errors" not in attempts[1]["files"][0]
+    repeated = [{"check": "mock_targets", "error": key, "attempts": [1, 2]}]
+    third = attempts[2]["files"][0]
+    assert third["repeated_errors"] == repeated
+    note = (
+        "This is the same error as last time (attempts 1 and 2); your previous fix did not "
+        f"change the target. Patch what the error says:\n    {key}"
+    )
+    assert note in llm.requests[6][0].text
+    (retry,) = attempts[2]["nudges"]  # the check retry in attempt 3 says it too
+    assert retry["repeated_errors"] == repeated and note in retry["message"]
+
+
+def test_a_different_error_ends_the_streak(tmp_path):
+    right = "notebook.generate.OpenAI"
+    undefined = indirect_test(right).replace("= SimpleNamespace(\n", "= Namespace(\n")
+    repo = tmp_path / "repo"
+    shutil.copytree(INDIRECT, repo)
+    test = "tests.test_context::test_assist_adds_the_reply_to_the_context"
+    wrong = block(indirect_test(WRONG_TARGET))
+    llm = FakeLLM(
+        [*INDIRECT_LIBRARY, wrong, wrong]  # attempt 1
+        + [wrong, block(undefined)]  # attempt 2 ends on another error
+        + [wrong, wrong]  # attempt 3: the first of a new streak
+        + [block(indirect_test(right))]  # attempt 4
+    )
+    sandbox = JudgingSandbox(judge=lambda tree: run((test, "passed")))
+    result = wf(repo, llm, sandbox, max_retries=4)
+    # verified_weak: the fake sandbox reports no coverage of the changed lines
+    assert (result.outcome, result.reason) == ("verified_weak", "verified_weak on attempt 4")
+    assert all("same error as last time" not in m.text for r in llm.requests for m in r)
+    assert [
+        f["failed_checks"][0][0]
+        for a in result.trajectory["attempts"][:3]
+        for f in a["files"]
+        if not f["accepted"]
+    ] == ["mock_targets", "undefined_names", "mock_targets"]

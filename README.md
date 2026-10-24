@@ -189,8 +189,10 @@ or defines, and (test files) patch neither a repo-module name that does not exis
 function the test calls, nor a library name such as `openai.OpenAI` that a module imports with
 `from openai import OpenAI` (the patch never reaches it; the error names the module's own
 target, by the path the tests import it by); the error names the target to patch instead
-where it can, and a failing file gets it back once (a fresh request with the rejected version as a diff, not the
-whole rejected file). Edits away from the migration are caught as well: a changed string,
+where it can (when the patched module never touches the library, the modules the test reaches
+that do, each with its own target), and a failing file gets it back once (a fresh request with the rejected version as a diff, not the
+whole rejected file). A file that fails a check with the same error on two attempts in a row
+is told so; on the third, the job stops instead of spending the remaining attempts. Edits away from the migration are caught as well: a changed string,
 docstring or comment far from any finding (a word slipped into a prompt) is put back by apifix
 and listed in the report ("apifix reverted: ..."); unrelated code changes, or string literals
 that went missing, send the file back. Code counts as related through a finding nearby or a name

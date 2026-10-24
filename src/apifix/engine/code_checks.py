@@ -14,11 +14,13 @@ Pure functions (source text in, messages out); repo modules are read through a c
 from __future__ import annotations
 
 import ast
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from dataclasses import dataclass, replace
 from pathlib import PurePosixPath
 
 from pyflakes import checker, messages
+
+from apifix.engine.context import reachable_modules
 
 # Imports suggested for common standard-library names a rewrite forgets to import.
 STDLIB_IMPORTS = {
@@ -56,6 +58,7 @@ STDLIB_IMPORTS = {
 
 PATCH_FUNCTIONS = frozenset({"patch", "mock.patch", "unittest.mock.patch", "mocker.patch"})
 MAX_LISTED_NAMES = 20
+MAX_SUGGESTED_MODULES = 3  # library-using modules listed when the patched one has no library use
 # Where repo modules are looked up, relative to the repo root; per test file, its own directory
 # and the test plan's import paths come first (module_roots()).
 MODULE_ROOTS = ("", "src/")
@@ -356,6 +359,7 @@ class _ModuleIndex:
     def __init__(self, dotted: str, tree: ast.Module, library_modules: frozenset[str]) -> None:
         self.dotted, self.library = dotted, library_modules
         self.imports: dict[str, str] = {}  # local name -> imported dotted path
+        self.module_names: dict[str, str] = {}  # local name -> module, of `import m [as a]`
         self.assigned: dict[str, ast.expr] = {}  # top-level name -> value
         self.functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
         self.methods: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
@@ -363,10 +367,10 @@ class _ModuleIndex:
             if isinstance(stmt, ast.Import):
                 for a in stmt.names:
                     if a.asname:
-                        self.imports[a.asname] = a.name
+                        self.imports[a.asname] = self.module_names[a.asname] = a.name
                     else:
                         root = a.name.split(".")[0]
-                        self.imports[root] = root
+                        self.imports[root] = self.module_names[root] = root
             elif isinstance(stmt, ast.ImportFrom) and stmt.module and not stmt.level:
                 for a in stmt.names:
                     self.imports[a.asname or a.name] = f"{stmt.module}.{a.name}"
@@ -485,6 +489,23 @@ class _ModuleIndex:
                 return _Suggestion(f"{self.dotted}.{dotted}", chain, origin, dotted)
         return None
 
+    def library_use(self) -> _Suggestion | None:
+        """The first call in the module's top-level functions (source order) that goes through
+        the library, with a target that fits how the module binds the name: the library's own
+        path when the module reaches it as a module (`import openai` + `openai.OpenAI()` ->
+        `openai.OpenAI`), else the module's (`from openai import OpenAI` -> `app.OpenAI`, a
+        module-level client -> `app.client.chat.completions.create`, a factory)."""
+        for name in self.functions:
+            s = self.what_it_calls(name)
+            if s is None:
+                continue
+            root, _, tail = s.target[len(self.dotted) + 1 :].partition(".")
+            module = self.module_names.get(root)
+            if module is None or module.split(".")[0] not in self.library:
+                return s
+            return replace(s, target=f"{module}.{tail}" if tail else module)
+        return None
+
 
 @dataclass(frozen=True)
 class _Options:
@@ -494,6 +515,8 @@ class _Options:
     roots: tuple[str, ...] = MODULE_ROOTS  # where repo modules are looked up
     modules: tuple[str, ...] = ()  # the repo's non-test Python files (relpaths)
     test_files: tuple[str, ...] = ()  # the repo's test files (relpaths)
+    path: str | None = None  # the test file being checked (where reachability starts)
+    unmigrated: frozenset[str] = frozenset()  # modules still on the old API (no suggestions)
 
 
 MAX_EXAMPLE_LINE = 88
@@ -536,33 +559,101 @@ def _example(s: _Suggestion, site: _PatchSite, response: str | None) -> str:
     return "For example:\n" + "\n".join(f"    {line}" for line in lines)
 
 
+def _objects_note(options: _Options) -> str:
+    """Mock responses must be objects, naming the test file's helpers that return dicts."""
+    helpers = options.dict_helpers
+    if len(helpers) == 1:
+        return (
+            f"Mock responses must be objects, not dicts: {helpers[0]}() returns a dict; make "
+            "it return an object, e.g. with SimpleNamespace."
+        )
+    if helpers:
+        names = ", ".join(f"{h}()" for h in helpers)
+        return (
+            f"Mock responses must be objects, not dicts: {names} return dicts; make them return "
+            "objects, e.g. with SimpleNamespace."
+        )
+    return "Mock responses must be objects, not dicts (1.x code uses attribute access)."
+
+
 def _fix_text(s: _Suggestion, site: _PatchSite, options: _Options) -> str:
     """`patch(...) and set <chain>.`, the objects-not-dicts note, and the example."""
     response = _response_for(s.path, options.mock_responses)
     text = f'patch("{s.target}") and set {s.chain}.'
     if response:
-        helpers = options.dict_helpers
-        if len(helpers) == 1:
-            text += (
-                f" Mock responses must be objects, not dicts: {helpers[0]}() returns a dict; "
-                "make it return an object, e.g. with SimpleNamespace."
-            )
-        elif helpers:
-            names = ", ".join(f"{h}()" for h in helpers)
-            text += (
-                f" Mock responses must be objects, not dicts: {names} return dicts; make them "
-                "return objects, e.g. with SimpleNamespace."
-            )
-        else:
-            text += " Mock responses must be objects, not dicts (1.x code uses attribute access)."
+        text += f" {_objects_note(options)}"
     return f"{text}\n{_example(s, site, response)}"
+
+
+def _library_name(options: _Options) -> str:
+    return ", ".join(sorted(options.library_modules))
+
+
+def _library_users(
+    own: tuple[str, _ModuleIndex], options: _Options, imports: _RepoImports
+) -> tuple[list[tuple[str, _Suggestion]], list[str], bool]:
+    """Where a patch would reach the library, for a patched module (`own`: its relpath and
+    index) whose own code gives no target: (relpath, suggestion) of at most
+    MAX_SUGGESTED_MODULES modules, the further ones of the same group, and whether the test
+    reaches them. The patched module comes first when it calls the library; then the non-test
+    modules the test reaches through imports, or, when it reaches none, all of them. Modules
+    still on the old API (`options.unmigrated`) are left out: their calls are no 1.x target."""
+    if not options.library_modules:
+        return [], [], False
+    own_rel, own_index = own
+    first: list[tuple[str, _Suggestion]] = []
+    own_use = own_index.library_use() if own_rel not in options.unmigrated else None
+    if own_use is not None:
+        first.append((own_rel, own_use))
+    users: dict[str, _Suggestion] = {}
+    for rel in options.modules:
+        if rel == own_rel or rel in options.unmigrated or not _module_paths(rel, options.roots):
+            continue
+        tree = imports.tree(rel)
+        if tree is None:
+            continue
+        index = _ModuleIndex(imports.module_path(rel)[0], tree, options.library_modules)
+        use = index.library_use()
+        if use is not None:
+            users[rel] = use
+    reached = []
+    if options.path and users:
+        reached = reachable_modules(options.path, imports.read_module, options.roots, set(users))
+    group = first + [(rel, users[rel]) for rel in (reached or users)]
+    shown = group[:MAX_SUGGESTED_MODULES]
+    return shown, [rel for rel, _ in group[MAX_SUGGESTED_MODULES:]], bool(first or reached)
+
+
+def _users_text(
+    own: tuple[str, _ModuleIndex], site: _PatchSite, options: _Options, imports: _RepoImports
+) -> str | None:
+    """ "Patch <library> where a module ... uses it:", one line per module with its target and
+    mock chain, the objects-not-dicts note, and an example for the first; None when no module
+    gives a target."""
+    shown, also, reached = _library_users(own, options, imports)
+    if not shown:
+        return None
+    where = (
+        "a module the test reaches"
+        if reached
+        else "a module (the test reaches none of them through its imports)"
+    )
+    lines = [f"Patch {_library_name(options)} where {where} uses it:"]
+    lines += [f'    {rel}: {s.origin}: patch("{s.target}") and set {s.chain}.' for rel, s in shown]
+    if also:
+        lines.append(f"    (also: {', '.join(also)})")
+    response = _response_for(shown[0][1].path, options.mock_responses)
+    if response:
+        lines.append(_objects_note(options))
+    lines.append(_example(shown[0][1], site, response))
+    return "\n".join(lines)
 
 
 # --- the checks -------------------------------------------------------------------------------
 
 
 def _missing_name_problem(
-    site: _PatchSite, read_module: ReadModule, options: _Options
+    site: _PatchSite, read_module: ReadModule, options: _Options, imports: _RepoImports
 ) -> str | None:
     parts = site.target.split(".")
     for n in range(len(parts) - 1, 0, -1):
@@ -589,7 +680,12 @@ def _missing_name_problem(
         index = _ModuleIndex(".".join(parts[:n]), ast.parse(text), options.library_modules)
         suggestion = index.where_created(name, ".".join(parts[n + 1 :]))
         if suggestion is None:
-            return f"{head}. Patch a name that exists in {rel}"
+            elsewhere = _users_text((rel, index), site, options, imports)
+            if elsewhere is None:
+                return f"{head}. Patch a name that exists in {rel}"
+            lib = _library_name(options)
+            why = "" if index.library_use() else f", and {rel} does not use {lib}"
+            return f"{head}{why}. {elsewhere}"
         verb = "the constructor" if "creates" in suggestion.origin else "that"
         fix = _fix_text(suggestion, site, options)
         return f"{head}; {suggestion.origin}. Patch {verb} instead: {fix}"
@@ -640,6 +736,7 @@ def _code_under_test_problem(
     tree: ast.Module,
     read_module: ReadModule,
     options: _Options,
+    imports: _RepoImports,
 ) -> str | None:
     """A patch of a repo function or class that the test it applies to calls directly."""
     parts = site.target.split(".")
@@ -665,7 +762,11 @@ def _code_under_test_problem(
         index = _ModuleIndex(".".join(parts[:-1]), ast.parse(text), options.library_modules)
         suggestion = index.what_it_calls(parts[-1])
         if suggestion is None:
-            return head
+            elsewhere = _users_text((rel, index), site, options, imports)
+            if elsewhere is None:
+                return head
+            lib = _library_name(options)
+            return f"{head}; {called}() does not call {lib} directly. {elsewhere}"
         return f"{head}: {suggestion.origin}, so {_fix_text(suggestion, site, options)}"
     return None
 
@@ -868,6 +969,8 @@ def mock_target_problems(
     roots: Sequence[str] = MODULE_ROOTS,
     modules: Sequence[str] = (),
     test_files: Sequence[str] = (),
+    path: str | None = None,
+    unmigrated_modules: Collection[str] = (),
 ) -> list[str]:
     """Mock targets new in the candidate that are wrong for a repo module (`read_module(relpath)`
     gives its current text, or None if there is no such file): a name the module does not
@@ -878,7 +981,12 @@ def mock_target_problems(
     `mock_responses` (call path -> example) when one matches the call. A library target
     (`openai.OpenAI`) is wrong when one of `modules` (the repo's non-test files) binds that
     name with `from openai import OpenAI` (see _library_binding_problem; `test_files` tell
-    which module path the tests use)."""
+    which module path the tests use).
+
+    When the patched module's own code gives no target, the message lists where a patch would
+    reach the library instead: modules that call it (the patched one first, then those the
+    test file at `path` reaches through imports, else all), each with the target that fits how
+    it binds the library, except `unmigrated_modules` (still on the old API)."""
     try:
         tree = ast.parse(candidate)
     except (SyntaxError, ValueError):
@@ -890,6 +998,8 @@ def mock_target_problems(
         tuple(roots),
         tuple(modules),
         tuple(test_files),
+        path,
+        frozenset(unmigrated_modules),
     )
     known = {target for _, target in mock_targets(original)}
     sites = _patch_sites(tree)
@@ -899,9 +1009,9 @@ def mock_target_problems(
     for site in sites:
         if site.target in known or site.target in seen:
             continue
-        problem = _missing_name_problem(site, read_module, options)
+        problem = _missing_name_problem(site, read_module, options, imports)
         if problem is None:
-            problem = _code_under_test_problem(site, tree, read_module, options)
+            problem = _code_under_test_problem(site, tree, read_module, options, imports)
         if problem is None:
             problem = _library_binding_problem(
                 site.target, tree, patched, read_module, options, imports

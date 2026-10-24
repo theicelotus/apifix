@@ -11,7 +11,7 @@ from __future__ import annotations
 import ast
 import difflib
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -378,10 +378,12 @@ def region_previous_note(
     ids: Sequence[str],
     reason: str,
     keep_fixed: Sequence[str] = (),
+    repeated: str = "",
 ) -> str:
     """For a region request that follows a failed one: the model's previous version of the
     regions `ids` as a diff against their original lines, and why it failed (`reason`, or ""
-    when the verifier's feedback above says why). `texts` None: no usable reply."""
+    when the verifier's feedback above says why). `texts` None: no usable reply. `repeated`:
+    repeated_errors_note()."""
     named = ", ".join(i for i in ordered_ids(plan, ids)) or path
     if "\n" in reason:
         why = f" was rejected:\n{reason}\n"
@@ -402,6 +404,8 @@ def region_previous_note(
                 f"not copy them back unchanged; fix what failed):\n{fence}diff\n{diff.rstrip()}"
                 f"\n{fence}"
             )
+    if repeated:
+        note += f"\n{repeated}"
     if keep_fixed:
         note += "\nKeep these fixed (problems in your earlier replies for this file):\n"
         note += "\n".join(f"- {k}" for k in keep_fixed)
@@ -452,14 +456,18 @@ def previous_version_note(
     previous: str | None,
     reason: str,
     keep_fixed: Sequence[str] = (),
+    repeated: str = "",
 ) -> str:
     """For a request that follows a failed one (a check retry, or a later attempt): the
     model's previous version of `path` as a short diff against the original, and why it failed
     (`reason`: a check error, or "" when the verifier's feedback above says why). `previous` is
     None when there was no usable file (e.g. the reply had no code block). `keep_fixed`:
     problems of earlier replies for this file that this one does not have (error_key form),
-    listed so that fixing one problem does not bring another back."""
+    listed so that fixing one problem does not bring another back. `repeated`:
+    repeated_errors_note()."""
     note = _previous_version(path, original, previous, reason)
+    if repeated:
+        note += f"\n{repeated}"
     if keep_fixed:
         note += "\nKeep these fixed (problems in your earlier replies for this file):\n"
         note += "\n".join(f"- {k}" for k in keep_fixed)
@@ -492,6 +500,29 @@ def _previous_version(path: str, original: str, previous: str | None, reason: st
         f"Your previous version of {path}{why}{sep}Its changes from the original (do not copy "
         f"them back unchanged; fix what failed):\n{fence}diff\n{diff.rstrip()}\n{fence}"
     )
+
+
+def attempts_text(numbers: Sequence[int]) -> str:
+    """2 -> "2"; 2, 3 -> "2 and 3"; 2, 3, 4 -> "2, 3 and 4"."""
+    *head, last = [str(n) for n in numbers]
+    return f"{', '.join(head)} and {last}" if head else last
+
+
+def repeated_errors_note(repeated: Sequence[tuple[str, str, Sequence[int]]]) -> str:
+    """For a file whose last attempts failed a check with the same error ((check, error_key,
+    attempt numbers) each): says so, so that the model changes its approach instead of
+    sending the same fix again."""
+    lines = []
+    for check, key, numbers in repeated:
+        if check == "mock_targets":
+            advice = "your previous fix did not change the target. Patch what the error says"
+        else:
+            advice = "your previous fix did not change it. Do something different this time"
+        lines.append(
+            f"This is the same error as last time (attempts {attempts_text(numbers)}); "
+            f"{advice}:\n    {key}"
+        )
+    return "\n".join(lines)
 
 
 def join_errors(errors: list[str]) -> str:
@@ -554,6 +585,7 @@ def as_file(body: str, original: str) -> str:
 class CheckResult:
     errors: list[str] = field(default_factory=list)
     checks: dict[str, str] = field(default_factory=dict)  # name -> "ok" / "n/a" / problem
+    error_checks: list[str] = field(default_factory=list)  # the check of each error, in order
     text: str = ""  # what is written if the checks pass: the candidate plus added imports
     auto_imports: list[str] = field(default_factory=list)  # import lines apifix added
     # text-only edits unrelated to the migration that apifix put back (Revert.to_dict())
@@ -579,6 +611,7 @@ def check_candidate(
     test_files: Sequence[str] = (),
     findings: Sequence[Finding] | None = None,
     rewrite_checks: Callable[[str, str, str], list[str]] | None = None,
+    unmigrated_modules: Collection[str] = (),
 ) -> CheckResult:
     """Syntax (Python files), well-formedness (dependency files), "differs from the original"
     (only when `required`), abbreviation (placeholders, or under half the original's lines
@@ -588,7 +621,9 @@ def check_candidate(
     None; `library_modules`, the migrated library, lets messages name the target to patch,
     and `mock_responses` gives its example a response shape; `python_modules` and
     `test_files`, the repo's non-test and test Python files, let a patch of a library name be
-    checked against modules that import that name with `from <library> import X`). Python
+    checked against modules that import that name with `from <library> import X`; when the
+    patched module gives no target, the message lists the modules that call the library,
+    except `unmigrated_modules`, which are still on the old API). Python
     files that parse first get an import for each new undefined name with exactly one
     `known_imports` entry, so every check sees the completed file (`text`, `auto_imports`).
 
@@ -599,16 +634,19 @@ def check_candidate(
     checks (Migration.rewrite_checker), run last on the completed file (check `config`)."""
     checks: dict[str, str] = {}
     errors: list[str] = []
+    error_checks: list[str] = []
 
     def record(name: str, problem: str | None, applies: bool = True) -> None:
         checks[name] = "n/a" if not applies else (problem or "ok")
         if applies and problem:
             errors.append(problem)
+            error_checks.append(name)
 
     def record_all(name: str, problems: list[str], applies: bool) -> None:
         """A check with several independent problems: one error each."""
         checks[name] = "n/a" if not applies else ("; ".join(problems) or "ok")
         errors.extend(problems if applies else [])
+        error_checks.extend([name] * len(problems) if applies else [])
 
     syntax = None
     if path.endswith(".py"):
@@ -666,6 +704,8 @@ def check_candidate(
             roots=module_roots,
             modules=python_modules,
             test_files=test_files,
+            path=path,
+            unmigrated_modules=unmigrated_modules,
         )
         if mocks and read_module is not None
         else []
@@ -681,4 +721,4 @@ def check_candidate(
     config = path.endswith(".py") and not syntax and rewrite_checks is not None
     config_problems = rewrite_checks(path, original, candidate) if config and rewrite_checks else []
     record_all("config", config_problems, config)
-    return CheckResult(errors, checks, candidate, added, reverts)
+    return CheckResult(errors, checks, error_checks, candidate, added, reverts)

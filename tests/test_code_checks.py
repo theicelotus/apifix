@@ -1100,3 +1100,289 @@ def test_aliases_submodules_and_files_with_no_dotted_name():
 def test_a_repo_module_named_like_the_library_is_not_this_check():
     files = {"openai.py": "OpenAI = object\n", "app.py": APP_FROM}
     assert app_problems(files) == []
+
+
+# --- suggestions from the modules that use the library (indirect_reach fixture) --------------
+
+INDIRECT = Path(__file__).parent / "fixtures" / "indirect_reach"
+INDIRECT_TEST = "tests/test_context.py"
+# notebook/generate.py migrated, binding the client class with a from-import
+GENERATE_FROM = '''\
+"""Replies from the chat model."""
+
+from openai import OpenAI
+
+
+def generate_reply(context, text):
+    client = OpenAI()
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[*context, {"role": "user", "content": text}],
+    )
+    yield response.choices[0].message.content
+'''
+BATCH_V1 = """\
+import openai
+
+
+def summarize(texts):
+    client = openai.OpenAI()
+    response = client.chat.completions.create(model="gpt-3.5-turbo", messages=[])
+    return response.choices[0].message.content
+"""
+
+
+def indirect_test(target: str = "notebook.context.OpenAI", form: str = "decorator") -> str:
+    """tests/test_context.py migrated to objects, patching `target` (the client class)."""
+    original = (INDIRECT / INDIRECT_TEST).read_text()
+    if form == "mocker":
+        test = (
+            "def test_assist_adds_the_reply_to_the_context(mocker, shell):\n"
+            f'    OpenAI = mocker.patch("{target}")\n'
+        )
+    else:
+        test = (
+            f'@patch("{target}")\ndef test_assist_adds_the_reply_to_the_context(OpenAI, shell):\n'
+        )
+    test += (
+        "    OpenAI.return_value.chat.completions.create.return_value = SimpleNamespace(\n"
+        "        choices=[\n"
+        "            SimpleNamespace(\n"
+        '                message=SimpleNamespace(role="assistant", content="plot(df)")\n'
+        "            )\n"
+        "        ]\n"
+        "    )\n"
+    )
+    old_head = original[original.index("@patch(") : original.index("    shell.run_cell")]
+    text = original.replace(old_head, test)
+    text = text.replace(
+        "create.call_count", "OpenAI.return_value.chat.completions.create.call_count"
+    )
+    return "from types import SimpleNamespace\n" + text
+
+
+def indirect_files(changes: dict[str, str | None] | None = None) -> dict[str, str]:
+    """The fixture's Python files with generate.py migrated (GENERATE_FROM), then `changes`
+    (relpath -> text; None removes the file)."""
+    files = {p.relative_to(INDIRECT).as_posix(): p.read_text() for p in INDIRECT.rglob("*.py")}
+    files["notebook/generate.py"] = GENERATE_FROM
+    for rel, text in (changes or {}).items():
+        if text is None:
+            files.pop(rel, None)
+        else:
+            files[rel] = text
+    return files
+
+
+def indirect_problems(
+    files: dict[str, str], candidate: str | None = None, unmigrated: tuple[str, ...] = ()
+) -> list[str]:
+    original = (INDIRECT / INDIRECT_TEST).read_text()
+    candidate = indirect_test() if candidate is None else candidate
+    tests = tuple(sorted(r for r in files if r.startswith("tests/")))
+    return mock_target_problems(
+        original,
+        candidate,
+        reader({**files, INDIRECT_TEST: candidate}),
+        library_modules=OPENAI,
+        mock_responses=MIGRATION.mock_responses,
+        roots=module_roots(INDIRECT_TEST),
+        modules=tuple(sorted(r for r in files if r not in tests)),
+        test_files=tests,
+        path=INDIRECT_TEST,
+        unmigrated_modules=unmigrated,
+    )
+
+
+CONTEXT_NAMES = "build_context"
+INDIRECT_HEAD = (
+    "mock target 'notebook.context.OpenAI': notebook/context.py has no top-level name 'OpenAI' "
+    f"(its top-level names: {CONTEXT_NAMES}), and notebook/context.py does not use openai. "
+)
+INDIRECT_EXAMPLE = (
+    "Mock responses must be objects, not dicts (1.x code uses attribute access).\n"
+    "For example:\n"
+    '    @patch("notebook.generate.OpenAI")\n'
+    "    def test_assist_adds_the_reply_to_the_context(OpenAI):\n"
+    "        OpenAI.return_value.chat.completions.create.return_value = SimpleNamespace(\n"
+    '            choices=[SimpleNamespace(message=SimpleNamespace(content="hello"))]\n'
+    "        )"
+)
+
+
+def test_a_module_without_the_library_gets_the_modules_the_test_reaches():
+    # genai: the test imports notebook.context only; the package's __init__.py imports the
+    # magics, which import notebook.generate. batch.py also calls openai; nothing reaches it.
+    assert indirect_problems(indirect_files({"notebook/batch.py": BATCH_V1})) == [
+        INDIRECT_HEAD + "Patch openai where a module the test reaches uses it:\n"
+        "    notebook/generate.py: generate_reply() creates client = OpenAI(): "
+        'patch("notebook.generate.OpenAI") and set '
+        "OpenAI.return_value.chat.completions.create.return_value.\n" + INDIRECT_EXAMPLE
+    ]
+
+
+def test_the_suggested_target_passes_the_check():
+    files = indirect_files({"notebook/batch.py": BATCH_V1})
+    assert indirect_problems(files, indirect_test("notebook.generate.OpenAI")) == []
+
+
+@pytest.mark.parametrize(
+    ("generate", "target", "chain"),
+    [
+        # import openai + openai.OpenAI(): the module's openai is the library itself
+        (
+            GENERATE_FROM.replace("from openai import OpenAI", "import openai").replace(
+                "client = OpenAI()", "client = openai.OpenAI()"
+            ),
+            "openai.OpenAI",
+            "OpenAI.return_value.chat.completions.create.return_value",
+        ),
+        # also through an alias
+        (
+            GENERATE_FROM.replace("from openai import OpenAI", "import openai as oa").replace(
+                "client = OpenAI()", "client = oa.OpenAI()"
+            ),
+            "openai.OpenAI",
+            "OpenAI.return_value.chat.completions.create.return_value",
+        ),
+        # the module-level client calls
+        (
+            GENERATE_FROM.replace("from openai import OpenAI", "import openai")
+            .replace("    client = OpenAI()\n", "")
+            .replace("client.chat", "openai.chat"),
+            "openai.chat.completions.create",
+            "create.return_value",
+        ),
+        # a module-level client = OpenAI()
+        (
+            GENERATE_FROM.replace(
+                "from openai import OpenAI\n", "from openai import OpenAI\n\nclient = OpenAI()\n"
+            ).replace("    client = OpenAI()\n", ""),
+            "notebook.generate.client.chat.completions.create",
+            "create.return_value",
+        ),
+        # a factory
+        (
+            GENERATE_FROM.replace(
+                "\n\ndef generate_reply",
+                "\n\ndef get_client():\n    return OpenAI()\n\n\ndef generate_reply",
+            ).replace("client = OpenAI()", "client = get_client()"),
+            "notebook.generate.get_client",
+            "get_client.return_value.chat.completions.create.return_value",
+        ),
+    ],
+)
+def test_each_way_of_binding_the_library_gets_its_own_target(generate, target, chain):
+    (problem,) = indirect_problems(indirect_files({"notebook/generate.py": generate}))
+    assert f'patch("{target}") and set {chain}.\n' in problem
+    var = chain.split(".")[0]
+    assert f'    @patch("{target}")\n    def test_assist_adds_the_reply_to_the_context({var}):' in (
+        problem
+    )
+
+
+def test_when_the_test_reaches_none_every_library_module_is_listed():
+    files = indirect_files(
+        {"notebook/__init__.py": '"""Nothing imported."""\n', "notebook/batch.py": BATCH_V1}
+    )
+    (problem,) = indirect_problems(files)
+    assert problem.startswith(
+        INDIRECT_HEAD + "Patch openai where a module (the test reaches none of them through its "
+        "imports) uses it:\n"
+        "    notebook/batch.py: summarize() creates client = openai.OpenAI(): "
+        'patch("openai.OpenAI") and set OpenAI.return_value.chat.completions.create.return_value.\n'
+        "    notebook/generate.py: generate_reply() creates client = OpenAI(): "
+        'patch("notebook.generate.OpenAI") and set '
+    )
+    assert '    @patch("openai.OpenAI")\n' in problem  # the example follows the first one
+
+
+def test_at_most_three_modules_are_listed_and_the_rest_named():
+    extra = {f"notebook/m{n}.py": BATCH_V1 for n in range(1, 4)}
+    files = indirect_files({"notebook/__init__.py": "", "notebook/batch.py": BATCH_V1, **extra})
+    (problem,) = indirect_problems(files)
+    listed = [line for line in problem.splitlines() if line.startswith("    notebook/")]
+    assert [line.split(":")[0].strip() for line in listed] == [
+        "notebook/batch.py",
+        "notebook/generate.py",
+        "notebook/m1.py",
+    ]
+    assert "\n    (also: notebook/m2.py, notebook/m3.py)\n" in problem
+
+
+def test_the_patched_module_comes_first_when_it_calls_the_library():
+    module = GENERATE_FROM.replace("from openai import OpenAI", "import openai").replace(
+        "client = OpenAI()", "client = openai.OpenAI()"
+    )
+    files = indirect_files({"notebook/generate.py": module})
+    (problem,) = indirect_problems(files, indirect_test("notebook.generate.OpenAI"))
+    assert problem.startswith(
+        "mock target 'notebook.generate.OpenAI': notebook/generate.py has no top-level name "
+        "'OpenAI' (its top-level names: generate_reply, openai). Patch openai where a module the "
+        "test reaches uses it:\n"
+        "    notebook/generate.py: generate_reply() creates client = openai.OpenAI(): "
+        'patch("openai.OpenAI") and set '
+    )
+
+
+def test_modules_still_on_the_old_api_are_left_out():
+    original = (INDIRECT / "notebook/generate.py").read_text()
+    files = indirect_files({"notebook/generate.py": original, "notebook/batch.py": BATCH_V1})
+    (problem,) = indirect_problems(files, unmigrated=("notebook/generate.py",))
+    assert "notebook/generate.py:" not in problem
+    assert "a module (the test reaches none of them through its imports)" in problem
+    assert "    notebook/batch.py: summarize() creates client = openai.OpenAI(): " in problem
+    # nothing left to suggest: the generic advice
+    files = indirect_files({"notebook/generate.py": original})
+    (problem,) = indirect_problems(files, unmigrated=("notebook/generate.py", "notebook/batch.py"))
+    assert problem.endswith("). Patch a name that exists in notebook/context.py")
+
+
+def test_patching_the_code_under_test_lists_the_modules_too():
+    candidate = indirect_test().replace(
+        '@patch("notebook.context.OpenAI")', '@patch("notebook.context.build_context")'
+    )
+    (problem,) = indirect_problems(indirect_files(), candidate)
+    assert problem.startswith(
+        "mock target 'notebook.context.build_context' in test_assist_adds_the_reply_to_the_context:"
+        " the test calls build_context() from notebook/context.py directly, so patching it "
+        "replaces the function being tested; patch what it calls instead; build_context() does "
+        "not call openai directly. Patch openai where a module the test reaches uses it:\n"
+        "    notebook/generate.py: "
+    )
+
+
+def test_a_mocker_patch_gets_a_mocker_example():
+    (problem,) = indirect_problems(indirect_files(), indirect_test(form="mocker"))
+    assert problem.endswith(
+        'For example:\n    OpenAI = mocker.patch("notebook.generate.OpenAI")\n'
+        "    OpenAI.return_value.chat.completions.create.return_value = SimpleNamespace(\n"
+        '        choices=[SimpleNamespace(message=SimpleNamespace(content="hello"))]\n'
+        "    )"
+    )
+
+
+def _indirect_pytest(root: Path, files: dict[str, str]) -> subprocess.CompletedProcess:
+    """Run the fixture's tests with an openai stub that raises without an API key."""
+    for rel, text in {**files, "openai.py": STUB_OPENAI}.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(text)
+    return subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests"],
+        cwd=root,
+        env={**os.environ, "PYTHONPATH": str(root)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def test_the_suggested_target_passes_the_tests_and_the_wrong_one_fails(tmp_path):
+    wrong = _indirect_pytest(
+        tmp_path / "wrong", {**indirect_files(), INDIRECT_TEST: indirect_test()}
+    )
+    assert wrong.returncode == 1
+    assert "does not have the attribute 'OpenAI'" in wrong.stdout
+    right = indirect_test("notebook.generate.OpenAI")
+    fixed = _indirect_pytest(tmp_path / "right", {**indirect_files(), INDIRECT_TEST: right})
+    assert fixed.returncode == 0, fixed.stdout
