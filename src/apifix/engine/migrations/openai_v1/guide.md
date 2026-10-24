@@ -133,6 +133,10 @@ for chunk in client.chat.completions.create(model=m, messages=msgs, stream=True)
         yield delta.content
 ```
 
+Mocked chunks in tests become objects with the same keys, role included:
+`{"choices": [{"delta": {"role": "assistant", "content": "Hi"}}]}` becomes
+`SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(role="assistant", content="Hi"))])`.
+
 <!-- part: errors -->
 ## Errors
 

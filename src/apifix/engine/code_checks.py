@@ -689,8 +689,14 @@ def _missing_name_problem(
             if elsewhere is None:
                 return f"{head}. Patch a name that exists in {rel}"
             lib = _library_name(options)
-            why = "" if index.library_use() else f", and {rel} does not use {lib}"
-            return f"{head}{why}. {elsewhere}"
+            if not index.library_use():
+                # none of its names reaches the library: the suggestion comes first, not a
+                # list of them (genai-gptoss-6's model kept the wrong module after one)
+                return (
+                    f"mock target {site.target!r}: {rel} has no top-level name {name!r} and "
+                    f"does not use {lib}. {elsewhere}"
+                )
+            return f"{head}. {elsewhere}"
         verb = "the constructor" if "creates" in suggestion.origin else "that"
         fix = _fix_text(suggestion, site, options)
         return f"{head}; {suggestion.origin}. Patch {verb} instead: {fix}"

@@ -6,7 +6,9 @@ affected file per request, and each candidate is checked before it is written. A
 the verifier compares the copy with the original in the sandbox, reusing one baseline run for
 the whole job. `verified` and `verified_weak` stop the loop (the weak reasons are not fixable
 with the edits the agent may make); `rejected` and `unverified` are retried up to
-`max_retries` times with the reasons as feedback. Limits on tool calls, tokens and cost end
+`max_retries` times with the reasons as feedback (in whole-file mode an attempt that ends at the
+checks, never reaching verification, does not count, up to MAX_ATTEMPTS_FACTOR times as many
+attempts in all). Limits on tool calls, tokens and cost end
 the job cleanly with a reason. Everything is recorded in a JSON-able trajectory.
 """
 
@@ -81,10 +83,13 @@ from apifix.engine.verifier import (
     VerifierConfig,
     downloads_line,
     feedback_lines,
+    mock_failures,
+    only_mock_failures,
     requirements_override,
     run_summary,
     sandbox_requirements_lines,
     sandbox_requirements_record,
+    test_files_of,
     upgraded_text,
     verify,
 )
@@ -158,6 +163,9 @@ REGION_REQUEST_OVERHEAD_CHARS = 1_500
 # attempts is told so in its next request; on REPEATED_ERROR_STOP_AT, the job stops
 REPEATED_ERROR_NOTE_AT = 2
 REPEATED_ERROR_STOP_AT = 3
+# whole-file mode: attempts that end check_failed do not count against max_retries + 1; the job
+# makes at most this many times max_retries + 1 attempts in all
+MAX_ATTEMPTS_FACTOR = 2
 REPEATED_KEY_CHARS = 160  # of the error in the stop reason
 
 
@@ -168,6 +176,8 @@ def token_limit_margin(limit: int) -> int:
 
 @dataclass(frozen=True)
 class AgentConfig:
+    # retries after a failed verification (whole-file attempts that fail the checks are free,
+    # within MAX_ATTEMPTS_FACTOR * (max_retries + 1) attempts in all)
     max_retries: int = 3
     max_tool_calls_per_attempt: int = 60
     # Replies that are only several tool calls written as text (openai-compat): none is run and
@@ -227,9 +237,12 @@ class Attempt:
     edits: list[EditRecord] = field(default_factory=list)
     files: list[dict[str, Any]] = field(default_factory=list)  # whole-file mode: one per request
     # whole-file mode: files not sent in this attempt (accepted earlier and still in place),
-    # and test files held back because a module they import failed its checks in it
+    # test files held back because a module they import failed its checks in it, and files
+    # accepted in an earlier attempt that failed their checks in this one and keep their last
+    # accepted version (path, accepted_in, error)
     kept_files: list[str] = field(default_factory=list)
     deferred: list[dict[str, str]] = field(default_factory=list)
+    fell_back: list[dict[str, Any]] = field(default_factory=list)
     diff: str = ""
     verification: Verification | None = None
     result: str = ""  # a verdict, "no_changes", "check_failed" (whole-file) or "aborted"
@@ -250,6 +263,7 @@ class Attempt:
             "files": self.files,
             "kept_files": self.kept_files,
             "deferred": self.deferred,
+            "fell_back": self.fell_back,
             "diff": self.diff,
             "verification": self.verification.to_dict() if self.verification else None,
             "verification_duration_s": round(self.verification_duration_s, 3),
@@ -353,9 +367,12 @@ def task_prompt(
     return "\n".join(lines)
 
 
-def feedback_prompt(attempt: Attempt, hints: Sequence[tuple[str, str]] = ()) -> str:
+def feedback_prompt(
+    attempt: Attempt, hints: Sequence[tuple[str, str]] = (), mock_hint: str = ""
+) -> str:
     """Agent mode: the verifier's problems after a failed attempt, with the migration's
-    failure hints whose marker appears in the failing output."""
+    failure hints whose marker appears in the failing output (and `mock_hint` per mock
+    failure: verifier.failure_hints)."""
     v = attempt.verification
     if v is None:
         return (
@@ -366,7 +383,7 @@ def feedback_prompt(attempt: Attempt, hints: Sequence[tuple[str, str]] = ()) -> 
         f"The verifier did not accept attempt {attempt.number} (verdict: {v.verdict}). "
         "Fix the problems below by editing the code; do not weaken, skip or delete tests.",
         "",
-        *feedback_lines(v, max_reasons=MAX_FEEDBACK_REASONS, hints=hints),
+        *feedback_lines(v, max_reasons=MAX_FEEDBACK_REASONS, hints=hints, mock_hint=mock_hint),
     ]
     out.append("Continue editing; end your turn with a short summary when done.")
     return "\n".join(out).rstrip()
@@ -422,6 +439,7 @@ class _Job:
         # stopped early ("" when it did not)
         self.wf_streaks: dict[str, dict[tuple[str, str], list[int]]] = {}
         self.wf_accepted: set[str] = set()
+        self.wf_accepted_in: dict[str, int] = {}  # the attempt that last accepted each file
         self.wf_stop = ""
         self.known_imports = import_table(STDLIB_IMPORTS, migration.known_imports)
         # Variables the repo's CI sets that the sandbox's test phase gets placeholders for
@@ -774,11 +792,14 @@ class _Job:
         """One pass over the pending files, each in its own conversation. True when all were
         accepted (the tree is ready to verify). A file that fails its checks is set aside for
         the rest of the attempt and the others are still sent; it stays pending, with its
-        rejected candidate and error, for the next attempt. Only a repeated-error stop (or an
-        abort) ends the pass early."""
+        rejected candidate and error, for the next attempt. A file accepted in an earlier
+        attempt that fails instead keeps its last accepted version (still in the working copy:
+        a failed request never writes it) and counts as accepted. Only a repeated-error stop
+        (or an abort) ends the pass early."""
         pending = self.wf_pending
         attempt.kept_files = [p for p in self.wf_all if p not in pending]
         failed: list[str] = []
+        again: list[str] = []  # pending in the next attempt: the failed and fell-back files
         previous: dict[str, tuple[str | None, str]] = {}
         aside: list[str] = []  # non-test Python files that failed in this attempt
         for path in pending:
@@ -786,6 +807,7 @@ class _Job:
             if blocked:  # its checks would judge it against the module's old version
                 attempt.deferred.append({"path": path, "module": blocked})
                 failed.append(path)
+                again.append(path)
                 if path in self.wf_previous:
                     previous[path] = self.wf_previous[path]
                 continue
@@ -794,7 +816,18 @@ class _Job:
             else:
                 entry, candidate = self._whole_file_request(attempt, path)
             if not entry["accepted"]:
+                accepted_in = self.wf_accepted_in.get(path)
+                if accepted_in is not None:  # its last good version stays for this attempt
+                    entry["fell_back_to"] = accepted_in
+                    attempt.fell_back.append(
+                        {"path": path, "accepted_in": accepted_in, "error": entry["error"]}
+                    )
+                    self._count_repeats(attempt.number, path, entry, stop=False)
+                    again.append(path)  # if the attempt does not get verified
+                    previous[path] = (candidate, entry["error"])
+                    continue
                 failed.append(path)
+                again.append(path)
                 previous[path] = (candidate, entry["error"])
                 if path.endswith(".py") and not is_test_file(path, root=self.repo):
                     aside.append(path)
@@ -802,11 +835,12 @@ class _Job:
                 if self.wf_stop:
                     break  # the job stops: the files after this one are not sent
                 continue
+            self.wf_accepted_in[path] = attempt.number
             self.wf_streaks.pop(path, None)
             self.wf_region_previous.pop(path, None)
-        self.wf_pending = failed
+        self.wf_pending = again
         self.wf_previous = previous
-        self.wf_region_previous = {p: t for p, t in self.wf_region_previous.items() if p in failed}
+        self.wf_region_previous = {p: t for p, t in self.wf_region_previous.items() if p in again}
         return not failed
 
     def _blocked_by(self, path: str, aside: Sequence[str]) -> str | None:
@@ -819,26 +853,44 @@ class _Job:
         found = reachable_modules(path, reader, roots, set(aside))
         return found[0] if found else None
 
-    def _count_repeats(self, number: int, path: str, entry: dict[str, Any]) -> None:
+    def _count_repeats(
+        self, number: int, path: str, entry: dict[str, Any], *, stop: bool = True
+    ) -> None:
         """After `path` failed in attempt `number`: extend the streaks of the (check, error)
         pairs its last reply failed with (`failed_checks`), drop the others, and stop the job
-        when one reaches REPEATED_ERROR_STOP_AT."""
+        when one reaches REPEATED_ERROR_STOP_AT (unless not `stop`: the file kept its last
+        accepted version, so the job can go on without it)."""
         before = self.wf_streaks.get(path, {})
         streaks = {
             (check, key): [*before.get((check, key), []), number]
             for check, key in entry.get("failed_checks", [])
         }
         self.wf_streaks[path] = streaks
+        if not stop:
+            return
         for (check, key), numbers in streaks.items():
             if len(numbers) >= REPEATED_ERROR_STOP_AT:
                 shown = key if len(key) <= REPEATED_KEY_CHARS else key[:REPEATED_KEY_CHARS] + "..."
-                left = self.config.max_retries + 1 - number
+                left = self._attempts_left(number)
                 self.wf_stop = (
                     f"{path} failed the {check} check with the same error on attempts "
                     f"{attempts_text(numbers)} ({shown})"
                     + (f"; stopped with {left} attempt(s) left" if left else "")
                 )
                 return
+
+    def _max_attempts(self) -> int:
+        """Attempts in all: max_retries + 1 that count, and in whole-file mode check_failed
+        attempts free up to MAX_ATTEMPTS_FACTOR times that."""
+        counted = self.config.max_retries + 1
+        return counted * MAX_ATTEMPTS_FACTOR if self.whole_file else counted
+
+    def _attempts_left(self, number: int) -> int:
+        """Attempts the job could still make after attempt `number`, a whole-file attempt that
+        ends check_failed (so it does not count): those left of max_retries + 1, within the
+        overall cap."""
+        counted = sum(a.result != "check_failed" for a in self.attempts[: number - 1])
+        return max(0, min(self.config.max_retries + 1 - counted, self._max_attempts() - number))
 
     def _repeated(self, path: str, current: Sequence[str] | None = None) -> list[dict[str, Any]]:
         """The errors `path` failed with on at least REPEATED_ERROR_NOTE_AT consecutive
@@ -852,10 +904,19 @@ class _Job:
     def _after_rejection(self, number: int, v: Verification) -> None:
         """Whole-file: what the next attempt sends. Every file again, from the original with
         the previous version as a diff, except dependency files (accepted, or set by apifix)
-        the verification did not implicate."""
+        the verification did not implicate, and, when every problem is a test failing on its
+        own mocks (verifier.only_mock_failures), non-test Python files nothing else names."""
         self.wf_verification = (number, v)
+        # the failing tests' files must be among those sent, or only the code under test can
+        # be changed (a test file without findings is never sent)
+        mocks_only = only_mock_failures(v) and set(
+            test_files_of(mock_failures(v), self.repo)
+        ) <= set(self.wf_all)
         self.wf_pending = [
-            p for p in self.wf_all if not is_dependency_file(p) or _dependency_problem(p, v)
+            p
+            for p in self.wf_all
+            if (not is_dependency_file(p) or _dependency_problem(p, v))
+            and not (mocks_only and self._only_called_the_mocks(p, v))
         ]
         self.wf_previous = {p: (self._read(self.work, p), "") for p in self.wf_pending}
         self.wf_region_previous = {
@@ -865,11 +926,24 @@ class _Job:
             if p in self.wf_plans and self._form(p)[0] == "regions":
                 self._add_feedback_regions(p, v)
 
+    def _only_called_the_mocks(self, path: str, v: Verification) -> bool:
+        """Is `path` a non-test Python file no reason or remaining finding names (its lines in
+        a mock failure's traceback only say where the test's mock was called)?"""
+        if not path.endswith(".py") or is_test_file(path, root=self.repo):
+            return False
+        named = {r.file for r in v.reasons} | {f.file for f in v.remaining_findings}
+        return path not in named
+
     def _add_feedback_regions(self, path: str, v: Verification) -> None:
         """Regions the verifier's output points at in a region-edited file (its failing tests,
-        traceback lines, reasons with a line), added to its plan with new ids."""
+        traceback lines, reasons with a line), added to its plan with new ids. A non-test
+        file's lines in the traceback of a test that failed on its own mocks are not used: the
+        test's mock setup is at fault."""
         original = self._read(self.repo, path)
-        lines = feedback_lines_in(path, original, self._read(self.work, path), v)
+        skip = set() if is_test_file(path, root=self.repo) else set(mock_failures(v))
+        lines = feedback_lines_in(
+            path, original, self._read(self.work, path), v, skip_tracebacks_of=skip
+        )
         if not lines:
             return
         plan = self.wf_plans[path]
@@ -894,7 +968,13 @@ class _Job:
         if dependency:
             return verification_feedback(number, v, dependency_file=True)
         short = self._limit() is not None
-        return verification_feedback(number, v, hints=self.migration.failure_hints, short=short)
+        return verification_feedback(
+            number,
+            v,
+            hints=self.migration.failure_hints,
+            mock_hint=_mock_hint(self.migration),
+            short=short,
+        )
 
     # --- known token limits -----------------------------------------------------------------
 
@@ -1869,6 +1949,11 @@ class _Job:
     def _nudges(attempt: Attempt, kind: str) -> int:
         return sum(n["kind"] == kind for n in attempt.nudges)
 
+    def _same_as_verified(self) -> bool:
+        """Is the working copy the tree the last verification judged?"""
+        verified = [a for a in self.attempts if a.verification is not None]
+        return bool(verified) and self._snapshot() == verified[-1].snapshot
+
     def _snapshot(self) -> dict[str, str]:
         return {
             ch.path: read_text(self.work / ch.path) or ""
@@ -1927,7 +2012,10 @@ class _Job:
         if self.baseline.status == "error" and self.baseline.reason.startswith("docker not usable"):
             return "aborted", f"sandbox unavailable before any LLM call: {self.baseline.reason}"
 
-        for number in range(1, self.config.max_retries + 2):
+        counted = 0  # attempts that count against max_retries + 1 (not check_failed ones)
+        number = 0
+        while counted < self.config.max_retries + 1 and number < self._max_attempts():
+            number += 1
             attempt = Attempt(number)
             self.attempts.append(attempt)
             if not self.preflight_done and self._needs_llm(first=number == 1):
@@ -1943,7 +2031,11 @@ class _Job:
                 else:
                     prompt = self._task_prompt()
                     if number > 1:
-                        feedback = feedback_prompt(self.attempts[-2], self.migration.failure_hints)
+                        feedback = feedback_prompt(
+                            self.attempts[-2],
+                            self.migration.failure_hints,
+                            _mock_hint(self.migration),
+                        )
                         prompt = f"{prompt}\n\n{feedback}" if not self.messages else feedback
                     self.messages.append(Message("user", text=prompt))
                     self._converse(attempt)
@@ -1952,6 +2044,8 @@ class _Job:
                 attempt.result = "aborted"
                 attempt.diff = unified_diff(self.repo, self.work)
                 return "aborted", f"{abort.code}: {abort}"
+            if ready and attempt.fell_back and self._same_as_verified():
+                ready = False  # only fallbacks: the tree the last verification judged
             if not ready:
                 if self.whole_file:
                     attempt.result = "check_failed"
@@ -1960,7 +2054,9 @@ class _Job:
                         break  # the same check error again: more attempts would repeat it
                 else:
                     attempt.result = "no_changes"
+                    counted += 1
                 continue
+            counted += 1
             changes = diff_trees(self.repo, self.work)
             attempt.diff = unified_diff(self.repo, self.work, changes)
             start = time.monotonic()
@@ -2163,6 +2259,10 @@ def revert_text(r: dict[str, Any]) -> str:
     return f'text changed outside the migration: "{r["new"]}" restored to the original'
 
 
+def _mock_hint(migration: Migration) -> str:
+    return getattr(migration, "mock_failure_hint", "")
+
+
 def _dependency_problem(path: str, v: Verification) -> bool:
     """Did the verification implicate this dependency file: a reason or a remaining finding
     points at it, or the install or the smoke check failed and the fixed run's install read the
@@ -2215,10 +2315,18 @@ def _def_line(tree: ast.Module, cls: str, name: str) -> int | None:
     return None
 
 
-def feedback_lines_in(path: str, original: str, fixed: str, v: Verification) -> list[int]:
+def feedback_lines_in(
+    path: str,
+    original: str,
+    fixed: str,
+    v: Verification,
+    *,
+    skip_tracebacks_of: set[str] | frozenset[str] = frozenset(),
+) -> list[int]:
     """Lines of the original `path` the verification points at: the definitions of its
-    newly failing or erroring tests, traceback lines in it, and reasons with a line (fixed-
-    file lines mapped back to the original)."""
+    newly failing or erroring tests, traceback lines in it (not of the tests in
+    `skip_tracebacks_of`), and reasons with a line (fixed-file lines mapped back to the
+    original)."""
     try:
         tree = ast.parse(original)
     except (SyntaxError, ValueError):
@@ -2235,6 +2343,8 @@ def feedback_lines_in(path: str, original: str, fixed: str, v: Verification) -> 
             line = _def_line(tree, classname[len(dotted) + 1 :], name.split("[", 1)[0])
             if line:
                 lines.add(line)
+        if test.id in skip_tracebacks_of:
+            continue
         for m in pattern.finditer(test.message):
             lines.add(map_line(original, fixed, int(m.group(1))))
     for r in v.reasons:
@@ -2458,6 +2568,18 @@ def region_edit_lines(job: _Job) -> list[str]:
     return out
 
 
+def _attempts_budget(job: _Job) -> str:
+    """The report's words for the attempt limit."""
+    counted = job.config.max_retries + 1
+    if not job.whole_file:
+        return f"max {counted}"
+    free = sum(a.result == "check_failed" for a in job.attempts)
+    return (
+        f"max {counted} that reach verification, {job._max_attempts()} in all; "
+        f"{free} ended at the checks and did not count"
+    )
+
+
 def report_markdown(
     result_outcome: Outcome,
     reason: str,
@@ -2480,7 +2602,7 @@ def report_markdown(
         "",
         f"- Migration: `{job.migration.name}` ({job.migration.summary})",
         f"- Outcome: {reason}",
-        f"- Attempts: {len(job.attempts)} (max {job.config.max_retries + 1})"
+        f"- Attempts: {len(job.attempts)} ({_attempts_budget(job)})"
         + (f"; changes from attempt {chosen.number}" if chosen else ""),
         f"- Model: `{job.llm.provider}` / `{job.llm.model}`"
         + (f"; reasoning effort: {effort} (sent as reasoning_effort)" if effort else ""),
@@ -2574,6 +2696,11 @@ def report_markdown(
                 files = ", ".join(
                     f"`{f['path']}` "
                     + ("ok" if f["accepted"] else f"failed: {_one_line(f['error'])}")
+                    + (
+                        f" (kept its attempt {f['fell_back_to']} version)"
+                        if "fell_back_to" in f
+                        else ""
+                    )
                     for f in a.files
                 )
                 kept = (

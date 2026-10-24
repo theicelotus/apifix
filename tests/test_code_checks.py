@@ -1196,10 +1196,10 @@ def indirect_problems(
     )
 
 
-CONTEXT_NAMES = "build_context"
+# no list of context.py's names: none of them reaches openai, so the suggestion comes first
 INDIRECT_HEAD = (
     "mock target 'notebook.context.OpenAI': notebook/context.py has no top-level name 'OpenAI' "
-    f"(its top-level names: {CONTEXT_NAMES}), and notebook/context.py does not use openai. "
+    "and does not use openai. "
 )
 INDIRECT_EXAMPLE = (
     "Mock responses must be objects, not dicts (1.x code uses attribute access).\n"

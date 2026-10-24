@@ -426,14 +426,32 @@ def chunk_repo(tmp_path: Path) -> Path:
 def test_dict_stream_chunks_in_a_test_file_are_likely_findings(tmp_path):
     findings = scan(chunk_repo(tmp_path), "openai-v1").findings
     chunks = [f for f in findings if f.file == TESTS and f.category == "response_access"]
+    # the deltas have a role: the example keeps it (genai-gptoss-6 dropped "assistant" twice
+    # copying a role-less example)
+    with_role = rules.MOCK_DICT_CHUNK_ROLE.format(role='"assistant"')
     assert [(f.line, f.confidence, f.suggestion) for f in chunks] == [
-        (8, "likely", rules.MOCK_DICT_CHUNK),
-        (19, "likely", rules.MOCK_DICT_CHUNK),
+        (8, "likely", with_role),
+        (19, "likely", with_role),
     ]
+    assert 'delta=SimpleNamespace(role="assistant", content=...)' in with_role
     assert "streaming" in selected_parts(chunks)  # the suggestion names the delta
     # the same chunks in a non-test module (sample data, no tests) are not flagged
     samples = CHUNK_TESTS.split("\n\n\n@mock")[0]
     assert findings_of(samples, "chatpad/samples.py") == []
+
+
+def test_a_chunk_without_role_or_with_a_computed_one(tmp_path):
+    source = (
+        "import openai\n\n"
+        "def test_x():\n"
+        '    a = {"choices": [{"delta": {"content": "x"}}]}\n'
+        '    b = {"choices": [{"delta": {"role": ROLE, "content": "x"}}]}\n'
+    )
+    found = findings_of(source, "tests/test_x.py")
+    assert [f.suggestion for f in found] == [
+        rules.MOCK_DICT_CHUNK,
+        rules.MOCK_DICT_CHUNK_ROLE.format(role="..."),
+    ]
 
 
 def test_converting_mocked_chunks_to_objects_is_migration_work(tmp_path):

@@ -172,8 +172,10 @@ def test_a_check_error_resends_only_the_region_it_concerns(big):
 
 def test_a_region_error_after_the_retry_fails_the_file(big):
     bad = R2_NEW.replace("def test_strips", "def test_strips_renamed")
-    llm = FakeLLM([block(APP_NEW), regions(("R1", R1_NEW), ("R2", bad)), regions(("R2", bad))])
+    again = [regions(("R1", R1_NEW), ("R2", bad)), regions(("R2", bad))]
+    llm = FakeLLM([block(APP_NEW), *again, *again])  # attempt 2: the first did not count
     result = wf(big, llm, max_retries=0)
+    assert [a["result"] for a in result.trajectory["attempts"]] == ["check_failed"] * 2
     entry = files_of(result)[1]
     assert not entry["accepted"]
     assert entry["error"].startswith("R2: return exactly def test_strips")
@@ -491,11 +493,13 @@ def test_a_failed_group_of_a_retry_fails_the_batch(big):
     bad_r1 = R1_NEW.replace("def test_ask", "def test_ask_renamed")
     bad_r2 = R2_NEW.replace("def test_strips", "def test_strips_renamed")
     first = regions(("IMPORTS", IMPORTS_NEW), ("R1", bad_r1), ("R2", bad_r2))
-    llm = FakeLLM([block(APP_NEW), first, too_large(600, 100_000), regions(("R1", bad_r1))])
+    # attempt 2 (the first did not count) gets the file as a group of each region at once
+    again = [regions(("IMPORTS", IMPORTS_NEW), ("R1", bad_r1)), regions(("R1", bad_r1))]
+    llm = FakeLLM([block(APP_NEW), first, too_large(600, 100_000), regions(("R1", bad_r1)), *again])
     result = wf(big, llm, max_retries=0)
     entry = files_of(result)[1]
     assert not entry["accepted"] and entry["error"].startswith("R1: return exactly def test_ask")
-    assert len(llm.requests) == 4  # R2's group is not sent
+    assert len(result.trajectory["attempts"][0]["responses"]) == 3  # R2's group is not sent
 
 
 def test_a_request_over_a_known_limit_is_split_before_it_is_sent(big, monkeypatch):
@@ -596,8 +600,9 @@ def test_a_cut_off_region_request_is_retried_with_fewer_regions(big):
 
 
 def test_a_single_region_cut_off_at_the_most_reply_tokens_fails_the_file(big):
-    llm = FakeLLM([block(APP_NEW), cut(), cut(), cut()])
+    llm = FakeLLM([block(APP_NEW), *[cut()] * 5])  # attempt 2 (the first did not count): 2
     result = wf(big, llm, max_retries=0)
+    assert llm.script == []
     entry = files_of(result)[1]
     assert not entry["accepted"]
     assert entry["error"] == (
@@ -608,8 +613,8 @@ def test_a_single_region_cut_off_at_the_most_reply_tokens_fails_the_file(big):
         "smaller_groups",
         "failed",
     ]
-    assert len(llm.requests) == 4  # R2's group is not sent
-    assert "Replies cut off at the output limit: 3" in result.report_markdown
+    assert len(result.trajectory["attempts"][0]["responses"]) == 4  # R2's group is not sent
+    assert "Replies cut off at the output limit: 5" in result.report_markdown
 
 
 def test_a_region_request_refused_again_after_lowering_is_split(big):

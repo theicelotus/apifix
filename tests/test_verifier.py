@@ -16,13 +16,18 @@ from apifix.engine.sandbox import PhaseResult, SandboxResult, SmokeResult
 from apifix.engine.test_results import FileCoverage, TestCaseResult, TestCounts, counts_from
 from apifix.engine.verifier import (
     INSTALL_OUTPUT_CHARS,
+    MockFailure,
     TestDelta,
     VerifierConfig,
     _why_failing,
     compare_runs,
     decide,
+    failure_hints,
     feedback_lines,
     matches_test,
+    mock_failure,
+    mock_failures,
+    only_mock_failures,
     run_summary,
     verify,
 )
@@ -610,6 +615,87 @@ def test_feedback_hints_also_see_collection_errors(trees):
     collection = run(("tests.test_app", "error", KEY_ERROR))
     v = _rejected(trees, collection)
     assert "Hint: No API key: mock the constructor." in feedback_lines(v, hints=[HINT])
+
+
+# genai-gptoss-6: the test built its client from SimpleNamespaces without `create`
+NS_CREATE = "AttributeError: 'types.SimpleNamespace' object has no attribute 'create'"
+MOCK_HINT = "the test's mock client is incomplete: {problem}; use MagicMock()"
+
+
+@pytest.mark.parametrize(
+    ("message", "problem", "spec"),
+    [
+        (
+            f"{NS_CREATE}\nget_client = <MagicMock name='get_client'>",
+            "SimpleNamespace has no create",
+            False,
+        ),
+        ("TypeError: 'MagicMock' object is not iterable", "MagicMock is not iterable", False),
+        (
+            "TypeError: 'unittest.mock.Mock' object is not subscriptable",
+            "Mock is not subscriptable",
+            False,
+        ),
+        (
+            "TypeError: object MagicMock can't be used in 'await' expression",
+            "MagicMock can't be used in 'await' expression",
+            False,
+        ),
+        (
+            "AttributeError: Mock object has no attribute 'completions'",
+            "Mock has no completions",
+            True,
+        ),
+    ],
+)
+def test_mock_failures_are_recognised(message, problem, spec):
+    assert mock_failure(T_ASK, message) == MockFailure(T_ASK, problem, spec)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "AttributeError: 'Response' object has no attribute 'choices'",  # not a mock
+        "AttributeError: module 'openai' has no attribute 'ChatCompletion'",
+        "TypeError: 'dict' object is not callable",
+        "AssertionError: assert 'x' == 'y'",
+    ],
+)
+def test_other_errors_are_not_mock_failures(message):
+    assert mock_failure(T_ASK, message) is None
+
+
+def test_only_mock_failures_and_the_hint(trees):
+    v = _rejected(trees, run((T_ASK, "failed", NS_CREATE), (T_STRIP, "error", NS_CREATE)))
+    assert set(mock_failures(v)) == {T_ASK, T_STRIP} and only_mock_failures(v)
+    hints = [line for line in feedback_lines(v, mock_hint=MOCK_HINT) if line.startswith("Hint")]
+    # one hint per distinct problem
+    assert hints == [
+        "Hint: the test's mock client is incomplete: SimpleNamespace has no create; use MagicMock()"
+    ]
+    assert not any(line.startswith("Hint") for line in feedback_lines(v))
+    # one test failing otherwise: the code under test may be at fault too
+    mixed = _rejected(trees, run((T_ASK, "failed", NS_CREATE), (T_STRIP, "failed", "boom")))
+    assert set(mock_failures(mixed)) == {T_ASK} and not only_mock_failures(mixed)
+    # a spec'd mock (autospec) has its own hint
+    spec = _rejected(
+        trees,
+        run(
+            (T_ASK, "failed", "AttributeError: Mock object has no attribute 'completions'"),
+            (T_STRIP, "passed"),
+        ),
+    )
+    assert only_mock_failures(spec)
+    assert failure_hints(spec, (), MOCK_HINT) == []
+    # another blocking reason (a remaining finding) is not the tests' mocks
+    original, fixed = trees({"app.py": APP_OLD})
+    stale = verify(
+        original,
+        fixed,
+        "openai-v1",
+        sandbox=FakeSandbox(PASSING, [run((T_ASK, "failed", NS_CREATE), (T_STRIP, "passed"))] * 2),
+    )
+    assert "incomplete_migration" in codes(stale) and not only_mock_failures(stale)
 
 
 def test_feedback_without_failure_output_and_with_pip_output(trees):

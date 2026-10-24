@@ -9,6 +9,7 @@ retry) and a Markdown section (for the pull request).
 from __future__ import annotations
 
 import dataclasses
+import re
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
@@ -199,14 +200,85 @@ def _first_line(message: str) -> str:
     return next((line.strip() for line in message.splitlines() if line.strip()), "")
 
 
-def failure_hints(v: Verification, hints: Sequence[tuple[str, str]]) -> list[str]:
-    """Explanations whose marker appears in the fixed run's failing tests or test output."""
-    if not hints:
-        return []
+@dataclass(frozen=True)
+class MockFailure:
+    """A test that failed on its own mock object: an attribute the mock lacks, or an operation
+    it does not support. `problem` is how a hint names it ("SimpleNamespace has no create",
+    "MagicMock is not iterable"); `spec` marks a spec'd mock (`Mock object has no attribute`,
+    autospec), which has its own hint."""
+
+    test: str
+    problem: str
+    spec: bool = False
+
+
+_MOCK_TYPE = (
+    r"(?:[\w.]+\.)?(SimpleNamespace|Mock|MagicMock|NonCallableMock|NonCallableMagicMock|"
+    r"AsyncMock|PropertyMock)"
+)
+_MOCK_ERRORS = (
+    re.compile(rf"AttributeError: '{_MOCK_TYPE}' object has no attribute '(\w+)'"),
+    re.compile(rf"TypeError: '{_MOCK_TYPE}' object (is not \w+)"),
+    re.compile(rf"TypeError: object {_MOCK_TYPE} (can't be used in 'await' expression)"),
+)
+_SPEC_MOCK_ERROR = re.compile(r"AttributeError: Mock object has no attribute '(\w+)'")
+MAX_MOCK_HINTS = 3
+
+
+def mock_failure(test: str, message: str) -> MockFailure | None:
+    """The mock failure in a failing test's message (the first one), wherever it was raised:
+    in the test's own setup or in the code under test calling the mock."""
+    found: list[tuple[int, MockFailure]] = []
+    for n, pattern in enumerate(_MOCK_ERRORS):
+        m = pattern.search(message)
+        if m:
+            what = f"has no {m.group(2)}" if n == 0 else m.group(2)
+            found.append((m.start(), MockFailure(test, f"{m.group(1)} {what}")))
+    m = _SPEC_MOCK_ERROR.search(message)
+    if m:
+        found.append((m.start(), MockFailure(test, f"Mock has no {m.group(1)}", spec=True)))
+    return min(found, key=lambda f: f[0])[1] if found else None
+
+
+def mock_failures(v: Verification) -> dict[str, MockFailure]:
+    """The fixed run's newly failing or erroring tests that failed on their own mocks."""
+    failing = set(v.delta.newly_failing) | set(v.delta.newly_erroring)
+    out = {}
+    for t in v.fixed.tests:
+        if t.id in failing and t.id not in out:
+            found = mock_failure(t.id, t.message)
+            if found:
+                out[t.id] = found
+    return out
+
+
+def only_mock_failures(v: Verification) -> bool:
+    """Is every rejecting problem a regression whose tests all failed on their own mocks? Then
+    the tests' mock setup is at fault, not the code under test (its line in a traceback says
+    only where the mock was called). Weaker reasons (no test passed, coverage) follow from the
+    failures and do not point at code."""
+    blocking = [r for r in v.reasons if r.severity == "reject"]
+    failing = set(v.delta.newly_failing) | set(v.delta.newly_erroring)
+    if not blocking or not failing:
+        return False
+    if any(r.code not in ("regression", "regression_error") for r in blocking):
+        return False
+    return failing <= set(mock_failures(v))
+
+
+def failure_hints(
+    v: Verification, hints: Sequence[tuple[str, str]], mock_hint: str = ""
+) -> list[str]:
+    """Explanations whose marker appears in the fixed run's failing tests or test output, then
+    `mock_hint` ({problem}) for each distinct mock failure (not spec'd mocks)."""
     texts = [t.message for t in v.fixed.tests if t.outcome in ("failed", "error")]
     if v.fixed.test is not None:
         texts += [v.fixed.test.stdout, v.fixed.test.stderr]
-    return [text for marker, text in hints if any(marker in t for t in texts)]
+    out = [text for marker, text in hints if any(marker in t for t in texts)]
+    if mock_hint:
+        problems = dict.fromkeys(f.problem for f in mock_failures(v).values() if not f.spec)
+        out += [mock_hint.format(problem=p) for p in list(problems)[:MAX_MOCK_HINTS]]
+    return out
 
 
 def feedback_lines(
@@ -219,14 +291,16 @@ def feedback_lines(
     failure_output: bool = True,
     dedupe: bool = False,
     hints: Sequence[tuple[str, str]] = (),
+    mock_hint: str = "",
     install_output_chars: int | None = None,
 ) -> list[str]:
     """The verifier's problems, warnings and failing-test output, as prompt lines for the model.
     `message_chars` cuts each test's output and `total_chars` bounds all of it together;
     `failure_output=False` leaves the test output out. `dedupe` shows a test whose output
     starts with the same line as an earlier one's as "(same error as ...)". `hints`
-    ((marker, explanation)) add explanations for markers found in the failing tests' output;
-    `install_output_chars` adds the tail of pip's output when the install failed."""
+    ((marker, explanation)) add explanations for markers found in the failing tests' output,
+    `mock_hint` one per distinct mock failure (failure_hints); `install_output_chars` adds the
+    tail of pip's output when the install failed."""
     out: list[str] = []
     shown = [r for r in v.reasons if r.code not in ENVIRONMENT_REASONS]
     blocking = [r for r in shown if r.severity in ("reject", "unverified", "weak")]
@@ -262,7 +336,7 @@ def feedback_lines(
             used += len(message)
             out.append(f"--- {test_id}\n{message}")
         out.append("")
-    found = failure_hints(v, hints)
+    found = failure_hints(v, hints, mock_hint)
     if found:
         out += [f"Hint: {text}" for text in found] + [""]
     if v.fixed.status in ("error", "timeout") and v.fixed.reason:
@@ -1159,7 +1233,8 @@ def environment_reasons(baseline: SandboxResult, original: Path) -> list[Reason]
             )
         ]
     blocks = "; ".join(
-        f"{m} blocks {', '.join(_test_files(ids, original))}" for m, ids in sorted(missing.items())
+        f"{m} blocks {', '.join(test_files_of(ids, original))}"
+        for m, ids in sorted(missing.items())
     )
     return [
         Reason(
@@ -1172,7 +1247,7 @@ def environment_reasons(baseline: SandboxResult, original: Path) -> list[Reason]
     ]
 
 
-def _test_files(test_ids: Iterable[str], root: Path) -> list[str]:
+def test_files_of(test_ids: Iterable[str], root: Path) -> list[str]:
     """The test files of runtime test ids (`tests.test_x`, `tests.test_x::test_y`,
     `tests.test_x.TestA::test_b`): the longest dotted prefix that is a .py file under `root`,
     else the id's module part as it is."""

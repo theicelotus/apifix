@@ -418,12 +418,14 @@ def verification_feedback(
     *,
     dependency_file: bool = False,
     hints: Sequence[tuple[str, str]] = (),
+    mock_hint: str = "",
     short: bool = False,
 ) -> str:
     """For the next attempt's files: why the verifier rejected the last one. Python files get
     the failing tests' output (repeated errors shown once; `short`: of fewer tests, cut
-    shorter) and the migration's hints; dependency files only the problems, plus pip's output
-    when the install failed. Every reason line and hint is kept either way."""
+    shorter) and the migration's hints (`mock_hint`: verifier.failure_hints); dependency
+    files only the problems, plus pip's output when the install failed. Every reason line and
+    hint is kept either way."""
     head = (
         f"The verifier did not accept attempt {attempt_number} (verdict: {v.verdict}). Fix the "
         "problems below in this file if they concern it; do not weaken, skip or delete tests."
@@ -436,6 +438,7 @@ def verification_feedback(
         failure_output=not dependency_file,
         dedupe=True,
         hints=() if dependency_file else hints,
+        mock_hint="" if dependency_file else mock_hint,
         install_output_chars=FEEDBACK_PIP_CHARS if dependency_file else None,
     )
     return "\n".join([head, "", *body]).rstrip()

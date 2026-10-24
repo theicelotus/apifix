@@ -1256,12 +1256,15 @@ def test_code_block_nudges_are_capped_per_attempt(repo):
 
 def test_truncated_reply_fails_the_file_without_a_nudge(repo):
     cut = LLMResponse("```python\nimport openai\n", [], "max_tokens", USAGE, "fake-model", "")
-    llm = FakeLLM([cut, cut])
+    llm = FakeLLM([cut, cut, cut])
     result = wf(repo, llm, max_retries=0)
-    (attempt,) = result.trajectory["attempts"]
+    # attempt 1 never reached verification, so it did not count: one more attempt
+    attempt, again = result.trajectory["attempts"]
     assert attempt["nudges"] == [] and attempt["result"] == "check_failed"
-    # sent again with the most reply tokens; app.py is nearly all regions, so not as regions
-    assert llm.max_tokens_seen == [budget(APP_OLD), 16_000]
+    assert again["result"] == "check_failed" and llm.script == []
+    # sent again with the most reply tokens; app.py is nearly all regions, so not as regions;
+    # attempt 2 starts with them
+    assert llm.max_tokens_seen == [budget(APP_OLD), 16_000, 16_000]
     entry = attempt["files"][0]
     assert entry["error"] == (
         "the reply hit the output limit before the file was complete (at 16,000 reply tokens)"
@@ -1505,9 +1508,10 @@ def test_autospec_on_the_client_class_goes_back_through_the_check_retry(tmp_path
 
 def test_a_second_failure_of_the_new_checks_fails_the_attempt(tmp_path):
     tiny = write_tree(tmp_path / "tiny", TINY)
-    llm = FakeLLM([block(LIVE_APP), block(LIVE_TESTS), block(LIVE_TESTS)])
+    llm = FakeLLM([block(LIVE_APP), *[block(LIVE_TESTS)] * 4])
     result = wf(tiny, llm, max_retries=0)
-    (attempt,) = result.trajectory["attempts"]
+    attempt, again = result.trajectory["attempts"]  # the first did not count
+    assert [f["path"] for f in again["files"]] == ["tests/test_app.py"]
     assert attempt["result"] == "check_failed" and attempt["verification"] is None
     assert attempt["files"][1]["error"] == LIVE_TARGET_WF
     assert "failed: mock target 'app.client.chat.completions.create'" in result.report_markdown
@@ -1940,9 +1944,11 @@ def test_retry_messages_list_earlier_problems_to_keep_fixed(repo):
     llm = FakeLLM(
         [broken("Missing1"), broken("Missing2")]  # attempt 1 fails
         + [broken("Missing3"), broken("Missing1")]  # attempt 2: app.py first, fails again
+        + [broken(f"Missing{n}") for n in range(4, 8)]  # 3 and 4: neither counted
     )
     result = wf(repo, llm, max_retries=1)
-    first, second = result.trajectory["attempts"]
+    first, second, *_ = result.trajectory["attempts"]
+    assert len(result.trajectory["attempts"]) == 4 and llm.script == []  # 2 x (1 + 1)
     assert first["nudges"][0]["keep_fixed"] == []  # nothing earlier yet
     (retry,) = second["nudges"]
     assert retry["keep_fixed"] == [
@@ -2724,7 +2730,9 @@ def test_the_same_check_error_on_three_attempts_stops_the_job(tmp_path, file_edi
         "same error on attempts 1, 2 and 3 (mock target 'notebook.context.OpenAI': "
         "notebook/context.py has no top-level name 'OpenAI'"
     )
-    assert result.reason.endswith("...); stopped with 2 attempt(s) left")
+    # none of the three reached verification: all of max_retries + 1 = 5 are left (within
+    # 10 in all)
+    assert result.reason.endswith("...); stopped with 5 attempt(s) left")
     assert f"- Outcome: {result.reason}" in result.report_markdown
     # each failure named the module the test reaches, with its target
     first = attempts[0]["nudges"][0]
@@ -2775,3 +2783,126 @@ def test_a_different_error_ends_the_streak(tmp_path):
         for f in a["files"]
         if not f["accepted"]
     ] == ["mock_targets", "undefined_names", "mock_targets"]
+
+
+# --- last good version, mock failures, attempt budget (docs/plans/genai-run-6.md) ------------
+
+NS_CREATE = "AttributeError: 'types.SimpleNamespace' object has no attribute 'create'"
+# the traceback runs through app.py, where the code under test calls the test's mock
+MOCK_TRACEBACK = f"{NS_CREATE}\napp.py:7: in ask\n    r = client.chat.completions.create("
+MOCK_HINT_TEXT = (
+    "Hint: the test's mock client is incomplete: SimpleNamespace has no create; build the "
+    "client mock with MagicMock() (or include the whole chat.completions.create chain) and set "
+    ".return_value on create"
+)
+# the same tests, with a role in the mock message (the reply after a failed verification)
+TESTS_ROLE = TESTS_NEW.replace("NS(content=text)", 'NS(role="assistant", content=text)')
+
+
+def failing_first_verification(llm, *failures):
+    """A judge whose first verification (fixed run and its rerun, during attempt 1) has
+    `failures`; later runs, and the baseline, are judged as usual."""
+
+    def judge_tree(tree: Path) -> SandboxResult:
+        if len(llm.requests) <= 2 and (tree / "app.py").read_text() != APP_OLD:
+            return run(*failures, (T_STRIP, "passed"))
+        return judge(tree)
+
+    return JudgingSandbox(judge=judge_tree)
+
+
+def test_mock_failures_resend_only_the_tests_with_a_hint(repo):
+    llm = FakeLLM([*GOOD, block(TESTS_ROLE)])
+    sandbox = failing_first_verification(llm, (T_ASK, "failed", MOCK_TRACEBACK))
+    result = wf(repo, llm, sandbox)
+    assert result.outcome == "verified", result.report_markdown
+    first, second = result.trajectory["attempts"]
+    assert first["result"] == "rejected"
+    # app.py's line in the traceback is where the test's mock was called: not resent
+    assert [f["path"] for f in second["files"]] == ["tests/test_app.py"]
+    assert second["kept_files"] == ["requirements.txt", "app.py"]
+    request = llm.requests[2][0].text
+    assert request.startswith("The verifier did not accept attempt 1") and MOCK_HINT_TEXT in request
+
+
+def test_a_failure_of_the_code_under_test_resends_everything(repo):
+    llm = FakeLLM([*GOOD, *GOOD])
+    sandbox = failing_first_verification(llm, (T_ASK, "failed", "AssertionError: assert 'x'"))
+    result = wf(repo, llm, sandbox)
+    second = result.trajectory["attempts"][1]
+    assert [f["path"] for f in second["files"]] == ["app.py", "tests/test_app.py"]
+    assert "mock client is incomplete" not in llm.requests[2][0].text
+
+
+def broken_app(name: str) -> LLMResponse:
+    return block(APP_NEW + f"\nX = {name}()\n")
+
+
+def test_a_resend_that_fails_its_checks_keeps_the_last_accepted_version(repo):
+    llm = FakeLLM([*GOOD, broken_app("Missing1"), broken_app("Missing2"), block(TESTS_ROLE)])
+    sandbox = failing_first_verification(llm, (T_ASK, "failed", "AssertionError: assert 'x'"))
+    result = wf(repo, llm, sandbox)
+    assert result.outcome == "verified", result.report_markdown
+    second = result.trajectory["attempts"][1]
+    app, tests = second["files"]
+    assert not app["accepted"] and app["fell_back_to"] == 1
+    assert second["fell_back"] == [{"path": "app.py", "accepted_in": 1, "error": app["error"]}]
+    # the test file that imports app.py is still sent, and verified against attempt 1's app.py
+    assert second["deferred"] == [] and tests["accepted"]
+    assert (
+        "+    r = client.chat.completions.create(" in result.diff and "Missing" not in result.diff
+    )
+    assert "`app.py` failed: line 10: 'Missing2' is used but never imported or defined" in (
+        result.report_markdown
+    )
+    assert "(kept its attempt 1 version)" in result.report_markdown
+
+
+def test_only_fallbacks_are_not_verified_again(repo):
+    # attempt 2: app.py falls back and the tests come back as they were: the tree attempt 1's
+    # verification judged, so no second sandbox run; attempt 3 resends app.py
+    llm = FakeLLM(
+        [*GOOD, broken_app("Missing1"), broken_app("Missing2"), block(TESTS_NEW), block(APP_NEW)]
+    )
+    sandbox = failing_first_verification(llm, (T_ASK, "failed", "AssertionError: assert 'x'"))
+    result = wf(repo, llm, sandbox, max_retries=1)
+    assert [a["result"] for a in result.trajectory["attempts"]] == [
+        "rejected",
+        "check_failed",
+        "verified",
+    ]
+    third = result.trajectory["attempts"][2]
+    assert [f["path"] for f in third["files"]] == ["app.py"]
+    assert "Your previous version of app.py was rejected" in llm.requests[5][0].text
+    assert "1 ended at the checks and did not count" in result.report_markdown
+
+
+def test_attempts_that_fail_the_checks_do_not_count(repo):
+    llm = FakeLLM([broken_app("Missing1"), broken_app("Missing2"), *GOOD])
+    result = wf(repo, llm, max_retries=0)
+    assert result.outcome == "verified"
+    assert [a["result"] for a in result.trajectory["attempts"]] == ["check_failed", "verified"]
+    assert (
+        "- Attempts: 2 (max 1 that reach verification, 2 in all; 1 ended at the checks and did "
+        "not count); changes from attempt 2"
+    ) in result.report_markdown
+    # agent mode: every attempt counts
+    agent = go(repo, FakeLLM([done()]), max_retries=0)
+    assert agent.attempts == 1 and "- Attempts: 1 (max 1)" in agent.report_markdown
+
+
+def test_mock_failure_tracebacks_add_no_regions_to_the_code_under_test():
+    from types import SimpleNamespace
+
+    from apifix.engine.agent import feedback_lines_in
+
+    source = "def ask():\n    return 1\n\n\ndef other():\n    return 2\n"
+    message = f"{NS_CREATE}\napp.py:5: in other"
+    test = SimpleNamespace(id=T_ASK, message=message)
+    v = SimpleNamespace(
+        delta=SimpleNamespace(newly_failing=[T_ASK], newly_erroring=[]),
+        fixed=SimpleNamespace(tests=[test]),
+        reasons=[],
+    )
+    assert feedback_lines_in("app.py", source, source, v) == [5]
+    assert feedback_lines_in("app.py", source, source, v, skip_tracebacks_of={T_ASK}) == []

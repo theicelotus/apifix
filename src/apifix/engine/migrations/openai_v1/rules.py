@@ -367,6 +367,13 @@ MOCK_DICT_CHUNK = (
     "1.x stream chunks are objects: build mock chunks with attribute access (e.g. "
     "SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=...))])), not dicts."
 )
+# A mocked chunk whose delta has a role: replies that copied MOCK_DICT_CHUNK's example dropped
+# it, and with it a string the test kept ("assistant"). {role}: the original's value (repr).
+MOCK_DICT_CHUNK_ROLE = (
+    "1.x stream chunks are objects: build mock chunks with attribute access and keep every "
+    "key of the delta, role too (e.g. SimpleNamespace(choices=[SimpleNamespace("
+    "delta=SimpleNamespace(role={role}, content=...))])), not dicts."
+)
 RESPONSE_DICT_KEY = "choices"
 RESPONSE_CHOICE_KEYS = frozenset({"message", "text"})
 CHUNK_CHOICE_KEY = "delta"

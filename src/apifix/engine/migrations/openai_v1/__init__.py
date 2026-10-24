@@ -60,6 +60,11 @@ class OpenAIV1Migration:
             'patching the client class (patch("app.OpenAI")), or autospec the method instead.',
         ),
     )
+    mock_failure_hint = (
+        "the test's mock client is incomplete: {problem}; build the client mock with "
+        "MagicMock() (or include the whole chat.completions.create chain) and set "
+        ".return_value on create"
+    )
     # A client must be constructible with the installed versions (a dummy key; nothing is sent:
     # the network is off and constructing a client makes no request).
     smoke_check = SmokeCheck(

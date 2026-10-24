@@ -246,7 +246,9 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
 - `.ipynb` notebooks are not scanned yet.
 - openai-v1, test files only (`project.is_test_file`): dict literals shaped like a 0.x response (`"choices"` holding a
   dict with `"message"` or `"text"`) or a 0.x stream chunk (a choice with `"delta"`; its own
-  suggestion, `rules.MOCK_DICT_CHUNK`, which selects the Streaming part) are a [likely]
+  suggestion, `rules.MOCK_DICT_CHUNK`, or `MOCK_DICT_CHUNK_ROLE` when the delta has a `"role"`
+  key: its example keeps `role=` with the literal's value, `...` when not a string constant;
+  both select the Streaming part) are a [likely]
   `response_access` finding, without requiring an openai import. `dict(choices=...)` calls and dicts built step by step are
   missed; the same literal in a non-test file (fixtures modules, sample data) is not flagged.
 
@@ -500,6 +502,12 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
 - Edits are exact string replacements in existing Python and dependency files. The agent
   cannot create, rename or delete files, so migrations that need a new module (e.g. a shared
   client factory) must put it in an existing file.
+- Attempt budget: `--max-retries N` bounds the attempts that count, N + 1. In whole-file mode an
+  attempt that ends `check_failed` (never verified) does not count, within
+  `MAX_ATTEMPTS_FACTOR` (2) x (N + 1) attempts in all; the repeated-error stop and the token
+  and cost limits still end a job sooner. Agent mode's `no_changes` attempts count. The
+  repeated-error stop's "N attempt(s) left" follows the same rule; the report's Attempts line
+  says how many ended at the checks.
 - `verified_weak` stops the loop. `unverified` is not retried when the repo has no tests, the
   sandbox could not run at all, or tests fail while the original code's run failed
   (`unjudged_failures`); nothing the agent edits could change those. The report then suggests
@@ -624,7 +632,14 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   earlier one's as "(same error as ...)", and adds the migration's `failure_hints` when their
   marker appears in failing output (openai: the missing-API-key error, httpx 0.28's
   `proxies`, and `Mock object has no attribute 'completions'`: autospec on a client class,
-  the advice of the autospec check). Agent mode's feedback after a failed verification gets
+  the advice of the autospec check). A test that failed on its own mock object
+  (`verifier.mock_failure`: `AttributeError: '<mock>' object has no attribute 'x'`, `TypeError:
+  '<mock>' object is not ...`, `object <mock> can't be used in 'await' expression`; `<mock>`
+  SimpleNamespace, Mock, MagicMock, NonCallable(Magic)Mock, AsyncMock, PropertyMock, any module
+  prefix; found anywhere in the clipped message) adds `Migration.mock_failure_hint` per distinct
+  problem, at most 3 ("the test's mock client is incomplete: SimpleNamespace has no create;
+  build the client mock with MagicMock() ..."); spec'd mocks (`Mock object has no attribute`)
+  keep the autospec hint only. Agent mode's feedback after a failed verification gets
   the same hints. Dependency files get
   the problem list without test output, plus the tail of pip's output when the install failed.
 - The file plus its read-only context (the other files already changed in the working copy)
@@ -742,7 +757,8 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   Calls with no known shape keep a `<the test's mock response>` placeholder.
 - Suggestions from other modules: when the patched module's own code gives none (genai: the
   test patched `genai.context.OpenAI`, and context.py never touches openai), the message lists
-  where a patch would reach the library: the patched module first if it calls the library,
+  where a patch would reach the library (a patched module that does not use the library gets
+  no list of its top-level names, so the suggestion comes first): the patched module first if it calls the library,
   then the non-test modules the test file reaches through imports (`context.reachable_modules`:
   absolute and relative imports, each package's `__init__.py`, transitively), or all of them
   when it reaches none ("the test reaches none of them through its imports"); at most 3, the
@@ -809,8 +825,15 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   that reach a non-test module set aside in the same attempt through imports
   (`context.reachable_modules`) are held back without a request (`attempts[].deferred`,
   report "not sent: ... (it imports ..., which failed)"); tests that reach it otherwise are
-  still sent. The next attempt sends only the files that failed or were held back, in the
-  same order and form. Several errors where one has an example are sent as a bullet list.
+  still sent. A file accepted in an earlier attempt that fails both tries instead keeps its
+  last accepted version for the attempt (a failed request never writes the working copy): it
+  is not set aside, test files importing it are sent, and the attempt can be verified
+  (`attempts[].fell_back` with `accepted_in` and the error, `fell_back_to` on the entry, report
+  "(kept its attempt N version)"); its streak still counts, but a repeated error on it does not
+  stop the job. An attempt whose tree, after fallbacks, is the one the last verification judged
+  is not verified again (`check_failed`). The next attempt sends only the files that failed,
+  fell back (when the attempt was not verified) or were held back, in the same order and
+  form. Several errors where one has an example are sent as a bullet list.
   Code-block nudges still continue the conversation.
 - A retry note also lists the file's earlier check errors in this job (any attempt) that the
   current reply does not have, under "Keep these fixed", compared and shown by first line
@@ -831,7 +854,13 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   attempt(s) left` (outcome aborted), or the best attempt's outcome with "; stopped early:
   ..." appended when an earlier attempt was verified.
 - After a failed verification every Python file is resent with the verifier's reasons and
-  failing test output (at most 10 tests, 2,000 characters each, 8,000 in total). A dependency
+  failing test output (at most 10 tests, 2,000 characters each, 8,000 in total), except when
+  every `reject` reason is `regression` / `regression_error` and every newly failing or
+  erroring test failed on its own mock (`verifier.only_mock_failures`) and those tests' files
+  are among the files sent: then non-test Python files that no reason or remaining finding
+  names are kept, not resent (their line in the traceback is only where the test's mock was
+  called). Region-edited non-test files never take regions from a mock failure's traceback
+  (`feedback_lines_in(skip_tracebacks_of=...)`); the failing test's own region still comes. A dependency
   file (accepted, or set by apifix) is resent only when a reason or remaining finding names
   it, or the install / smoke check failed and the fixed run's install read it
   (`dependency_sources` or a used declaration; a run that recorded none implicates all). With

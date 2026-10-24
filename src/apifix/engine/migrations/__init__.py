@@ -30,6 +30,9 @@ class Migration(Protocol):
     # (marker, explanation): when a failing test's output contains the marker, the retry
     # feedback carries the explanation.
     failure_hints: tuple[tuple[str, str], ...]
+    # For a test that failed on its own mock (verifier.mock_failure): the retry feedback's hint,
+    # with {problem} ("SimpleNamespace has no create"). "" for none.
+    mock_failure_hint: str
     # name -> the import that defines it, for names the library's 1.x code uses (apifix adds
     # a missing one when it is the only import known for the name).
     known_imports: Mapping[str, str]

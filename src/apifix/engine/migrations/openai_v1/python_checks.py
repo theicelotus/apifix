@@ -8,6 +8,7 @@ come from ``openai`` are reported. Limitations are listed in CLAUDE.md.
 from __future__ import annotations
 
 import ast
+import json
 from collections import Counter
 from dataclasses import dataclass
 
@@ -535,8 +536,27 @@ class _Visitor(ast.NodeVisitor):
                     if keys & rules.RESPONSE_CHOICE_KEYS:
                         return rules.MOCK_DICT_RESPONSE
                     if rules.CHUNK_CHOICE_KEY in keys:
-                        return rules.MOCK_DICT_CHUNK
+                        return self._chunk_suggestion(elt)
         return None
+
+    def _chunk_suggestion(self, choice: ast.Dict) -> str:
+        """MOCK_DICT_CHUNK, or MOCK_DICT_CHUNK_ROLE with the role when the delta has one (its
+        literal value, else `...`)."""
+        delta = next(
+            (
+                v
+                for k, v in zip(choice.keys, choice.values, strict=True)
+                if self._key(k) == rules.CHUNK_CHOICE_KEY
+            ),
+            None,
+        )
+        if isinstance(delta, ast.Dict):
+            for key, value in zip(delta.keys, delta.values, strict=True):
+                if self._key(key) == "role":
+                    role = self._key(value)
+                    shown = json.dumps(role) if isinstance(role, str) else "..."
+                    return rules.MOCK_DICT_CHUNK_ROLE.format(role=shown)
+        return rules.MOCK_DICT_CHUNK
 
     def visit_Dict(self, node: ast.Dict) -> None:
         suggestion = self._response_dict(node) if self.test_file else None
