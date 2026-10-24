@@ -107,13 +107,30 @@ Use `resp.model_dump()` where code really needs a dict (JSON output, storage). C
 `resp.choices[0].text`. Images: `resp.data[0].url`. Transcriptions: `resp.text`.
 Moderations: `resp.results[0].flagged`.
 
-<!-- part: responses.streaming -->
-Streaming (`stream=True`) yields objects too:
+<!-- part: streaming -->
+## Streaming
+
+`stream=True` yields chunk objects too. In 1.x `chunk.choices[0].delta.content` always exists
+and is `None` on the role chunk (the first) and the final chunk, so 0.x's key checks
+(`"content" in delta`, `hasattr(delta, "content")`) must become `if delta.content is not None:`
+(or `delta.content or ""` where text is joined). `hasattr` is always true in 1.x, so it would
+yield the `None`. `chunk.choices` can be empty (Azure's first chunk; the last one with
+`stream_options={"include_usage": True}`).
 
 ```python
+# 0.x
+for chunk in openai.ChatCompletion.create(model=m, messages=msgs, stream=True):
+    delta = chunk["choices"][0]["delta"]
+    if "content" in delta:
+        yield delta["content"]
+
+# 1.x
 for chunk in client.chat.completions.create(model=m, messages=msgs, stream=True):
-    if chunk.choices and chunk.choices[0].delta.content:
-        out.append(chunk.choices[0].delta.content)
+    if not chunk.choices:
+        continue
+    delta = chunk.choices[0].delta
+    if delta.content is not None:
+        yield delta.content
 ```
 
 <!-- part: errors -->
@@ -155,7 +172,7 @@ which fails on a dict. Helpers that build dict responses must return objects:
 ```python
 # 0.x
 def completion(text):
-    return {"choices": [{"message": {"content": text}}]}
+    return {"choices": [{"message": {"role": "assistant", "content": text}}]}
 
 
 # 1.x
@@ -163,7 +180,8 @@ from types import SimpleNamespace
 
 
 def completion(text):
-    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))])
+    message = SimpleNamespace(role="assistant", content=text)
+    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 ```
 
 `openai.OpenAI()` raises `OpenAIError` when no API key is set (argument or `OPENAI_API_KEY`),
@@ -175,14 +193,14 @@ its client:
 # 0.x
 @mock.patch("openai.ChatCompletion.create")
 def test_answer(create):
-    create.return_value = {"choices": [{"message": {"content": "hi"}}]}
+    create.return_value = {"choices": [{"message": {"role": "assistant", "content": "hi"}}]}
 
 
 # 1.x, client created inside the function (def answer(): client = openai.OpenAI() ...)
 @mock.patch("app.openai.OpenAI")
 def test_answer(OpenAI):
     OpenAI.return_value.chat.completions.create.return_value = SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content="hi"))]
+        choices=[SimpleNamespace(message=SimpleNamespace(role="assistant", content="hi"))]
     )
 
 
@@ -191,7 +209,7 @@ def test_answer(OpenAI):
 @mock.patch("app.client.chat.completions.create")
 def test_answer(create):
     create.return_value = SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content="hi"))]
+        choices=[SimpleNamespace(message=SimpleNamespace(role="assistant", content="hi"))]
     )
 
 
@@ -199,7 +217,7 @@ def test_answer(create):
 @mock.patch("app.get_client")
 def test_answer(get_client):
     get_client.return_value.chat.completions.create.return_value = SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content="hi"))]
+        choices=[SimpleNamespace(message=SimpleNamespace(role="assistant", content="hi"))]
     )
 ```
 

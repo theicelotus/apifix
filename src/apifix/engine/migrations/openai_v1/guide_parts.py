@@ -27,14 +27,19 @@ def _matches(finding: Finding, selector: tuple[frozenset[str], tuple[str, ...]])
     return not keywords or any(k in text for k in keywords)
 
 
-def selected_parts(findings: list[Finding], root: Path | None = None) -> set[str]:
-    """`root`: the repo, for recognising test files by content."""
+def selected_parts(
+    findings: list[Finding], root: Path | None = None, shared: bool = False
+) -> set[str]:
+    """`root`: the repo, for recognising test files by content. `shared`: for a whole-file
+    job's shared system prompt, which leaves out the per-file parts (rules.GUIDE_PER_FILE)."""
     keep = set(rules.GUIDE_ALWAYS)
     if any(is_test_file(f.file, root=root) for f in findings):
         keep |= rules.GUIDE_FOR_TEST_FILES
     for part, selectors in rules.GUIDE_SELECTORS.items():
         if any(_matches(f, s) for f in findings for s in selectors):
             keep.add(part)
+    if shared:
+        keep -= rules.GUIDE_PER_FILE
     return with_sections(keep)
 
 
@@ -71,9 +76,11 @@ def _part_text(part: str, body: str, findings: list[Finding], keep: set[str]) ->
     return body
 
 
-def job_guide(findings: list[Finding], root: Path | None = None) -> tuple[str, list[str]]:
+def job_guide(
+    findings: list[Finding], root: Path | None = None, shared: bool = False
+) -> tuple[str, list[str]]:
     """The guide text for these findings, and the ids of the parts it holds (in guide order)."""
-    keep = selected_parts(findings, root)
+    keep = selected_parts(findings, root, shared)
     parts = [(part, _part_text(part, body, findings, keep)) for part, body in PARTS]
     text = render_parts(parts, keep)
     return text, [part for part, _ in PARTS if part in keep]

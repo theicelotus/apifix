@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 
 from apifix.engine.dependencies import (
@@ -13,7 +13,11 @@ from apifix.engine.dependencies import (
 )
 from apifix.engine.migrations.guide import full_guide
 from apifix.engine.migrations.openai_v1 import config_checks, guide_parts, repo_findings, rules
-from apifix.engine.migrations.openai_v1.python_checks import check_python, v1_api_uses
+from apifix.engine.migrations.openai_v1.python_checks import (
+    check_python,
+    stream_check_errors,
+    v1_api_uses,
+)
 from apifix.engine.models import CERTAIN, LIKELY, Finding, SmokeCheck
 
 
@@ -63,8 +67,10 @@ class OpenAIV1Migration:
     first_version = rules.FIRST_V1
     target_name = "openai 1.x"
 
-    def job_guide(self, findings: list[Finding], root: Path | None = None) -> tuple[str, list[str]]:
-        return guide_parts.job_guide(findings, root)
+    def job_guide(
+        self, findings: list[Finding], root: Path | None = None, shared: bool = False
+    ) -> tuple[str, list[str]]:
+        return guide_parts.job_guide(findings, root, shared)
 
     def guide_text(self, part_ids: Iterable[str]) -> str:
         return guide_parts.parts_text(part_ids)
@@ -86,8 +92,18 @@ class OpenAIV1Migration:
 
     def rewrite_checker(
         self, root: Path, findings: Sequence[Finding]
-    ) -> Callable[[str, str, str], list[str]] | None:
-        return config_checks.rewrite_checker(root, findings)
+    ) -> Callable[[str, str, str], Mapping[str, list[str]]] | None:
+        """Checks `config` (config_checks.py: dropped / ignored module configuration) and
+        `streaming` (key checks on a stream delta)."""
+        config = config_checks.rewrite_checker(root, findings)
+
+        def check(path: str, original: str, candidate: str) -> dict[str, list[str]]:
+            return {
+                "config": config(path, original, candidate),
+                "streaming": stream_check_errors(path, original, candidate),
+            }
+
+        return check
 
     def check_dependency(self, file: str, dep: DeclaredDependency) -> Finding | None:
         """A declaration that allows a 0.x release: `certain` when it allows nothing else,

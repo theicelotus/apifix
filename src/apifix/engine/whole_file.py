@@ -610,7 +610,7 @@ def check_candidate(
     python_modules: Sequence[str] = (),
     test_files: Sequence[str] = (),
     findings: Sequence[Finding] | None = None,
-    rewrite_checks: Callable[[str, str, str], list[str]] | None = None,
+    rewrite_checks: Callable[[str, str, str], Mapping[str, list[str]]] | None = None,
     unmigrated_modules: Collection[str] = (),
 ) -> CheckResult:
     """Syntax (Python files), well-formedness (dependency files), "differs from the original"
@@ -631,7 +631,8 @@ def check_candidate(
     check (unrelated.py): text-only hunks away from the migration are reverted before the
     imports are added (`reverted`), and code hunks unrelated to it, or original strings that
     are missing, are errors. `rewrite_checks(path, original, candidate)`: the migration's own
-    checks (Migration.rewrite_checker), run last on the completed file (check `config`)."""
+    checks (Migration.rewrite_checker, e.g. `config`, `streaming`), run last on the completed
+    file; without them, check `config` is n/a."""
     checks: dict[str, str] = {}
     errors: list[str] = []
     error_checks: list[str] = []
@@ -718,7 +719,8 @@ def check_candidate(
         else []
     )
     record_all("unrelated_edits", unrelated_problems, unrelated)
-    config = path.endswith(".py") and not syntax and rewrite_checks is not None
-    config_problems = rewrite_checks(path, original, candidate) if config and rewrite_checks else []
-    record_all("config", config_problems, config)
+    own = path.endswith(".py") and not syntax and rewrite_checks is not None
+    named = dict(rewrite_checks(path, original, candidate)) if own and rewrite_checks else {}
+    for name, problems in (named or {"config": []}).items():
+        record_all(name, list(problems), own)
     return CheckResult(errors, checks, error_checks, candidate, added, reverts)

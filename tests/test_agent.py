@@ -1123,6 +1123,7 @@ def test_whole_file_migrates_each_file_in_its_own_request(repo):
                 "mock_targets": "n/a",  # not a test file
                 "unrelated_edits": "ok",
                 "config": "ok",
+                "streaming": "ok",
             },
             "auto_imports": [],
             "reverted": [],
@@ -1786,7 +1787,8 @@ def test_run3_replay(tmp_path):
     assert "completion() returns a dict; make it return an object" in nudge["error"]
     assert (
         "        OpenAI.return_value.chat.completions.create.return_value = SimpleNamespace(\n"
-        '            choices=[SimpleNamespace(message=SimpleNamespace(content="hello"))]\n'
+        '            choices=[SimpleNamespace(message=SimpleNamespace(role="assistant", '
+        'content="hello"))]\n'
         "        )" in nudge["message"]
     )
     assert tests["accepted"] and tests["replies"][1]["checks"]["mock_targets"] == "ok"

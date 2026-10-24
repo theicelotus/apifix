@@ -4,9 +4,10 @@ The candidate is compared with the original line by line (the same diff as
 `diffing.changed_lines`). Each changed region (hunk) is then judged:
 
 - import hunks are kept;
-- text-only hunks (the token streams match once comments, blank lines, whitespace and string
-  contents are set aside) are kept when they touch a string on a finding's line, or only change
-  comments/whitespace near a finding's statement; any other is reverted to the original;
+- text-only hunks (the token streams match once comments, blank lines, whitespace, string
+  contents and docstrings are set aside) are kept when they touch a string on a finding's line,
+  or only change comments/whitespace near a finding's statement; any other is reverted to the
+  original (so an added, removed or changed docstring is put back, however the diff splits it);
 - code hunks near a finding's statement are kept; so are code hunks elsewhere that use an
   openai-bound name (see _Bound: the library's names and what is assigned from them, in scope)
   or a name a near code hunk binds or introduces, in the same scope; any other is an error
@@ -100,6 +101,54 @@ class _Tok:
     string: str
     start: tuple[int, int]
     end_row: int
+    doc: bool = False  # part of a docstring statement (see _docstring_tokens)
+
+
+def _docstrings(tree: ast.Module) -> list[ast.Expr]:
+    """The docstring statements: a string as the first statement of the module, a class or a
+    function."""
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+            first = node.body[0] if node.body else None
+            if (
+                isinstance(first, ast.Expr)
+                and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)
+            ):
+                out.append(first)
+    return out
+
+
+def _docstring_tokens(
+    tokens: list[tokenize.TokenInfo], lines: list[str], docs: list[ast.Expr]
+) -> set[int]:
+    """Indexes of the tokens that make up docstring statements: their strings, the NEWLINE
+    ending them, and the INDENT on their first line (it moves to the next statement's line
+    when a docstring is added or removed)."""
+    spans = []
+    for d in docs:
+        start = (d.lineno, _char_col(lines[d.lineno - 1], d.col_offset))
+        end_row = d.end_lineno or d.lineno
+        end = (end_row, _char_col(lines[end_row - 1], d.end_col_offset or 0))
+        spans.append((start, end))
+    out: set[int] = set()
+    for start, end in spans:
+        inside = [i for i, t in enumerate(tokens) if start <= t.start and t.end <= end]
+        if not inside:
+            continue
+        out.update(inside)
+        after = inside[-1] + 1
+        if after < len(tokens) and tokens[after].type == tokenize.NEWLINE:
+            out.add(after)
+        before = inside[0] - 1
+        if (
+            before >= 0
+            and tokens[before].type == tokenize.INDENT
+            and tokens[before].start[0] == start[0]
+        ):
+            out.add(before)
+    return out
 
 
 class _Version:
@@ -109,10 +158,18 @@ class _Version:
         self.text = text
         self.lines = text.splitlines()
         self.tree = ast.parse(text)
+        raw = list(tokenize.generate_tokens(io.StringIO(text).readline))
+        docs = _docstrings(self.tree)
+        doc = _docstring_tokens(raw, self.lines, docs)
         self.tokens = [
-            _Tok(t.type, t.string, t.start, t.end[0])
-            for t in tokenize.generate_tokens(io.StringIO(text).readline)
+            _Tok(t.type, t.string, t.start, t.end[0], i in doc) for i, t in enumerate(raw)
         ]
+        # 1-based lines holding only docstring text (not a `def f(): """doc"""` line)
+        self.docstring_lines: set[int] = set()
+        for d in docs:
+            first, last = d.lineno, d.end_lineno or d.lineno
+            if self.lines[first - 1][: _char_col(self.lines[first - 1], d.col_offset)].isspace():
+                self.docstring_lines.update(range(first, last + 1))
         self.import_lines: set[int] = set()  # 1-based
         for node in ast.walk(self.tree):
             if isinstance(node, ast.Import | ast.ImportFrom):
@@ -135,7 +192,7 @@ class _Version:
 
 
 def _token_key(t: _Tok) -> tuple[int, str] | None:
-    if t.type in (tokenize.COMMENT, tokenize.NL):
+    if t.type in (tokenize.COMMENT, tokenize.NL) or t.doc:
         return None
     if t.type in _STRING_TOKENS:
         return (tokenize.STRING, "")
@@ -757,17 +814,20 @@ class _Diff:
     # messages
 
     def _excerpt(
-        self, lines: list[str], first: int, last: int, code: bool = False
+        self, version: _Version, first: int, last: int, code: bool = False
     ) -> tuple[int, str]:
         """(line number, text) of the first non-blank line in first..last; with `code`, of
-        the first one that is not a comment, if any."""
+        the first one that is neither a comment nor docstring text, if any."""
+        lines = version.lines
         found = [
             (n, lines[n - 1].strip())
             for n in range(first, min(last, len(lines)) + 1)
             if lines[n - 1].strip()
         ]
         if code:
-            found = [f for f in found if not f[1].startswith("#")] or found
+            found = [
+                f for f in found if not f[1].startswith("#") and f[0] not in version.docstring_lines
+            ] or found
         if not found:
             return first, ""
         n, s = found[0]
@@ -780,13 +840,13 @@ class _Diff:
 
     def code_error(self, h: Hunk) -> str:
         if h.insertion:
-            _, text = self._excerpt(self.new.lines, *self._new_side(h), code=True)
+            _, text = self._excerpt(self.new, *self._new_side(h), code=True)
             return (
                 f'{self.where(h)}: added code unrelated to the migration ("{text}"); remove it, '
                 "make only the changes the migration needs"
             )
         what = "removed" if h.j1 == h.j2 else "changed"
-        line, text = self._excerpt(self.old.lines, *self._old_side(h), code=True)
+        line, text = self._excerpt(self.old, *self._old_side(h), code=True)
         return (
             f'original line {line}: {what} code unrelated to the migration ("{text}"); keep it '
             "exactly as in the original"
@@ -794,12 +854,12 @@ class _Diff:
 
     def text_error(self, h: Hunk) -> str:
         if h.insertion:
-            _, text = self._excerpt(self.new.lines, *self._new_side(h))
+            _, text = self._excerpt(self.new, *self._new_side(h))
             return (
                 f'{self.where(h)}: added text unrelated to the migration ("{text}"); remove it, '
                 "make only the changes the migration needs"
             )
-        _, text = self._excerpt(self.old.lines, *self._old_side(h))
+        _, text = self._excerpt(self.old, *self._old_side(h))
         return (
             f'{self.where(h)}: changed text unrelated to the migration ("{text}"); keep it '
             "exactly as in the original"
@@ -828,9 +888,14 @@ def _changed_excerpts(old: list[str], new: list[str]) -> tuple[str, str]:
         while s < min(len(a), len(b)) - p and a[-1 - s] == b[-1 - s]:
             s += 1
         return _window(a, p, len(a) - s), _window(b, p, len(b) - s)
-    first = next((x.strip() for x in old if x.strip()), "")
-    added = next((x.strip() for x in new if x.strip()), "")
-    return _clip(first), _clip(added)
+    return _clip(_first_text(old)), _clip(_first_text(new))
+
+
+def _first_text(lines: list[str]) -> str:
+    """The first non-blank line, stripped, past lines that hold only quotes (the opening line
+    of a docstring)."""
+    stripped = [x.strip() for x in lines if x.strip()]
+    return next((x for x in stripped if x.strip("\"'")), stripped[0] if stripped else "")
 
 
 def _window(line: str, start: int, end: int, context: int = 25) -> str:

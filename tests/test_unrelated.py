@@ -140,6 +140,124 @@ def test_revert_kinds_and_excerpts():
     assert removed.old == gone.strip()
 
 
+# --- docstrings: text, however the diff splits them --------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "kind", "excerpt"),
+    [
+        # added to a method far from the findings, several lines
+        (
+            "    def describe(self) -> str:\n",
+            '    def describe(self) -> str:\n        """\n        Say which voice this is.\n'
+            '\n        Used in logs.\n        """\n',
+            "added",
+            "Say which voice this is.",
+        ),
+        # removed (the function's body is then its return)
+        ('    """The first choice of a stored completion."""\n', "", "removed", ""),
+        ('"""Answers spoken questions with a chat model."""\n\n', "", "removed", ""),
+        # rewritten across lines
+        (
+            '    """Wraps one chat model."""',
+            '    """Wraps one chat model.\n\n    Replies are short.\n    """',
+            "changed",
+            '..."""Wraps one chat model.',
+        ),
+        # a comment turned into a docstring
+        (
+            "        # The voice is fixed per instance.\n",
+            '        """The voice is fixed per instance."""\n',
+            "changed",
+            '"""The voice is fixed per instance."""',
+        ),
+    ],
+)
+def test_docstring_edits_away_from_the_migration_are_reverted(old, new, kind, excerpt):
+    r, errors = check(ASSISTANT, edit(GOOD_ASSISTANT, old, new))
+    assert (r.text, errors) == (GOOD_ASSISTANT, [])
+    (revert,) = r.reverted
+    assert revert.kind == kind
+    assert (revert.new if kind != "removed" else revert.old).startswith(excerpt)
+
+
+SHOUT = """import openai
+
+
+def ask(q):
+    r = openai.ChatCompletion.create(model="m", messages=[{"role": "user", "content": q}])
+    return r["choices"][0]["message"]["content"]
+
+
+def shout(text):
+    # Split on whitespace.
+
+    words = text.split()
+    return " ".join(w.upper() for w in words)
+"""
+
+
+def test_a_docstring_the_diff_splits_is_reverted_piece_by_piece():
+    candidate = SHOUT.replace(
+        "    # Split on whitespace.\n\n    words",
+        '    """Upper-case every word.\n\n    Used for headings.\n    """\n    words',
+    )
+    findings = MIGRATION.check_python("app.py", ast.parse(SHOUT), SHOUT)
+    # the docstring's blank line lines up with the original's, so two hunks hold its pieces
+    assert len(unrelated.hunks(SHOUT, candidate)) == 2
+    r = revert_text_edits(SHOUT, candidate, findings, LIBRARY)
+    assert (r.text, r.errors) == (SHOUT, [])
+    assert [(x.kind, x.new) for x in r.reverted] == [
+        ("changed", '"""Upper-case every word.'),
+        ("added", "Used for headings."),
+    ]
+
+
+def test_a_docstring_next_to_a_related_change_is_reverted_and_the_change_kept():
+    """The pattern of a real run: the model documented a migrated helper, and an unchanged
+    line split the docstring from the body change, so it was a hunk of its own."""
+    from tests.test_streaming import FIXTURE, GENERATE, migrated
+
+    findings = [f for f in scan(FIXTURE, "openai-v1").findings if f.file == GENERATE]
+    original = (FIXTURE / GENERATE).read_text()
+    good = migrated()
+    documented = good.replace(
+        "    for chunk in completion:\n",
+        '    """\n    Yield the text of each streamed chunk.\n    """\n'
+        "    for chunk in completion:\n",
+    )
+    r = revert_text_edits(original, documented, findings, LIBRARY)
+    assert (r.text, r.errors) == (good, [])
+    assert [(x.line, x.kind, x.new) for x in r.reverted] == [
+        (14, "added", "Yield the text of each streamed chunk.")
+    ]
+    assert unrelated_edits(original, r.text, findings, LIBRARY) == []
+
+
+def test_code_beside_a_docstring_is_still_judged_as_code():
+    # one hunk: a docstring change and an unrelated code change; the message shows the code
+    both = edit(
+        GOOD_ASSISTANT,
+        '    """Collapse whitespace so the speech engine reads it smoothly."""\n'
+        '    return " ".join(text.split()[:MAX_WORDS])',
+        '    """Collapse whitespace."""\n    return " ".join(text.split()[: MAX_WORDS - 1])',
+    )
+    assert check(ASSISTANT, both)[1] == [
+        'original line 15: changed code unrelated to the migration ("return " ".join('
+        'text.split()[:MAX_WORDS])"); keep it exactly as in the original'
+    ]
+    # a string statement after the first one is no docstring
+    note = edit(
+        GOOD_ASSISTANT,
+        "        self.voice = voice\n",
+        '        self.voice = voice\n        "the voice name"\n',
+    )
+    assert check(ASSISTANT, note)[1] == [
+        'after original line 27: added code unrelated to the migration (""the voice name""); '
+        "remove it, make only the changes the migration needs"
+    ]
+
+
 # --- kept -------------------------------------------------------------------------------------
 
 

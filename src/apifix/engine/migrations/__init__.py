@@ -50,9 +50,13 @@ class Migration(Protocol):
     first_version: str
     target_name: str
 
-    def job_guide(self, findings: list[Finding], root: Path | None = None) -> tuple[str, list[str]]:
+    def job_guide(
+        self, findings: list[Finding], root: Path | None = None, shared: bool = False
+    ) -> tuple[str, list[str]]:
         """The parts of `guide` these findings need, and the ids of those parts. `root`: the
-        repo, for recognising test files by content."""
+        repo, for recognising test files by content. `shared`: for a system prompt shared by
+        every file's requests, which leaves out parts that go only with the files needing them
+        (e.g. streaming); each file's request then adds those it needs."""
         ...
 
     def guide_text(self, part_ids: Iterable[str]) -> str:
@@ -87,9 +91,10 @@ class Migration(Protocol):
 
     def rewrite_checker(
         self, root: Path, findings: Sequence[Finding]
-    ) -> Callable[[str, str, str], list[str]] | None:
+    ) -> Callable[[str, str, str], Mapping[str, list[str]]] | None:
         """Migration-specific checks of a rewritten file, built once per job from the original
-        repo: a function (path, original, candidate) -> check errors, or None for no checks."""
+        repo: a function (path, original, candidate) -> check name -> its errors (in order;
+        every name each time), or None for no checks."""
         ...
 
 

@@ -55,7 +55,8 @@ src/apifix/
     migrations/       one package per migration; registry in __init__.py; guide.py splits
                       guides into `<!-- part: id -->` parts for per-job selection; optional
                       hooks `adjust_findings` (repo-level pass at the end of a scan) and
-                      `rewrite_checker` (migration checks of a whole-file rewrite); attributes
+                      `rewrite_checker` (migration checks of a whole-file rewrite, errors by
+                      check name); attributes
                       `first_version` / `target_name` and hook `new_api_uses` for
                       already_migrated.py
       openai_v1/      rules.py (pure data tables, incl. guide-part selectors) + migration-
@@ -63,7 +64,9 @@ src/apifix/
                       guide_parts.py (which parts / Resources rows a job's findings need);
                       repo_findings.py (adjust_findings: call sites -> module-level client when
                       a non-test file keeps a configured value); config_checks.py (rewrite
-                      checks: dropped / ignored openai.api_key, organization, api_base)
+                      checks: dropped / ignored openai.api_key, organization, api_base);
+                      streaming.py (key checks on a stream delta, `hasattr(delta, "content")`:
+                      scanner finding and rewrite check `streaming`)
     project.py        target repo facts: Python version, test files (`is_test_file`, the one
                       definition everything uses), test plan (pytest, explicit file list,
                       import paths), install plan (where each dependency is declared, what
@@ -221,6 +224,18 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   `environment-dev.yml` or files passed to `conda env create -f` under other names).
 - No cross-function tracking of response objects: dict-style access is only flagged when the
   response is assigned and used in the same function/module scope.
+- openai-v1 streaming: an api_call finding whose call passes `stream=` (anything but a `False`
+  / `None` constant, so `stream=stream` counts) ends with `rules.STREAM_CALL` (delta.content
+  always exists, None on role and final chunks); that text selects the Streaming guide part.
+  Key checks on a stream delta (`streaming.py`), `hasattr(D, "content")` and `"content" [not]
+  in D`, are a [likely] `response_access` finding in files with an openai import, where D is a
+  delta by shape (0.x or 1.x form, also mixed): `<x>.choices[i].delta`,
+  `<x>["choices"][i]["delta"]`, a name assigned from one, or `<c>.delta` for a name `c` from
+  `<x>.choices[i]` or `for c in <x>.choices`; per function scope, flow-insensitive. Deltas
+  passed in as parameters (`def f(delta)`), `getattr(delta, "content", ...)` and
+  `delta.get("content")` are not recognised. The 1.x form is flagged too (`hasattr` is always
+  true there), so a repo already on 1.x with such a check has a non-test finding and is not
+  `already_migrated`; the verifier's completeness check also sees one left in a fix.
 - No `getattr(openai, ...)` or other dynamic-attribute detection.
 - String references (e.g. `mock.patch` targets) are found with any module prefix
   (`app.openai.ChatCompletion.create`, `src.x.openai.error.RateLimitError`; [likely]), unless
@@ -548,7 +563,10 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
 - The system prompt carries only the guide parts the job's findings need
   (`Migration.job_guide`, selectors in `rules.py`; `job.guide_sections`), chosen once per job
   so it stays identical across requests (servers such as Ollama cache that shared prefix).
-  Agent mode keeps the full guide.
+  Per-file parts (`rules.GUIDE_PER_FILE`, openai-v1: `streaming`) are never in it
+  (`job_guide(..., shared=True)`): a file whose own findings select one gets it in its request
+  ("Migration guide for this file:"; check retries too), so only files that stream carry the
+  Streaming part. Agent mode keeps the full guide.
 - Request layout: the last verification's feedback first (identical for every Python file of an
   attempt, so it is cached too), then the file's findings, its original contents, the previous
   version (later attempts), and read-only context. Only test files get context: the changed
@@ -582,11 +600,11 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   against the original by line (`diffing.opcodes`). A finding's *region* is the innermost
   statement holding its line (simple statements whole, compound ones by their header:
   decorators to the line before the body; `except` handlers count). Per hunk: import-only hunks
-  are kept; *text-only* hunks (same tokens once comments, blank lines, whitespace and string
-  contents are set aside) are kept when they touch a string on a finding's line (or a key of a
-  dict-literal finding), or change only comments/whitespace within 3 lines of a region
-  (insertions: only strictly inside a region), and are otherwise **reverted** by apifix before
-  the other checks (`reverted` per reply and file entry; report "apifix reverted:
+  are kept; *text-only* hunks (same tokens once comments, blank lines, whitespace, string
+  contents and docstrings are set aside) are kept when they touch a string on a finding's line
+  (or a key of a dict-literal finding), or change only comments/whitespace within 3 lines of a
+  region (insertions: only strictly inside a region), and are otherwise **reverted** by apifix
+  before the other checks (`reverted` per reply and file entry; report "apifix reverted:
   file:line (...)" with the written file's line); *code* hunks are kept near a region or when
   they use (either side) an *openai-bound* name or a name a near code hunk binds or introduces
   (used on its candidate side, never in the original) in the same scope, and are otherwise a
@@ -621,6 +639,15 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   a pure comment insertion right above a finding's statement is reverted (insertions get no
   proximity). Whole-file mode only (not agent mode or
   `apifix verify`: see docs/plans/unrelated-edits-and-config.md, "Later").
+- Docstrings (first statement of the module, a class or a function): their tokens (the string,
+  its NEWLINE and the INDENT on its first line) are set aside when a hunk is judged text-only,
+  so a hunk that only adds, removes or changes a docstring is text wherever the diff splits it
+  (a hunk of its own, a piece of a docstring the diff cut in two, next to a comment edit), and
+  is reverted (also near a finding: its strings changed) with "apifix reverted: ..."; the
+  excerpt skips a line holding only quotes. A docstring in the same hunk as a code change is
+  judged with that code, and code-hunk messages show the first line that is not docstring text.
+  A string statement after the first statement is code. A docstring whose lines also appear as
+  code nearby can be aligned by the diff so that a piece holds real code: that piece is code.
 - Config checks (`Migration.rewrite_checker`, openai-v1 `config_checks.py`; check `config`, run
   last, non-test Python files only), built once per job from the original repo (non-test files
   with findings). A, dropped: each original assignment to `openai.api_key` / `organization` /
@@ -632,6 +659,14 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   call the original did not have must pass every keyword the repo's configured values need
   (any value) or `**kwargs`. Two deliberately different clients fail B. Constructors reached
   through a shim (`OpenAI = _OpenAI`) or a factory in another module are not seen.
+- Streaming check (`Migration.rewrite_checker`, openai-v1 `python_checks.stream_check_errors`;
+  check `streaming`, run last with `config`, every Python file): each key check on a stream
+  delta in the rewrite (the scanner's shapes above) is an error, "line N: in 1.x a stream
+  delta's content always exists and is None on role and final chunks, so `<check>` must become
+  `if <delta>.content is not None:` (or `<delta>.content or ""`)". Exempt: the same check text
+  already in an original without an openai import (another SDK's stream; the scanner reports
+  none there). `if delta.content:` passes (it skips "" too). Whole-file mode only; agent mode
+  and `apifix verify` rely on the verifier's completeness check (the scanner finding).
 - Undefined names (`code_checks.py`, Python files): pyflakes `UndefinedName` messages only, and
   only names the original did not already use undefined (star imports and builtins never
   count). Before the checks, apifix adds the import itself for each such name with exactly

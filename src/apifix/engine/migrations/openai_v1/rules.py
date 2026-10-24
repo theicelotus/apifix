@@ -215,6 +215,17 @@ STREAM_ACCESS = (
     "1.x stream chunks are typed objects: use chunk.choices[0].delta.content "
     "(delta.content may be None)"
 )
+# Appended to an api_call finding whose call passes stream= (anything but False / None).
+STREAM_CALL = (
+    "; it streams: each chunk's choices[0].delta.content always exists in 1.x and is None on "
+    "role and final chunks"
+)
+# `hasattr(delta, "content")` / `"content" in delta` on a streamed chunk's delta, 0.x code
+# (scanner) and rewrites (rewrite check `streaming`); {check} and {delta} are the code's own.
+STREAM_CONTENT_CHECK = (
+    "in 1.x a stream delta's content always exists and is None on role and final chunks, so "
+    '`{check}` must become `if {delta}.content is not None:` (or `{delta}.content or ""`)'
+)
 DICT_METHODS = {"get", "keys", "values", "items", "to_dict", "to_dict_recursive"}
 JSON_DUMP = "Responses are not JSON-serialisable as-is: use resp.model_dump_json() / model_dump()"
 
@@ -249,6 +260,9 @@ COMPANION_PINS: dict[str, CompanionPin] = {
 # any) and whose old_pattern or suggestion contains one of `keywords` (empty: no condition).
 GUIDE_ALWAYS = frozenset({"client"})
 GUIDE_FOR_TEST_FILES = frozenset({"tests"})  # when a finding is in a test file
+# Sent with the request for a file whose own findings select them, never in a whole-file
+# job's shared system prompt (agent mode has the full guide).
+GUIDE_PER_FILE = frozenset({"streaming"})
 GUIDE_SELECTORS: dict[str, tuple[tuple[frozenset[str], tuple[str, ...]], ...]] = {
     "client.async": ((frozenset(), ("AsyncOpenAI", "await ", "aiosession")),),
     "client.azure": ((frozenset(), ("Azure", "azure", "deployment_id")),),
@@ -263,7 +277,8 @@ GUIDE_SELECTORS: dict[str, tuple[tuple[frozenset[str], tuple[str, ...]], ...]] =
         (frozenset({"api_call", "import"}), tuple(f"{name}." for name in REMOVED_RESOURCES)),
     ),
     "responses": ((frozenset({"api_call", "response_access"}), ()),),
-    "responses.streaming": ((frozenset({"api_call", "response_access"}), ("stream", "delta")),),
+    # a file that streams: a call with stream=, chunk access, a key check on a delta
+    "streaming": ((frozenset({"api_call", "response_access"}), ("stream", "delta")),),
     "errors": (
         (frozenset({"error_class"}), ()),
         (frozenset({"import"}), tuple(ERROR_CLASSES)),
@@ -295,10 +310,12 @@ V1_MODULE_RESOURCES = frozenset(
     {"chat", "completions", "embeddings", "images", "moderations", "audio", "fine_tuning"}
 )
 
-# Object-shaped example responses for mocks, by the 1.x call they stand in for.
+# Object-shaped example responses for mocks, by the 1.x call they stand in for. The chat
+# message has its role: replies that copy the example otherwise drop a mock's "assistant".
 MOCK_RESPONSES: dict[str, str] = {
     "chat.completions.create": (
-        'SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="hello"))])'
+        "SimpleNamespace(choices=[SimpleNamespace("
+        'message=SimpleNamespace(role="assistant", content="hello"))])'
     ),
     "completions.create": 'SimpleNamespace(choices=[SimpleNamespace(text="hello")])',
     "embeddings.create": "SimpleNamespace(data=[SimpleNamespace(embedding=[0.1, 0.2])])",

@@ -8,9 +8,11 @@ come from ``openai`` are reported. Limitations are listed in CLAUDE.md.
 from __future__ import annotations
 
 import ast
+from collections import Counter
 from dataclasses import dataclass
 
 from apifix.engine.migrations.openai_v1 import rules
+from apifix.engine.migrations.openai_v1.streaming import content_checks
 from apifix.engine.models import CERTAIN, LIKELY, Category, Confidence, Finding
 from apifix.engine.project import is_test_file
 
@@ -36,7 +38,35 @@ def check_python(
     aliases = _collect_aliases(tree)
     visitor = _Visitor(file, source, aliases, _targets_azure(tree, aliases), repo_modules)
     visitor.visit(tree)
+    if aliases:  # key checks on a stream delta: only in files that use openai
+        for c in content_checks(tree, source):
+            message = rules.STREAM_CONTENT_CHECK.format(check=c.check, delta=c.delta)
+            visitor._report(c.node, "response_access", message, LIKELY)
     return visitor.findings
+
+
+def stream_check_errors(path: str, original: str, candidate: str) -> list[str]:
+    """The `streaming` rewrite check: each key check on a stream delta in the rewritten file
+    (`hasattr(delta, "content")`, `"content" in delta`; streaming.content_checks), except those
+    the original has too in a file that does not use openai (the scanner reports none there, e.g.
+    another SDK's stream). Lines are the candidate's."""
+    if not path.endswith(".py"):
+        return []
+    try:
+        old, new = ast.parse(original), ast.parse(candidate)
+    except SyntaxError:
+        return []
+    kept: Counter[str] = Counter()
+    if not _collect_aliases(old):
+        kept.update(c.check for c in content_checks(old, original))
+    errors = []
+    for c in content_checks(new, candidate):
+        if kept[c.check] > 0:
+            kept[c.check] -= 1
+            continue
+        message = rules.STREAM_CONTENT_CHECK.format(check=c.check, delta=c.delta)
+        errors.append(f"line {c.line}: {message}")
+    return errors
 
 
 def v1_api_uses(tree: ast.Module) -> list[tuple[int, str]]:
@@ -234,6 +264,7 @@ class _Visitor(ast.NodeVisitor):
         self.findings: list[Finding] = []
         # One dict per function/class scope: name -> True if it holds a stream, else False.
         self.scopes: list[dict[str, bool]] = [{}]
+        self.streaming_calls: set[int] = set()  # ids of the func of resource calls with stream=
 
     # reporting
 
@@ -301,6 +332,8 @@ class _Visitor(ast.NodeVisitor):
             attr = canonical.split(".", 1)[1]
             if attr in ("api_key", "organization") and not self.azure:  # a read
                 rule = _Rule(rule.category, rules.CONFIG_READ.format(attr=attr), rule.confidence)
+            if id(node) in self.streaming_calls:
+                rule = _Rule(rule.category, rule.suggestion + rules.STREAM_CALL, rule.confidence)
             self._report_rule(node, rule)
             return  # the rest of the chain is part of this finding
         self.generic_visit(node)
@@ -374,6 +407,15 @@ class _Visitor(ast.NodeVisitor):
         return None
 
     @staticmethod
+    def _may_stream(call: ast.Call) -> bool:
+        """`stream=` with anything but False / None (`stream=stream` may stream)."""
+        return any(
+            kw.arg == "stream"
+            and not (isinstance(kw.value, ast.Constant) and kw.value.value in (False, None))
+            for kw in call.keywords
+        )
+
+    @staticmethod
     def _is_stream(call: ast.Call) -> bool:
         return any(
             kw.arg == "stream" and isinstance(kw.value, ast.Constant) and kw.value.value is True
@@ -391,6 +433,8 @@ class _Visitor(ast.NodeVisitor):
     def visit_Call(self, node: ast.Call) -> None:
         call = self._resource_call(node)
         if call is not None:
+            if self._may_stream(call):
+                self.streaming_calls.add(id(call.func))
             for kw in call.keywords:
                 if kw.arg in rules.KWARG_CHANGES:
                     self._report(kw, "api_call", rules.KWARG_CHANGES[kw.arg], CERTAIN)

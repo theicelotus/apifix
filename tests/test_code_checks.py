@@ -136,7 +136,8 @@ WF_FIX = (
     '    @mock.patch("app.openai.OpenAI")\n'
     "    def test_ask(OpenAI):\n"
     "        OpenAI.return_value.chat.completions.create.return_value = SimpleNamespace(\n"
-    '            choices=[SimpleNamespace(message=SimpleNamespace(content="hello"))]\n'
+    '            choices=[SimpleNamespace(message=SimpleNamespace(role="assistant", '
+    'content="hello"))]\n'
     "        )"
 )
 LIVE_TARGET_WF = (
@@ -801,7 +802,8 @@ def test_run3_test_file_gets_the_object_shaped_example():
         '    @mock.patch("app.OpenAI")\n'
         "    def test_ask(OpenAI):\n"
         "        OpenAI.return_value.chat.completions.create.return_value = SimpleNamespace(\n"
-        '            choices=[SimpleNamespace(message=SimpleNamespace(content="hello"))]\n'
+        '            choices=[SimpleNamespace(message=SimpleNamespace(role="assistant", '
+        'content="hello"))]\n'
         "        )"
     )
     assert _wf_problems(RUN3_TESTS_2, RUN3_APP) == []  # the target was right in the end
@@ -1205,7 +1207,8 @@ INDIRECT_EXAMPLE = (
     '    @patch("notebook.generate.OpenAI")\n'
     "    def test_assist_adds_the_reply_to_the_context(OpenAI):\n"
     "        OpenAI.return_value.chat.completions.create.return_value = SimpleNamespace(\n"
-    '            choices=[SimpleNamespace(message=SimpleNamespace(content="hello"))]\n'
+    '            choices=[SimpleNamespace(message=SimpleNamespace(role="assistant", '
+    'content="hello"))]\n'
     "        )"
 )
 
@@ -1357,7 +1360,8 @@ def test_a_mocker_patch_gets_a_mocker_example():
     assert problem.endswith(
         'For example:\n    OpenAI = mocker.patch("notebook.generate.OpenAI")\n'
         "    OpenAI.return_value.chat.completions.create.return_value = SimpleNamespace(\n"
-        '        choices=[SimpleNamespace(message=SimpleNamespace(content="hello"))]\n'
+        '        choices=[SimpleNamespace(message=SimpleNamespace(role="assistant", '
+        'content="hello"))]\n'
         "    )"
     )
 

@@ -119,7 +119,7 @@ def test_job_guide_for_the_live_run():
         (_finding("client_config", "openai.api_type", "use openai.AzureOpenAI"), "client.azure"),
         (_finding("client_config", "openai.api_key"), "client.kwargs"),
         (_finding("api_call", "request_timeout=30"), "client.kwargs"),
-        (_finding("response_access", 'chunk["choices"][0]["delta"]'), "responses.streaming"),
+        (_finding("response_access", 'chunk["choices"][0]["delta"]'), "streaming"),
         (_finding("dependency", "openai==0.28.1"), "dependencies"),
         (_finding("api_call", file="tests/test_app.py"), "tests"),
     ],
@@ -213,9 +213,9 @@ def test_guide_advice_on_keys_and_mock_data():
     tests = guide.split("## Tests")[1]
     assert "Mock responses must be objects, not dicts" in tests
     assert (
-        "return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))])"
-        in tests
-    )
+        '    message = SimpleNamespace(role="assistant", content=text)\n'
+        "    return SimpleNamespace(choices=[SimpleNamespace(message=message)])"
+    ) in tests
 
 
 def test_tests_part_for_a_test_file_recognised_by_content(tmp_path):

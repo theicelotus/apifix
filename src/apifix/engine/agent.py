@@ -1491,9 +1491,10 @@ class _Job:
             sent.append(retry)
 
     def _extra_guide(self, path: str) -> str:
-        """Guide parts a file's request needs that the job's system prompt left out (a
-        dependency file apifix set, resent after a verification implicated it). None once a
-        token limit is known: the request's own system prompt then has the file's parts."""
+        """Guide parts a file's request needs that the job's system prompt left out (per-file
+        parts such as streaming; a dependency file apifix set, resent after a verification
+        implicated it). None once a token limit is known: the request's own system prompt then
+        has the file's parts."""
         if self.guide_sections is None or self._limit() is not None:
             return ""
         own = [f for f in self.findings if f.file == path]
@@ -1570,7 +1571,9 @@ class _Job:
             if not self.wf_files and not self.wf_pinned:
                 return "aborted", "no_files: no affected file can be sent (see skipped files)"
             sent = [f for f in self.findings if f.file in self.wf_files]
-            self.wf_guide, self.guide_sections = self.migration.job_guide(sent, self.repo)
+            self.wf_guide, self.guide_sections = self.migration.job_guide(
+                sent, self.repo, shared=True
+            )
             self.system = whole_file_system_prompt(self.migration, self.wf_guide, self._pins_note())
         if self._needs_llm(first=True):
             problem = self._preflight()

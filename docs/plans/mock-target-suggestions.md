@@ -180,3 +180,78 @@ As planned, with these differences:
 - Fixture `tests/fixtures/indirect_reach/`; the suggested target also passes the fixture's
   tests under an openai stub, and the wrong one fails them (`does not have the attribute
   'OpenAI'`).
+
+## Amendments
+
+Requested 2026-10-23, verbatim:
+
+Read CLAUDE.md and docs/plans/mock-target-suggestions.md (its findings section lists the issues below). Build these, recording this request verbatim in that plan’s Amendments section:
+
+Mock example: add role="assistant" to the chat example in MOCK_RESPONSES (and anywhere else an example response is shown), so replies that copy it keep the role.
+Docstrings: a hunk that only adds, removes or changes a docstring is text, so it is reverted like comments (and reported as “apifix reverted”), never rejected as unrelated code, wherever the diff splits it. Replay genai-gptoss-2 attempt 1: generate.py should then be accepted, with the deltas() docstring reverted.
+Streaming in 1.x: add a guide part for streaming (stream=True): in 1.x, chunk.choices[0].delta.content always exists and is None on role and final chunks, so hasattr(delta, "content") or "content" in delta checks must become if delta.content is not None: (or delta.content or ""). Add a static check in the migrated code that rejects hasattr(<x>, "content") / "content" in <x> on a streamed delta, with that message, and a scanner finding for those patterns in 0.x code. Send the guide part only when the file streams.
+
+Synthetic fixtures only. Fast suite, Docker if the network allows, and ruff, then commit.
+
+### Built (amendments)
+
+Built in the same step (no review stop was asked for).
+
+- **Mock example.** `MOCK_RESPONSES["chat.completions.create"]` is
+  `SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(role="assistant",
+  content="hello"))])`; the guide's mock examples (the Tests part: the `completion()` helper
+  in both forms and the three patch patterns) carry `role="assistant"` as well. No other
+  example responses are shown (README, failure hints).
+- **Docstrings** (`unrelated.py`). Docstring statements (the first statement of the module, a
+  class or a function) are set aside when a hunk is judged text-only: their string tokens,
+  the NEWLINE ending them and the INDENT on their first line (which moves to the next
+  statement's line when a docstring is added or removed). Marked by token position, so each
+  piece of a docstring the diff splits is set aside on its own. A hunk that only adds,
+  removes or changes a docstring is therefore text and is reverted (its strings changed, so
+  also near a finding) and reported as "apifix reverted"; a docstring sharing a hunk with a
+  code change is judged with that code. Messages: a code hunk's excerpt skips docstring lines
+  (no more `("""""`), and a revert's excerpt skips a line holding only quotes (the
+  docstring's first text line instead).
+- **Streaming.**
+  - Guide: the old `responses.streaming` sub-part became its own section `streaming`
+    ("## Streaming": delta.content always exists and is None on role and final chunks; key
+    checks become `if delta.content is not None:` or `delta.content or ""`; `chunk.choices`
+    can be empty), so it can be sent without repeating the Responses section.
+  - "Only when the file streams": `rules.GUIDE_PER_FILE = {"streaming"}`; the whole-file job's
+    shared system prompt is built with `job_guide(..., shared=True)` and never holds it, and a
+    file whose own findings select it gets it in its request (the existing "Migration guide
+    for this file:" path, `_extra_guide`; with a known token limit the per-file system prompt
+    has it). A file streams when a finding says so: an api_call finding whose call passes
+    `stream=` (anything but a False / None constant; genai passes `stream=stream`) now ends
+    with `rules.STREAM_CALL`, and stream-chunk access and key-check findings mention streams.
+    Before this, the selector never fired for genai: the call finding's pattern is the
+    attribute only (`openai.ChatCompletion.create`), without the keyword.
+  - Scanner: `streaming.content_checks` finds `hasattr(D, "content")` and `"content" [not] in
+    D` where D is a delta by shape (`<x>.choices[i].delta`, `<x>["choices"][i]["delta"]`,
+    mixed, names assigned from those, `<c>.delta` for `c` from `<x>.choices[i]` or `for c in
+    <x>.choices`; per scope, flow-insensitive); a [likely] `response_access` finding with
+    `rules.STREAM_CONTENT_CHECK`, in files with an openai import. The 1.x form counts too, so
+    a check left in a fix is a remaining finding for the verifier in every mode, and a repo
+    already on 1.x with one is not `already_migrated`.
+  - Rewrite check `streaming` (`python_checks.stream_check_errors`, every Python file): each
+    such check in the rewrite is an error, "line N: in 1.x a stream delta's content always
+    exists and is None on role and final chunks, so `hasattr(delta, "content")` must become
+    `if delta.content is not None:` (or `delta.content or ""`)", except the same check already
+    in an original without an openai import (another SDK's stream). To give it its own check
+    name, `Migration.rewrite_checker` now returns errors by check name (`config`,
+    `streaming`); `check_candidate` records each.
+- **Replay of genai-gptoss-2 attempt 1** (`genai/generate.py`, first reply):
+  - With the docstring change alone (run's findings, `config` check only): accepted. The
+    `deltas()` docstring is reverted (`added` after original line 42, "Yield streamed delta
+    contents from a streaming completion."); the `content()` docstring stays, since it shares
+    its hunk with the changed `return`, which is related.
+  - With everything (fresh scan, which adds the finding on line 45 `"content" in delta`):
+    rejected by the new `streaming` check, twice: the reply kept the dict branch's `"content"
+    in delta` and added `hasattr(delta_obj, "content")` for objects. So this reply is still not
+    accepted, now for a real bug instead of the docstring. Attempt 2's accepted version
+    (`if hasattr(delta, "content"): yield delta.content`, the trailing-None bug in the
+    findings above) would be rejected by the same check.
+- Fixture `tests/fixtures/stream_deltas/` (synthetic): dict-typed `content()` / `deltas()`
+  helpers and a `stream=stream` call as in genai, a call without stream=, and another SDK's
+  relay with the same key check and no openai import. Tests in `tests/test_streaming.py`
+  and `tests/test_unrelated.py` (docstrings, including a docstring the diff splits in two).

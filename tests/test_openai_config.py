@@ -46,7 +46,7 @@ def make(tmp_path: Path, files: dict[str, str]):
     assert checker is not None
 
     def check(path: str, candidate: str) -> list[str]:
-        return checker(path, (root / path).read_text(), textwrap.dedent(candidate))
+        return checker(path, (root / path).read_text(), textwrap.dedent(candidate))["config"]
 
     return check
 

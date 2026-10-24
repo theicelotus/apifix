@@ -20,7 +20,8 @@ _ASSIGNED = re.compile(r"\.(api_key|organization|api_base)\s*=")
 _CALL = re.compile(
     r"^(?P<prefix>String reference \(e\.g\. a mock\.patch target\)[^:]*: )?Use "
     r"(?P<await>await )?client\.(?P<path>[\w.]+)\(\.\.\.\) with client = openai\."
-    r"(?:Async)?OpenAI\(\); the response is a typed object, not a dict$"
+    r"(?:Async)?OpenAI\(\); the response is a typed object, not a dict"
+    rf"(?P<stream>{re.escape(rules.STREAM_CALL)})?$"
 )
 _NEW_NAME = {"api_key": "api_key", "organization": "organization", "api_base": "base_url"}
 
@@ -62,7 +63,7 @@ def adjust_findings(findings: list[Finding], root: Path | None = None) -> list[F
                 text = rules.MODULE_CLIENT_ASYNC.format(path=m["path"], kwargs=kwargs)
             else:
                 text = rules.MODULE_CLIENT_CALL.format(path=m["path"], attrs=reads, where=where)
-            f = replace(f, suggestion=text)
+            f = replace(f, suggestion=text + (m["stream"] or ""))
         elif f in kept and f.file not in call_files and call_files:
             keep = (
                 "keep the value set here (as openai.base_url)"
