@@ -28,6 +28,11 @@ from apifix.engine.dependencies import dependency_file_problem, is_dependency_fi
 from apifix.engine.migrations import Migration
 from apifix.engine.models import CERTAIN, Finding
 from apifix.engine.project import is_test_file
+from apifix.engine.regions import (
+    fenced_blocks,
+    placeholder_problem,
+    too_short,
+)
 from apifix.engine.unrelated import Revert, relocate, revert_text_edits, unrelated_edits
 from apifix.engine.verifier import Verification, feedback_lines
 
@@ -42,7 +47,6 @@ FEEDBACK_PIP_CHARS = 1_500  # dependency files: the tail of pip's output when th
 # the original, at most this long, with this many lines of context.
 PREVIOUS_DIFF_CHARS = 3_000
 PREVIOUS_DIFF_CONTEXT = 1
-MIN_LINES_FOR_LENGTH_CHECK = 20
 # Reply budget (max_tokens) for rewriting a file: chars / 3 over-estimates the tokens of code,
 # which is the safe side here; see reply_budget for the margin.
 REPLY_CHARS_PER_TOKEN = 3
@@ -333,9 +337,6 @@ def error_key(error: str) -> str:
 
 # --- parsing the reply ------------------------------------------------------------------------
 
-_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
-_CLOSE = re.compile(r"^ {0,3}(`{3,}|~{3,})\s*$")
-
 
 @dataclass(frozen=True)
 class ParsedReply:
@@ -349,31 +350,13 @@ def parse_code_block(reply: str, *, truncated: bool = False) -> ParsedReply:
     output limit is `truncated` whatever it contains."""
     if truncated:
         return ParsedReply("truncated")
-    lines = reply.splitlines()
-    blocks: list[str] = []
-    unclosed = False
-    i = 0
-    while i < len(lines):
-        m = _OPEN.match(lines[i])
-        if not m or (m.group(1)[0] == "`" and "`" in m.group(2)):
-            i += 1
-            continue
-        fence = m.group(1)
-        for j in range(i + 1, len(lines)):
-            c = _CLOSE.match(lines[j])
-            if c and c.group(1)[0] == fence[0] and len(c.group(1)) >= len(fence):
-                blocks.append("\n".join(lines[i + 1 : j]))
-                i = j + 1
-                break
-        else:
-            unclosed = True
-            break
+    blocks, unclosed = fenced_blocks(reply)
     count = len(blocks) + unclosed
     if count >= 2:
         return ParsedReply("several_blocks")
     if count == 0 or unclosed:
         return ParsedReply("no_block")
-    return ParsedReply("ok", blocks[0])
+    return ParsedReply("ok", blocks[0].body)
 
 
 def as_file(body: str, original: str) -> str:
@@ -385,13 +368,6 @@ def as_file(body: str, original: str) -> str:
 
 
 # --- checks before applying -------------------------------------------------------------------
-
-_ELISION_COMMENT = re.compile(
-    r"^#\s*[(\[]?\s*(\.\.\.|…)"
-    r"|^#.*\b(rest of (the )?\w+|remaining (code|lines|functions|methods|tests|parts?)"
-    r"|everything else|omitted|for brevity|same as (before|above|the original|original))\b",
-    re.IGNORECASE,
-)
 
 
 @dataclass(frozen=True)
@@ -406,17 +382,6 @@ class CheckResult:
     @property
     def ok(self) -> bool:
         return not self.errors
-
-
-def _placeholder(candidate: str, original: str) -> str | None:
-    known = {line.strip() for line in original.splitlines()}
-    for n, line in enumerate(candidate.splitlines(), 1):
-        s = line.strip()
-        if s in known:
-            continue
-        if s in ("...", "…") or _ELISION_COMMENT.search(s):
-            return f"line {n} is a placeholder instead of code ({s!r})"
-    return None
 
 
 def check_candidate(
@@ -501,14 +466,8 @@ def check_candidate(
         required,
     )
 
-    abbreviated = _placeholder(candidate, original)
-    old_lines, new_lines = len(original.splitlines()), len(candidate.splitlines())
-    if not abbreviated and old_lines >= MIN_LINES_FOR_LENGTH_CHECK and new_lines * 2 < old_lines:
-        abbreviated = (
-            f"it has {new_lines} lines, fewer than half of the original's {old_lines}; return "
-            "every line of the file"
-        )
-    elif abbreviated:
+    abbreviated = placeholder_problem(candidate, original) or too_short(candidate, original)
+    if abbreviated:
         abbreviated += "; return every line of the file"
     record("abbreviation", abbreviated)
 

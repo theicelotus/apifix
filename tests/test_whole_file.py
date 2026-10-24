@@ -9,9 +9,9 @@ import pytest
 from apifix.engine.code_checks import STDLIB_IMPORTS, import_table
 from apifix.engine.migrations import get_migration
 from apifix.engine.models import Finding
+from apifix.engine.regions import MIN_LINES_FOR_LENGTH_CHECK
 from apifix.engine.verifier import feedback_lines
 from apifix.engine.whole_file import (
-    MIN_LINES_FOR_LENGTH_CHECK,
     PREVIOUS_DIFF_CHARS,
     REPLY_MARGIN_TOKENS,
     as_file,
