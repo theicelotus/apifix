@@ -83,7 +83,8 @@ src/apifix/
     local_paths.py    home dir -> ~ and pytest-of-<user> -> pytest-of-USER in written outputs
                       (report, verification, trajectory; never fix.diff)
     imports.py        third-party imports no dependency file declares ("imported but not
-                      declared"), read before the first sandbox run; report section only
+                      declared"), read before the first sandbox run; report section only;
+                      top-level names a test run can import (mock targets on unknown modules)
     test_results.py   JUnit / unittest output -> counts + per-test outcomes (+ the module of
                       a "No module named" error, read before messages are clipped)
     diffing.py        original vs fixed tree: changed files, changed lines and hunks
@@ -132,7 +133,9 @@ src/apifix/
                       each with the target that fits how it binds the library; a client class
                       patched with autospec=True whose instance's resources the test uses;
                       a patched resource method (`openai.resources...create`) in a test that
-                      sets no key while the code under test builds a client without api_key=
+                      sets no key while the code under test builds a client without api_key=;
+                      targets on a module that does not exist (`app.OpenAI`); call assertions
+                      a test did not make before
 benchmark/            real repos + scoring
 docs/plans/           approved plans, one file per step (request, plan, amendments)
 tests/                pytest; fixtures/ holds realistic sample code
@@ -656,13 +659,19 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   problem, at most 3 ("the test's mock client is incomplete: SimpleNamespace has no create;
   build the client mock with MagicMock() ..."); spec'd mocks (`Mock object has no attribute`)
   keep the autospec hint only. A mock that was never called (`Called 0 times`, `Actual: not
-  called`: `verifier.UNCALLED_MOCK_MARKERS`) adds `Migration.uncalled_mock_hint` once, when a
-  non-test module of the working copy builds a client without a key in a function
-  (`code_checks.keyless_client`, the first in walk order; computed once per verification) and
-  the repo's CI does not set the key: the missing key, errors the code's own try/except may
-  swallow, both fixes with the module's client class target. Agent mode's feedback after a
-  failed verification gets the same hints. Dependency files get
-  the problem list without test output, plus the tail of pip's output when the install failed.
+  called`: `verifier.UNCALLED_MOCK_MARKERS`): tests among them that patch a client class
+  (`code_checks.patches_client_class`: a string target whose last name is one of
+  `client_classes`, applying to that test, in the working copy) add
+  `Migration.uncalled_patched_hint` naming them (at most 3): no real client is built, so the
+  code did not reach the call; a call assertion the original did not make is the usual cause
+  (genai-gptoss20b-3). When any such test does not patch one (or no test message has the
+  marker), `Migration.uncalled_mock_hint` once, when a non-test module of the working copy
+  builds a client without a key in a function (`code_checks.keyless_client`, the first in
+  walk order; computed once per verification) and the repo's CI does not set the key: the
+  missing key, errors the code's own try/except may swallow, both fixes with the module's
+  client class target. Agent mode's feedback after a failed verification gets the same hints.
+  Dependency files get the problem list without test output, plus the tail of pip's output
+  when the install failed.
 - The file plus its read-only context (the other files already changed in the working copy)
   share one byte budget, `whole_file_max_bytes` (24,000 by default, `--max-file-bytes`). Python
   files over it are sent as regions when every region fits (see Known limitations (region
@@ -809,6 +818,29 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   that do not parse or have a star import or module `__getattr__`, aliased patch functions
   (`from unittest.mock import patch as p`), `target=` keywords, and attributes deeper than
   the first name (`app.client.missing_attr` passes if `client` exists).
+- Unknown modules (genai-gptoss20b-3 patched `app.OpenAI`, the guide's old sample module): a new
+  target whose first name is no repo module (under the test's module roots, or any `.py` stem
+  or directory holding Python files: `walk.repo_module_names`) and nothing the test run can
+  import (`imports.ImportableModules`, built once per job from the original before the
+  baseline: stdlib and builtin modules, `ALWAYS_INSTALLED`, the migration's `api_modules` and
+  `companion_modules`, first names of every import in the repo's Python files, declared
+  distributions by `distribution_candidates` as for "imported but not declared", and the
+  --sandbox-requirements lines) is rejected ("patch() fails with ModuleNotFoundError"), with
+  the modules that use the library and their targets as for a patched module with no library
+  use. Known false positive: a package installed only as another one's dependency that the
+  repo never imports (genai: `requests`, via tiktoken). Whole-file mode only.
+- Added call assertions (`code_checks.added_call_assertions`, check `call_assertions`, test
+  files): per test the original has (top-level `test*` functions, `test*` methods of top-level
+  classes), its call assertions in source order, unittest.mock's `assert_called*`,
+  `assert_any_call`, `assert_has_calls`, `assert_awaited*`, `assert_any_await`,
+  `assert_has_awaits` method calls and `assert` statements on `.called` / `.call_count` /
+  `.awaited` / `.await_count`, are aligned with the candidate's by kind (difflib); only a test
+  with more than before is reported, with the first added one, "(and N more)", and what the
+  original asserts on. A migrated assertion on another mock path keeps its kind and is not
+  counted; `assert create.called` -> `create.assert_called()` is a replacement. Not counted:
+  `call_args` reads, plain value asserts, new tests. Swapping one assertion for another kind
+  while adding one more of the first can misattribute which line is "added". Whole-file mode
+  only; agent mode gets the patched-client hint after the regression.
 - Library targets (`patch("openai.OpenAI")`, any `<library>.<path>.X` new versus the original,
   when the repo has no module of the library's name): rejected when a non-test module (the
   job's list of the repo's Python files, split by `is_test_file` on the original; text from
@@ -907,18 +939,30 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   with the same error on attempts 2, 3 and 4 (<key, 160 characters>); stopped with N
   attempt(s) left` (outcome aborted), or the best attempt's outcome with "; stopped early:
   ..." appended when an earlier attempt was verified.
-- After a failed verification every Python file is resent with the verifier's reasons and
-  failing test output (at most 10 tests, 2,000 characters each, 8,000 in total), except when
-  every `reject` reason is `regression` / `regression_error` and every newly failing or
-  erroring test failed on its own mock (`verifier.only_mock_failures`) and those tests' files
-  are among the files sent: then non-test Python files that no reason or remaining finding
-  names are kept, not resent (their line in the traceback is only where the test's mock was
-  called). Region-edited non-test files never take regions from a mock failure's traceback
-  (`feedback_lines_in(skip_tracebacks_of=...)`); the failing test's own region still comes. A dependency
-  file (accepted, or set by apifix) is resent only when a reason or remaining finding names
-  it, or the install / smoke check failed and the fixed run's install read it
-  (`dependency_sources` or a used declaration; a run that recorded none implicates all). With
-  nothing to resend, the job stops instead of verifying the same tree again.
+- After a failed verification the next attempt resends only the files the rejection
+  implicates (`agent.implicated_files`, docs/plans/genai-run-9.md), with the verifier's
+  reasons and failing test output (at most 10 tests, 2,000 characters each, 8,000 in total);
+  the others keep their accepted versions (`kept_files`). Implicated, among the files
+  whole-file mode sends: the files the failing tests live in (`failing_tests`: newly failing /
+  erroring, plus tests reject / unverified reasons name, collection errors as their module;
+  `verifier.test_files_of`); files a failing test's message points at (`path:N`, `"path",
+  line N`; not non-test files in the message of a test that failed on its own mock,
+  `verifier.mock_failure`: that line is only where the code called the mock) and files in the
+  fixed run's reason / `runner_error`; files a reject / unverified reason names (info
+  reasons such as `setup_changed` do not count); files with remaining findings; dependency
+  files whose install or smoke check failed and that the fixed run's install read
+  (`dependency_sources` or a used declaration; a run that recorded none implicates all). For a
+  failing test whose own file is not sent (no findings), and for one that also failed the
+  previous verification (`still_failing`: what was sent did not fix it), the non-test files its
+  file reaches through imports (working copy, `context.reachable_modules`): the code under
+  test, which an assertion failing in the test does not name. Nothing implicated: every Python
+  file. Recorded on the rejected attempt as `resend` (path -> why). Known cost: a regression
+  caused by a wrong value in the code under test (its traceback stays in the test) first
+  resends only the test; if the model returns it unchanged, the same tree is verified again
+  (one more sandbox run) before the code comes along. Region-edited non-test files never take
+  regions from a mock failure's traceback (`feedback_lines_in(skip_tracebacks_of=...)`); the
+  failing test's own region still comes. With nothing to resend, the job stops instead of
+  verifying the same tree again.
 - Every file entry records `prompt_parts` (characters of rules, guide, file guide, feedback,
   file, previous version, context, findings and instructions); check retries record theirs in
   the nudge. A request that aborts the job is recorded too, and the abort reason names the file.

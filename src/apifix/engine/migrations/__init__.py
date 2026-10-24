@@ -35,8 +35,12 @@ class Migration(Protocol):
     mock_failure_hint: str
     # For a mock that was never called (verifier.UNCALLED_MOCK_MARKERS) while the fixed code
     # builds a client without a key (client_key): the retry feedback's hint, with {where}
-    # ("app.py:12 builds openai.OpenAI()") and {target} (the client class to patch). "" for none.
+    # ("yourpkg/module.py:12 builds openai.OpenAI()") and {target} (the client class to
+    # patch). "" for none.
     uncalled_mock_hint: str
+    # For a mock that was never called in tests that patch a client class (no real client is
+    # built, so the key is not the cause): the retry feedback's hint, with {tests}. "" for none.
+    uncalled_patched_hint: str
     # name -> the import that defines it, for names the library's 1.x code uses (apifix adds
     # a missing one when it is the only import known for the name).
     known_imports: Mapping[str, str]

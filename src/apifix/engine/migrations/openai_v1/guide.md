@@ -167,8 +167,11 @@ openai.APIConnectionError(request=request)
 ## Tests
 
 Update mocks to the new call path and keep every assertion as it is. Patch what the code under
-test calls, never the function or class the test exercises: after `from app import ask`,
-`patch("app.ask")` leaves the test's `ask` untouched, so the real one runs.
+test calls, never the function or class the test exercises: after `from yourpkg.module
+import ask`, `patch("yourpkg.module.ask")` leaves the test's `ask` untouched, so the real one
+runs. `yourpkg.module` in these examples is a placeholder: write the dotted path the tests
+import the code under test by (`patch("yourpkg.module.OpenAI")` fails with
+`ModuleNotFoundError`).
 
 Mock responses must be objects, not dicts: 1.x code reads `resp.choices[0].message.content`,
 which fails on a dict. Helpers that build dict responses must return objects:
@@ -203,24 +206,24 @@ def test_answer(create):
 
 # 1.x, client created inside the function (def answer(): client = openai.OpenAI() ...)
 # (no autospec=True on a client class: an autospecced client has no chat.completions)
-@mock.patch("app.openai.OpenAI")
+@mock.patch("yourpkg.module.openai.OpenAI")
 def test_answer(OpenAI):
     OpenAI.return_value.chat.completions.create.return_value = SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(role="assistant", content="hi"))]
     )
 
 
-# 1.x, module-level client (client = openai.OpenAI() at the top of app.py; the module must
-# import without a key)
-@mock.patch("app.client.chat.completions.create")
+# 1.x, module-level client (client = openai.OpenAI() at the top of yourpkg/module.py; the
+# module must import without a key)
+@mock.patch("yourpkg.module.client.chat.completions.create")
 def test_answer(create):
     create.return_value = SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(role="assistant", content="hi"))]
     )
 
 
-# 1.x, lazily built client (def get_client() in app.py)
-@mock.patch("app.get_client")
+# 1.x, lazily built client (def get_client() in yourpkg/module.py)
+@mock.patch("yourpkg.module.get_client")
 def test_answer(get_client):
     get_client.return_value.chat.completions.create.return_value = SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(role="assistant", content="hi"))]
@@ -243,18 +246,21 @@ def test_answer(create):
 # (pytest: monkeypatch.setenv("OPENAI_API_KEY", "test") in the test or a fixture)
 ```
 
-- When the module does `from openai import OpenAI`, patch `app.OpenAI` instead of
-  `app.openai.OpenAI`.
-- Drop `autospec=True` when patching a client class (`patch("app.OpenAI", autospec=True)`): an
-  autospecced 1.x client has no `chat.completions` (resources are cached properties), so
-  `OpenAI.return_value.chat.completions.create` fails. Patch the class without autospec. If
-  you patch the method instead (`...Completions.create`), the real client is still built, so
-  set `OPENAI_API_KEY` in the test as above; with `autospec=True` the method's mock also
-  receives the resource object as its first argument (`call_args.args[0]`), so assertions
-  such as `args == ()` fail.
+- When the module does `from openai import OpenAI`, patch `yourpkg.module.OpenAI` instead of
+  `yourpkg.module.openai.OpenAI`.
+- Drop `autospec=True` when patching a client class (`patch("yourpkg.module.OpenAI",
+  autospec=True)`): an autospecced 1.x client has no `chat.completions` (resources are cached
+  properties), so `OpenAI.return_value.chat.completions.create` fails. Patch the class
+  without autospec. If you patch the method instead (`...Completions.create`), the real
+  client is still built, so set `OPENAI_API_KEY` in the test as above; with `autospec=True`
+  the method's mock also receives the resource object as its first argument
+  (`call_args.args[0]`), so assertions such as `args == ()` fail.
 - Mock return values must support attribute access now that the code uses it; keep the same
   values. `SimpleNamespace` (`from types import SimpleNamespace`) or the real types
   (`openai.types.chat.ChatCompletion`) both work.
+- Keep each test's assertions: migrate the ones it has and add none. A new
+  `create.assert_called_once()` in a test that never reached `create` before (its code raises
+  or returns first) fails.
 - Exception classes in `pytest.raises` / `except` follow the error table; do not replace a
   specific class with a broader one (`Exception`, `openai.APIError`, `openai.OpenAIError`).
 

@@ -72,6 +72,58 @@ def undeclared_imports(
     ]
 
 
+@dataclass(frozen=True)
+class ImportableModules:
+    """Top-level module names a test run in the sandbox can import, besides repo modules: the
+    standard library, ALWAYS_INSTALLED, `extra` (the migrated library and its companions),
+    names any of the repo's Python files imports (they may come in as another package's
+    dependency), and declared distributions (by distribution_candidates). Called with a name.
+    For mock targets: a first name that is none of these and no repo module is a placeholder
+    copied from an example (`app.OpenAI`), and patch() fails with ModuleNotFoundError."""
+
+    local: frozenset[str]
+    declared: frozenset[str]
+    imported: frozenset[str]
+    extra: frozenset[str] = frozenset()
+
+    def __call__(self, name: str) -> bool:
+        return (
+            name in sys.stdlib_module_names
+            or name in sys.builtin_module_names
+            or name in ("__future__", "__main__")
+            or name in self.local
+            or name in ALWAYS_INSTALLED
+            or name in self.extra
+            or name in self.imported
+            or _is_declared(name, set(self.declared))
+        )
+
+
+def importable_modules(
+    root: Path, override: SandboxRequirements | None = None, extra: frozenset[str] = frozenset()
+) -> ImportableModules:
+    """ImportableModules of the repo at `root` (read from the original, once per job)."""
+    imported: set[str] = set()
+    for path in iter_files(root):
+        if path.suffix != ".py":
+            continue
+        try:
+            tree = ast.parse(path.read_bytes())
+        except (SyntaxError, ValueError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                imported.add(node.module.split(".")[0])
+    return ImportableModules(
+        frozenset(repo_module_names(root)),
+        frozenset(declared_names(root, override)),
+        frozenset(imported),
+        frozenset(extra),
+    )
+
+
 def required_imports(tree: ast.Module) -> set[str]:
     """First names of the absolute imports in `tree`, except optional ones (inside a `try`
     whose handlers catch ImportError, ModuleNotFoundError, Exception or everything) and those

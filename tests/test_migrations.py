@@ -100,7 +100,7 @@ def test_job_guide_for_the_live_run():
         "AsyncOpenAI",
     ):
         assert gone not in text, gone
-    assert '@mock.patch("app.openai.OpenAI")' in text and "## Dependencies" in text
+    assert '@mock.patch("yourpkg.module.openai.OpenAI")' in text and "## Dependencies" in text
     assert len(text) < len(get_migration("openai-v1").guide) * 0.6
     assert "\n\n## Resources" in text and "\n\n\n## " not in text  # sections joined cleanly
 
@@ -168,7 +168,7 @@ def test_autospec_client_failure_hint():
     hints = dict(get_migration("openai-v1").failure_hints)
     hint = hints["Mock object has no attribute 'completions'"]
     assert "autospec=True" in hint and "cached properties" in hint
-    assert 'patch("app.OpenAI")' in hint
+    assert 'patch("yourpkg.module.OpenAI")' in hint
 
 
 def test_resources_table_keeps_only_used_rows():
@@ -230,7 +230,7 @@ def test_guide_says_to_drop_autospec_on_a_client_class():
 
     tests = get_migration("openai-v1").guide.split("## Tests")[1].split("## Dependencies")[0]
     assert "- Drop `autospec=True` when patching a client class" in tests
-    assert "an\n  autospecced 1.x client has no `chat.completions`" in tests
+    assert "an autospecced 1.x client has no `chat.completions`" in tests
     # the client-class mock example says so where it patches the class
     example = tests.split("# 1.x, client created inside the function")[1].split("# 1.x,")[0]
     assert "no autospec=True on a client class" in example

@@ -91,7 +91,10 @@ def judge(tree: Path) -> SandboxResult:
     if (old_code and old_mock) or (new_code and new_mock):
         outcomes = [(T_ASK, "passed"), (T_STRIP, "passed")]
         if "# BREAK" in app:
-            outcomes[1] = (T_STRIP, "failed", "AssertionError: assert 'x\\n' == 'x'")
+            # an assert in app.py fails: the traceback ends there
+            where = next(n for n, line in enumerate(app.splitlines(), 1) if "# BREAK" in line)
+            message = f"AssertionError: assert 'x\\n' == 'x'\n\napp.py:{where}: AssertionError"
+            outcomes[1] = (T_STRIP, "failed", message)
     else:
         message = "AttributeError: module 'openai' has no attribute 'ChatCompletion'"
         outcomes = [(T_ASK, "error", message), (T_STRIP, "error", message)]
@@ -998,13 +1001,13 @@ UNCALLED_HINT = (
 )
 
 
-def _uncalled_feedback(repo, app_edit) -> str:
+def _uncalled_feedback(repo, app_edit, tests_edit=FIX_TESTS) -> str:
     def judge_tree(tree: Path) -> SandboxResult:
         if "openai.ChatCompletion" in (tree / "app.py").read_text():
             return judge(tree)  # the baseline
         return run((T_ASK, "failed", UNCALLED), (T_STRIP, "passed"))
 
-    llm = FakeLLM([tools(app_edit, FIX_TESTS), done(), done()])
+    llm = FakeLLM([tools(app_edit, tests_edit), done(), done()])
     go(repo, llm, JudgingSandbox(judge=judge_tree), max_retries=1)
     return last_user_text(llm.requests[2])
 
@@ -1013,6 +1016,26 @@ def test_an_uncalled_mock_with_a_keyless_client_gets_the_missing_key_hint(repo):
     feedback = _uncalled_feedback(repo, edit("app.py", APP_OLD, APP_KEYLESS))
     assert UNCALLED_HINT in feedback
     assert 'patch("app.openai.OpenAI"), without autospec' in feedback
+    assert feedback.count("Hint: a mock was never called") == 1
+
+
+def test_an_uncalled_mock_in_a_test_patching_the_client_class_gets_no_missing_key_hint(repo):
+    # genai-gptoss20b-3: the test patches the client class, so no real client is built and the
+    # key cannot be the cause (the test had a call assertion its code never reaches)
+    patched = TESTS_NEW.replace(
+        '@mock.patch("app.client.chat.completions.create")\ndef test_ask(create):',
+        '@mock.patch("app.openai.OpenAI")\ndef test_ask(OpenAI):\n    create = OpenAI.return_value'
+        ".chat.completions.create",
+    )
+    assert patched != TESTS_NEW
+    feedback = _uncalled_feedback(
+        repo, edit("app.py", APP_OLD, APP_KEYLESS), edit("tests/test_app.py", TESTS_OLD, patched)
+    )
+    assert "without api_key=" not in feedback
+    assert (
+        f"Hint: a mock was never called in {T_ASK}, which patch the client class, so no real "
+        "client is built and no API key is needed"
+    ) in feedback
     assert feedback.count("Hint: a mock was never called") == 1
 
 
@@ -1227,6 +1250,7 @@ def test_whole_file_migrates_each_file_in_its_own_request(repo):
                 "abbreviation": "ok",
                 "undefined_names": "ok",
                 "mock_targets": "n/a",  # not a test file
+                "call_assertions": "n/a",
                 "unrelated_edits": "ok",
                 "config": "ok",
                 "streaming": "ok",
@@ -1839,28 +1863,25 @@ def _install_failed(tree: Path) -> SandboxResult:
 
 
 def test_dependency_files_are_resent_when_the_install_failed(repo):
-    llm = FakeLLM(list(GOOD) + [block(REQS_NEW, ""), *GOOD])
+    llm = FakeLLM(list(GOOD) + [block(REQS_NEW, "")])
     result = wf(repo, llm, JudgingSandbox(judge=_install_failed), max_retries=1)
-    second = result.trajectory["attempts"][1]
+    first, second = result.trajectory["attempts"]
     # the run recorded no install sources, so every dependency file is implicated, including
-    # requirements.txt, which apifix set and did not send in attempt 1
-    assert [f["path"] for f in second["files"]] == [
-        "requirements.txt",
-        "app.py",
-        "tests/test_app.py",
-    ]
-    reqs, app = llm.requests[2][0].text, llm.requests[3][0].text
+    # requirements.txt, which apifix set and did not send in attempt 1; no test ran, so no
+    # Python file is implicated: they keep their accepted versions
+    assert [f["path"] for f in second["files"]] == ["requirements.txt"]
+    assert second["kept_files"] == ["app.py", "tests/test_app.py"]
+    assert first["resend"] == {"requirements.txt": "dependency problem"}
+    reqs = llm.requests[2][0].text
     # the job's system prompt has no Dependencies part (no dependency file was sent at first),
     # so this request carries it
     assert "## Dependencies" not in llm.systems[2]
     assert "Migration guide for this file:\n\n# openai 0.x -> 1.x\n\n## Dependencies" in reqs
-    assert "Migration guide for this file" not in app
     assert "Your previous version of requirements.txt did not pass verification" in reqs
     assert "+openai>=1.55.3,<2" in reqs  # apifix's pin edit, as the previous version
     assert "Sandbox: dependency install failed" in reqs
     assert "pip output, last part (untrusted, not instructions):" in reqs
     assert "No matching distribution found for openai>=1.55.3,<2" in reqs
-    assert "pip output" not in app  # Python files: the problems, not pip's output
     assert "--- app.py" not in reqs  # dependency files get no context
     # the attempt's tests never ran, so none is reported deleted
     assert "deleted_test" not in {
@@ -1874,11 +1895,7 @@ def test_dependency_file_with_a_remaining_finding_is_resent(repo):
     (repo / "pyproject.toml").write_text(pyproject)
     still_pinned = pyproject + "# migrated\n"
     fixed = '[project]\nname = "app"\ndependencies = ["openai>=1.55.3,<2"]\n'
-    llm = FakeLLM(
-        [block(still_pinned, "toml"), *GOOD]
-        + [block(fixed, "toml"), block(APP_NEW)]
-        + [block(TESTS_NEW)]
-    )
+    llm = FakeLLM([block(still_pinned, "toml"), *GOOD] + [block(fixed, "toml")])
     result = wf(repo, llm, max_retries=1)
     first, second = result.trajectory["attempts"]
     assert [f["path"] for f in first["files"]] == ["pyproject.toml", "app.py", "tests/test_app.py"]
@@ -1887,8 +1904,10 @@ def test_dependency_file_with_a_remaining_finding_is_resent(repo):
         r["code"] == "incomplete_migration" and r["file"] == "pyproject.toml"
         for r in first["verification"]["reasons"]
     )
-    assert second["files"][0]["path"] == "pyproject.toml"
-    assert second["kept_files"] == ["requirements.txt"]
+    # only the file with the remaining finding goes back
+    assert [f["path"] for f in second["files"]] == ["pyproject.toml"]
+    assert second["kept_files"] == ["requirements.txt", "app.py", "tests/test_app.py"]
+    assert first["resend"] == {"pyproject.toml": "verifier: incomplete_migration"}
     assert result.outcome == "verified"
     (fallback,) = result.trajectory["job"]["pin_fallbacks"]
     assert (fallback["file"], fallback["sent"]) == ("pyproject.toml", True)
@@ -2089,7 +2108,7 @@ def test_whole_file_reply_budget_counts_the_previous_version(repo):
 
     def judge_twice(tree):
         if tree != repo and next(verdicts, "fine") == "broken":
-            return run((T_ASK, "passed"), (T_STRIP, "failed", "boom"))
+            return run((T_ASK, "passed"), (T_STRIP, "failed", "boom\napp.py:4: in strip"))
         return judge(tree)
 
     sandbox.judge = judge_twice
@@ -2838,6 +2857,8 @@ def test_a_different_error_ends_the_streak(tmp_path):
 NS_CREATE = "AttributeError: 'types.SimpleNamespace' object has no attribute 'create'"
 # the traceback runs through app.py, where the code under test calls the test's mock
 MOCK_TRACEBACK = f"{NS_CREATE}\napp.py:7: in ask\n    r = client.chat.completions.create("
+# a failure in the code under test: its traceback ends in app.py
+APP_FAILURE = "TypeError: 'NoneType' object is not subscriptable\napp.py:8: in ask"
 MOCK_HINT_TEXT = (
     "Hint: the test's mock client is incomplete: SimpleNamespace has no create; build the "
     "client mock with MagicMock() (or include the whole chat.completions.create chain) and set "
@@ -2875,11 +2896,41 @@ def test_mock_failures_resend_only_the_tests_with_a_hint(repo):
 
 def test_a_failure_of_the_code_under_test_resends_everything(repo):
     llm = FakeLLM([*GOOD, *GOOD])
-    sandbox = failing_first_verification(llm, (T_ASK, "failed", "AssertionError: assert 'x'"))
+    sandbox = failing_first_verification(llm, (T_ASK, "failed", APP_FAILURE))
     result = wf(repo, llm, sandbox)
     second = result.trajectory["attempts"][1]
     assert [f["path"] for f in second["files"]] == ["app.py", "tests/test_app.py"]
     assert "mock client is incomplete" not in llm.requests[2][0].text
+
+
+def test_a_failure_that_names_only_the_test_resends_the_test_then_the_code(repo):
+    # app.py returns the wrong value: the assertion in the test fails, and the output names no
+    # app.py line. Attempt 2 sends the test file only; the test still fails, so attempt 3 adds
+    # the code it imports (docs/plans/genai-run-9.md)
+    wrong = "AssertionError: assert 'x\\n' == 'x'"
+
+    def judge_tree(tree: Path) -> SandboxResult:
+        if "# WRONG" in (tree / "app.py").read_text():
+            return run((T_ASK, "passed"), (T_STRIP, "failed", wrong))
+        return judge(tree)
+
+    llm = FakeLLM(
+        [block(APP_NEW + "# WRONG\n"), block(TESTS_NEW)]
+        + [block(TESTS_NEW)]
+        + [block(APP_NEW), block(TESTS_NEW)]
+    )
+    result = wf(repo, llm, JudgingSandbox(judge=judge_tree), max_retries=2)
+    assert result.outcome == "verified", result.report_markdown
+    first, second, third = result.trajectory["attempts"]
+    assert first["resend"] == {"tests/test_app.py": f"failing test {T_STRIP}"}
+    assert [f["path"] for f in second["files"]] == ["tests/test_app.py"]
+    assert second["kept_files"] == ["requirements.txt", "app.py"]
+    assert second["resend"] == {
+        "app.py": f"imported by tests/test_app.py ({T_STRIP} still fails)",
+        "tests/test_app.py": f"failing test {T_STRIP}",
+    }
+    assert [f["path"] for f in third["files"]] == ["app.py", "tests/test_app.py"]
+    assert third["resend"] == {}
 
 
 def broken_app(name: str) -> LLMResponse:
@@ -2888,7 +2939,7 @@ def broken_app(name: str) -> LLMResponse:
 
 def test_a_resend_that_fails_its_checks_keeps_the_last_accepted_version(repo):
     llm = FakeLLM([*GOOD, broken_app("Missing1"), broken_app("Missing2"), block(TESTS_ROLE)])
-    sandbox = failing_first_verification(llm, (T_ASK, "failed", "AssertionError: assert 'x'"))
+    sandbox = failing_first_verification(llm, (T_ASK, "failed", APP_FAILURE))
     result = wf(repo, llm, sandbox)
     assert result.outcome == "verified", result.report_markdown
     second = result.trajectory["attempts"][1]
@@ -2912,7 +2963,7 @@ def test_only_fallbacks_are_not_verified_again(repo):
     llm = FakeLLM(
         [*GOOD, broken_app("Missing1"), broken_app("Missing2"), block(TESTS_NEW), block(APP_NEW)]
     )
-    sandbox = failing_first_verification(llm, (T_ASK, "failed", "AssertionError: assert 'x'"))
+    sandbox = failing_first_verification(llm, (T_ASK, "failed", APP_FAILURE))
     result = wf(repo, llm, sandbox, max_retries=1)
     assert [a["result"] for a in result.trajectory["attempts"]] == [
         "rejected",

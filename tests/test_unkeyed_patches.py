@@ -531,7 +531,7 @@ def test_the_tests_guide_part_says_a_patched_method_needs_a_key():
     assert 'monkeypatch.setenv("OPENAI_API_KEY", "test")' in tests_part
     assert "autospec the method instead" not in tests_part
     # the client-class examples come before the method one
-    assert tests_part.index('@mock.patch("app.openai.OpenAI")') < tests_part.index(
+    assert tests_part.index('@mock.patch("yourpkg.module.openai.OpenAI")') < tests_part.index(
         '@mock.patch("openai.resources.chat.completions.Completions.create")'
     )
     assert "call_args.args[0]" in tests_part

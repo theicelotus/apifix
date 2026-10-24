@@ -11,6 +11,9 @@ autospec=True is reported when the test uses a resource of its instance (`chat.c
 which an autospecced instance does not have. A patch of one of the library's resource methods
 (`openai.resources.chat.completions.Completions.create`) leaves the client constructor running,
 which is reported when the code under test builds a client without a key and the test sets none.
+A target whose first name is no module the test run can import (the guide's old sample
+`app.OpenAI`) is reported with the module to patch instead, and so is a call assertion
+(`create.assert_called_once()`) a test did not make before.
 
 Pure functions (source text in, messages out); repo modules are read through a callback.
 """
@@ -18,6 +21,7 @@ Pure functions (source text in, messages out); repo modules are read through a c
 from __future__ import annotations
 
 import ast
+import difflib
 import re
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -602,21 +606,22 @@ def _library_name(options: _Options) -> str:
 
 
 def _library_users(
-    own: tuple[str, _ModuleIndex], options: _Options, imports: _RepoImports
+    own: tuple[str, _ModuleIndex] | None, options: _Options, imports: _RepoImports
 ) -> tuple[list[tuple[str, _Suggestion]], list[str], bool]:
     """Where a patch would reach the library, for a patched module (`own`: its relpath and
-    index) whose own code gives no target: (relpath, suggestion) of at most
-    MAX_SUGGESTED_MODULES modules, the further ones of the same group, and whether the test
-    reaches them. The patched module comes first when it calls the library; then the non-test
-    modules the test reaches through imports, or, when it reaches none, all of them. Modules
-    still on the old API (`options.unmigrated`) are left out: their calls are no 1.x target."""
+    index; None when the target names no module that exists) whose own code gives no target:
+    (relpath, suggestion) of at most MAX_SUGGESTED_MODULES modules, the further ones of the
+    same group, and whether the test reaches them. The patched module comes first when it
+    calls the library; then the non-test modules the test reaches through imports, or, when
+    it reaches none, all of them. Modules still on the old API (`options.unmigrated`) are left
+    out: their calls are no 1.x target."""
     if not options.library_modules:
         return [], [], False
-    own_rel, own_index = own
+    own_rel = own[0] if own else None
     first: list[tuple[str, _Suggestion]] = []
-    own_use = own_index.library_use() if own_rel not in options.unmigrated else None
-    if own_use is not None:
-        first.append((own_rel, own_use))
+    own_use = own[1].library_use() if own and own[0] not in options.unmigrated else None
+    if own and own_use is not None:
+        first.append((own[0], own_use))
     users: dict[str, _Suggestion] = {}
     for rel in options.modules:
         if rel == own_rel or rel in options.unmigrated or not _module_paths(rel, options.roots):
@@ -637,7 +642,10 @@ def _library_users(
 
 
 def _users_text(
-    own: tuple[str, _ModuleIndex], site: _PatchSite, options: _Options, imports: _RepoImports
+    own: tuple[str, _ModuleIndex] | None,
+    site: _PatchSite,
+    options: _Options,
+    imports: _RepoImports,
 ) -> str | None:
     """ "Patch <library> where a module ... uses it:", one line per module with its target and
     mock chain, the objects-not-dicts note, and an example for the first; None when no module
@@ -708,6 +716,31 @@ def _missing_name_problem(
         fix = _fix_text(suggestion, site, options)
         return f"{head}; {suggestion.origin}. Patch {verb} instead: {fix}"
     return None  # not a repo module: outside the repo, not checked
+
+
+def _unknown_module_problem(
+    site: _PatchSite,
+    read_module: ReadModule,
+    options: _Options,
+    imports: _RepoImports,
+    importable: Callable[[str], bool],
+) -> str | None:
+    """A target whose first name is no module the test run can import: not a repo module
+    (under the test's module roots) and not `importable` (the standard library, declared
+    dependencies, names the repo already imports, ...). patch() then fails with
+    ModuleNotFoundError; a model copies sample names (`app.OpenAI`) from examples."""
+    top = site.target.split(".", 1)[0]
+    if not top or importable(top) or _module_file([top], read_module, options.roots):
+        return None
+    head = (
+        f"mock target {site.target!r}: there is no module {top!r} (not a repo module, the "
+        "standard library, a declared dependency or a module the repo imports), so patch() "
+        "fails with "
+        f"ModuleNotFoundError: No module named {top!r}. A module name in an example is a "
+        "placeholder: use the dotted path the tests import the code under test by"
+    )
+    elsewhere = _users_text(None, site, options, imports)
+    return f"{head}. {elsewhere}" if elsewhere else f"{head}."
 
 
 def _test_imports(tree: ast.Module) -> tuple[dict[str, str], dict[str, str]]:
@@ -1537,13 +1570,16 @@ def mock_target_problems(
     client_classes: Collection[str] = (),
     client_resources: Collection[str] = (),
     client_key: ClientKey | None = None,
+    importable: Callable[[str], bool] | None = None,
 ) -> list[str]:
     """Mock targets new in the candidate that are wrong for a repo module (`read_module(relpath)`
     gives its current text, or None if there is no such file): a name the module does not
     have at top level, or the function or class the test the patch applies to calls directly
-    (the code under test). With `library_modules` (the migrated library's top-level modules),
-    a message names the concrete target to patch instead when the module's code reaches the
-    library in a recognisable way; its example sets an object-shaped response from
+    (the code under test). With `importable` (top-level name -> can the test run import it,
+    besides repo modules), a target whose first name is neither is reported too. With
+    `library_modules` (the migrated library's top-level modules), a message names the
+    concrete target to patch instead when the module's code reaches the library in a
+    recognisable way; its example sets an object-shaped response from
     `mock_responses` (call path -> example) when one matches the call. A library target
     (`openai.OpenAI`) is wrong when one of `modules` (the repo's non-test files) binds that
     name with `from openai import OpenAI` (see _library_binding_problem; `test_files` tell
@@ -1581,7 +1617,11 @@ def mock_target_problems(
     for site in sites:
         if site.target in known or site.target in seen:
             continue
-        problem = _missing_name_problem(site, read_module, options, imports)
+        problem = None
+        if importable is not None:
+            problem = _unknown_module_problem(site, read_module, options, imports, importable)
+        if problem is None:
+            problem = _missing_name_problem(site, read_module, options, imports)
         if problem is None:
             problem = _code_under_test_problem(site, tree, read_module, options, imports)
         if problem is None:
@@ -1614,3 +1654,125 @@ def mock_target_problems(
             path=path,
         )
     return problems
+
+
+# --- call assertions a test did not make --------------------------------------------------------
+
+# unittest.mock's assertions that a mock was called (or awaited)
+CALL_ASSERTIONS = frozenset(
+    {
+        "assert_called",
+        "assert_called_once",
+        "assert_called_with",
+        "assert_called_once_with",
+        "assert_any_call",
+        "assert_has_calls",
+        "assert_awaited",
+        "assert_awaited_once",
+        "assert_awaited_with",
+        "assert_awaited_once_with",
+        "assert_any_await",
+        "assert_has_awaits",
+    }
+)
+# mock attributes an `assert` statement checks a call with (`assert create.called`)
+CALL_ATTRIBUTES = frozenset({"called", "call_count", "awaited", "await_count"})
+
+
+def _test_functions(tree: ast.Module) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
+    """Top-level test functions and the test methods of top-level classes, by qualified name
+    ("test_x", "TestA.test_y")."""
+    out: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+    for node in tree.body:
+        if _is_test_function(node):
+            out[node.name] = node  # type: ignore[union-attr]
+        elif isinstance(node, ast.ClassDef):
+            for item in node.body:
+                if _is_test_function(item):
+                    out[f"{node.name}.{item.name}"] = item  # type: ignore[union-attr]
+    return out
+
+
+def _call_expectations(fn: ast.AST) -> list[tuple[str, int, str, str]]:
+    """(kind, line, text, mock) of each call assertion in `fn`, in source order: a
+    CALL_ASSERTIONS method call (kind: its name), or an `assert` statement on a CALL_ATTRIBUTES
+    attribute (kind: the attribute); `mock` is the expression asserted on."""
+    found: list[tuple[int, int, str, str, str]] = []
+    for node in ast.walk(fn):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in CALL_ASSERTIONS
+        ):
+            mock = ast.unparse(node.func.value)
+            found.append((node.lineno, node.col_offset, node.func.attr, ast.unparse(node), mock))
+        elif isinstance(node, ast.Assert):
+            attrs = [
+                n
+                for n in ast.walk(node.test)
+                if isinstance(n, ast.Attribute) and n.attr in CALL_ATTRIBUTES
+            ]
+            if attrs:
+                mock = ast.unparse(attrs[0].value)
+                found.append((node.lineno, node.col_offset, attrs[0].attr, ast.unparse(node), mock))
+    return [(kind, line, text, mock) for line, _, kind, text, mock in sorted(found)]
+
+
+def added_call_assertions(original: str, candidate: str) -> list[str]:
+    """Call assertions (`create.assert_called_once()`, `assert create.called`) the candidate
+    adds to a test the original already has, one error per test. The tests' assertions are
+    aligned by kind in source order, so a migrated assertion (`create.assert_called_once()` ->
+    `OpenAI.return_value.chat.completions.create.assert_called_once()`) or one changed to
+    another kind is not counted; only a test with more of them than before is reported. A new
+    expectation that the library is called fails whenever the test does not reach the call
+    (genai-gptoss20b-3: its display mock raises first)."""
+    try:
+        before_tree, after_tree = ast.parse(original), ast.parse(candidate)
+    except (SyntaxError, ValueError):
+        return []
+    before = _test_functions(before_tree)
+    problems = []
+    for name, fn in _test_functions(after_tree).items():
+        if name not in before:
+            continue
+        old = _call_expectations(before[name])
+        new = _call_expectations(fn)
+        if len(new) <= len(old):
+            continue
+        matcher = difflib.SequenceMatcher(a=[e[0] for e in old], b=[e[0] for e in new])
+        added = []
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == "insert":
+                added += new[j1:j2]
+            elif tag == "replace" and j2 - j1 > i2 - i1:
+                added += new[j1 + (i2 - i1) : j2]
+        if not added:
+            continue
+        _, line, text, _ = added[0]
+        more = f" (and {len(added) - 1} more)" if len(added) > 1 else ""
+        mocks = ", ".join(dict.fromkeys(e[3] for e in old))
+        had = f"makes {len(old)}, on {mocks}" if old else "makes none"
+        problems.append(
+            f"line {line}: {name} adds a call assertion the original test does not make: "
+            f"`{text}`{more} (the original {had}). Migrate the test's existing assertions and "
+            "add no new ones: the original test may not reach that call (an error raised "
+            "earlier, a branch not taken), so the new assertion fails"
+        )
+    return problems
+
+
+def patches_client_class(source: str, test: str, client_classes: Collection[str]) -> bool:
+    """Does test `test` ("test_x" or "TestA.test_y") of `source` patch one of
+    `client_classes` (a string target whose last name is one, under any module path)? Its
+    client is then a mock: no real constructor runs, so no API key is needed."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return False
+    fn = _test_functions(tree).get(test)
+    if fn is None:
+        return False
+    return any(
+        fn in site.tests and site.target.rsplit(".", 1)[-1] in client_classes
+        for site in _patch_sites(tree)
+    )

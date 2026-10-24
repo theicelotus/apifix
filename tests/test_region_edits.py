@@ -407,10 +407,11 @@ def test_a_later_attempt_adds_regions_the_verifier_points_at(big):
         f'    text = "{"abc " * 80}"\n    assert len(text) == 320\n'
     )
     second = regions(("R1", R1_NEW), ("R2", R2_NEW), ("R3", extra_new), ("IMPORTS", IMPORTS_NEW))
-    llm = FakeLLM([block(APP_NEW), GOOD_REGIONS, block(APP_NEW), second])
+    # attempt 2 sends only the failing test's file: app.py keeps its accepted version
+    llm = FakeLLM([block(APP_NEW), GOOD_REGIONS, second])
     result = wf(big, llm, JudgingSandbox(judge=extra_judge))
     assert result.outcome == "verified"
-    entry = files_of(result, 1)[1]
+    (entry,) = files_of(result, 1)
     assert entry["regions"][-1] == {
         "id": "R3",
         "kind": "function",
@@ -423,7 +424,7 @@ def test_a_later_attempt_adds_regions_the_verifier_points_at(big):
         "returned": True,
         "changed": True,
     }
-    request = llm.requests[3][0].text
+    request = llm.requests[2][0].text
     assert f"Region R3: def test_extra_3 (original lines {line}-{line + 2})" in request
     assert "+import openai" in result.diff and '+    client = openai.OpenAI(api_key="x")' in (
         result.diff

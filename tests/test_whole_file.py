@@ -109,6 +109,7 @@ def test_valid_changed_python_passes():
         "abbreviation": "ok",
         "undefined_names": "ok",
         "mock_targets": "n/a",  # not a test file
+        "call_assertions": "n/a",
         "unrelated_edits": "n/a",  # no findings given
         "config": "n/a",  # no migration checks given
     }

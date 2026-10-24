@@ -21,6 +21,7 @@ from apifix.engine.code_checks import (
     MODULE_ROOTS,
     ImportTable,
     add_missing_imports,
+    added_call_assertions,
     mock_target_problems,
     undefined_names,
 )
@@ -619,6 +620,7 @@ def check_candidate(
     client_resources: Collection[str] = (),
     client_key: ClientKey | None = None,
     env_names: Collection[str] = (),
+    importable: Callable[[str], bool] | None = None,
 ) -> CheckResult:
     """Syntax (Python files), well-formedness (dependency files), "differs from the original"
     (only when `required`), abbreviation (placeholders, or under half the original's lines
@@ -633,8 +635,11 @@ def check_candidate(
     except `unmigrated_modules`, which are still on the old API; `client_classes` and
     `client_resources` report a client class patched with autospec=True whose instance's
     resources the test uses; `client_key` a patched resource method in a test that sets no
-    key while the code under test builds a client without one). Python
-    files that parse first get an import for each new undefined name with exactly one
+    key while the code under test builds a client without one; `importable` a target whose
+    first name is no repo module and nothing the test run can import). Test files also get
+    the call-assertion check: no call assertion (`create.assert_called_once()`) a test did not
+    make before (code_checks.added_call_assertions). Python files that parse first get an
+    import for each new undefined name with exactly one
     `known_imports` entry, so every check sees the completed file (`text`, `auto_imports`).
 
     With `findings` (the file's own scanner findings), Python files also get the unrelated-edit
@@ -722,11 +727,15 @@ def check_candidate(
             client_classes=client_classes,
             client_resources=client_resources,
             client_key=client_key,
+            importable=importable,
         )
         if mocks and read_module is not None
         else []
     )
     record("mock_targets", "; ".join(targets) or None, mocks)
+    tests = python and is_test_file(path, original)
+    added_calls = added_call_assertions(original, candidate) if tests else []
+    record_all("call_assertions", added_calls, tests)
 
     unrelated_problems = (
         revert_errors

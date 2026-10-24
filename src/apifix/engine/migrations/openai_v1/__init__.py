@@ -37,7 +37,7 @@ class OpenAIV1Migration:
             "api_key client option must be set",
             "openai.OpenAI() raised because no API key is set: the tests run without one. "
             "Keep the real constructor from running in tests: patch it where the code under "
-            'test looks it up (e.g. patch("app.openai.OpenAI") and set '
+            'test looks it up (e.g. patch("yourpkg.module.openai.OpenAI") and set '
             "OpenAI.return_value.chat.completions.create.return_value), patch the module's "
             "client or get_client(), or build the client lazily instead of at import. Never "
             "add a real key. If the code uses the module-level client "
@@ -54,12 +54,13 @@ class OpenAIV1Migration:
             # agent mode and `apifix verify` see autospec on a client class only here
             # (whole-file mode rejects it before verifying: code_checks.autospec_client_problems)
             "Mock object has no attribute 'completions'",
-            'a client class patched with autospec=True (patch("app.OpenAI", autospec=True)) '
-            "gives an instance without chat.completions: in 1.x the client's resources are "
-            "cached properties, which autospec does not follow. Drop autospec=True when "
-            'patching the client class (patch("app.OpenAI")). Patching the method instead '
-            "(openai.resources.chat.completions.Completions.create) leaves the real client "
-            "being built, so the test must then set a placeholder OPENAI_API_KEY.",
+            'a client class patched with autospec=True (patch("yourpkg.module.OpenAI", '
+            "autospec=True)) gives an instance without chat.completions: in 1.x the client's "
+            "resources are cached properties, which autospec does not follow. Drop "
+            'autospec=True when patching the client class (patch("yourpkg.module.OpenAI")). '
+            "Patching the method instead (openai.resources.chat.completions.Completions.create) "
+            "leaves the real client being built, so the test must then set a placeholder "
+            "OPENAI_API_KEY.",
         ),
     )
     mock_failure_hint = (
@@ -74,6 +75,15 @@ class OpenAIV1Migration:
         '(mock.patch.dict(os.environ, {{"OPENAI_API_KEY": "test"}}) or '
         'monkeypatch.setenv("OPENAI_API_KEY", "test")), or patch the client class where the '
         'code looks it up (patch("{target}"), without autospec)'
+    )
+    uncalled_patched_hint = (
+        "a mock was never called in {tests}, which patch the client class, so no real client "
+        "is built and no API key is needed: the code under test did not reach the call in "
+        "that test. Compare the test with the original: a call assertion the original does not "
+        "make (create.assert_called_once() in a test whose code raises or returns before the "
+        "call) expects a call the code never makes there; keep the test's assertions as they "
+        "were. Otherwise check that the patch target is where the code under test looks the "
+        "client up"
     )
     # A client must be constructible with the installed versions (a dummy key; nothing is sent:
     # the network is off and constructing a client makes no request).

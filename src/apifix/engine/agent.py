@@ -22,7 +22,7 @@ import re
 import shutil
 import tempfile
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -35,12 +35,15 @@ from apifix.engine.code_checks import (
     import_table,
     keyless_client,
     module_roots,
+    patches_client_class,
 )
 from apifix.engine.context import changed_statements, library_uses, reachable_modules
 from apifix.engine.dependencies import is_dependency_file
 from apifix.engine.diffing import diff_trees, read_text, unified_diff
 from apifix.engine.imports import (
+    ImportableModules,
     UndeclaredImport,
+    importable_modules,
     undeclared_imports,
     undeclared_record,
     undeclared_section,
@@ -90,7 +93,6 @@ from apifix.engine.verifier import (
     downloads_line,
     feedback_lines,
     mock_failures,
-    only_mock_failures,
     requirements_override,
     run_summary,
     sandbox_requirements_lines,
@@ -149,6 +151,7 @@ FILE_EDITS: tuple[FileEdits, ...] = ("auto", "whole", "regions")
 TRAJECTORY_VERSION = 1
 CHARS_PER_TOKEN = 3  # conservative estimate for the pre-call budget check
 MAX_FEEDBACK_REASONS = 40
+MAX_HINT_TESTS = 3  # tests a hint names
 ONE_CALL_NUDGE = "Send exactly one tool call per reply."
 NO_CALL_NUDGE = "You can't see files directly. Call a tool, for example read_file, to get them."
 _RANK = {"verified": 3, "verified_weak": 2, "unverified": 1, "rejected": 0}
@@ -249,6 +252,9 @@ class Attempt:
     kept_files: list[str] = field(default_factory=list)
     deferred: list[dict[str, str]] = field(default_factory=list)
     fell_back: list[dict[str, Any]] = field(default_factory=list)
+    # whole-file mode, a rejected attempt: the files the next attempt sends, with why
+    # (implicated_files)
+    resend: dict[str, str] = field(default_factory=dict)
     diff: str = ""
     verification: Verification | None = None
     result: str = ""  # a verdict, "no_changes", "check_failed" (whole-file) or "aborted"
@@ -270,6 +276,7 @@ class Attempt:
             "kept_files": self.kept_files,
             "deferred": self.deferred,
             "fell_back": self.fell_back,
+            "resend": self.resend,
             "diff": self.diff,
             "verification": self.verification.to_dict() if self.verification else None,
             "verification_duration_s": round(self.verification_duration_s, 3),
@@ -434,6 +441,7 @@ class _Job:
         self.wf_skipped: list[dict[str, object]] = []
         self.wf_pending: list[str] = []
         self.wf_verification: tuple[int, Verification] | None = None  # the last rejection
+        self.wf_failing: set[str] = set()  # the tests it was about (failing_tests)
         # per verification (by id): its failure hints, with the uncalled-mock hint when the
         # working copy builds a client without a key (_failure_hints)
         self.hints_for: dict[int, tuple[tuple[str, str], ...]] = {}
@@ -496,6 +504,9 @@ class _Job:
         # the check of library patch targets against `from <library> import X` modules
         self.wf_python_modules: tuple[str, ...] = ()
         self.wf_test_files: tuple[str, ...] = ()
+        # whole-file: top-level names a test run can import besides repo modules (read before
+        # the baseline), for mock targets whose module does not exist
+        self.wf_importable: ImportableModules | None = None
         # whole-file region edits: per Python file its regions, its form (whole / regions) and
         # why, the region texts of its last accepted version, and of the version a later
         # request follows (like wf_previous)
@@ -910,23 +921,21 @@ class _Job:
             if len(numbers) >= REPEATED_ERROR_NOTE_AT and (current is None or key in current)
         ]
 
-    def _after_rejection(self, number: int, v: Verification) -> None:
-        """Whole-file: what the next attempt sends. Every file again, from the original with
-        the previous version as a diff, except dependency files (accepted, or set by apifix)
-        the verification did not implicate, and, when every problem is a test failing on its
-        own mocks (verifier.only_mock_failures), non-test Python files nothing else names."""
+    def _after_rejection(self, number: int, v: Verification) -> dict[str, str]:
+        """Whole-file: what the next attempt sends, from the original with the previous
+        version as a diff: only the files the rejection implicates (implicated_files), with
+        why. The others keep their accepted versions."""
         self.wf_verification = (number, v)
-        # the failing tests' files must be among those sent, or only the code under test can
-        # be changed (a test file without findings is never sent)
-        mocks_only = only_mock_failures(v) and set(
-            test_files_of(mock_failures(v), self.repo)
-        ) <= set(self.wf_all)
-        self.wf_pending = [
-            p
-            for p in self.wf_all
-            if (not is_dependency_file(p) or _dependency_problem(p, v))
-            and not (mocks_only and self._only_called_the_mocks(p, v))
-        ]
+        failing = failing_tests(v)
+        resend = implicated_files(
+            v,
+            self.wf_all,
+            self.repo,
+            reaches=self._code_under_test,
+            still_failing=set(failing) & self.wf_failing,
+        )
+        self.wf_failing = set(failing)
+        self.wf_pending = list(resend)
         self.wf_previous = {p: (self._read(self.work, p), "") for p in self.wf_pending}
         self.wf_region_previous = {
             p: self.wf_region_texts[p] for p in self.wf_pending if p in self.wf_region_texts
@@ -934,14 +943,19 @@ class _Job:
         for p in self.wf_pending:
             if p in self.wf_plans and self._form(p)[0] == "regions":
                 self._add_feedback_regions(p, v)
+        return resend
 
-    def _only_called_the_mocks(self, path: str, v: Verification) -> bool:
-        """Is `path` a non-test Python file no reason or remaining finding names (its lines in
-        a mock failure's traceback only say where the test's mock was called)?"""
-        if not path.endswith(".py") or is_test_file(path, root=self.repo):
-            return False
-        named = {r.file for r in v.reasons} | {f.file for f in v.remaining_findings}
-        return path not in named
+    def _code_under_test(self, test_file: str) -> list[str]:
+        """The non-test files whole-file mode sends that `test_file` reaches through imports
+        (working copy), in the order they are found."""
+        if not test_file.endswith(".py") or not (self.work / test_file).is_file():
+            return []
+        wanted = {
+            p for p in self.wf_all if p.endswith(".py") and not is_test_file(p, root=self.repo)
+        }
+        roots = module_roots(test_file, self.baseline.import_paths if self.baseline else ())
+        reader = self._working_copy_reader(test_file, self._read(self.work, test_file))
+        return reachable_modules(test_file, reader, roots, wanted)
 
     def _add_feedback_regions(self, path: str, v: Verification) -> None:
         """Regions the verifier's output points at in a region-edited file (its failing tests,
@@ -1302,18 +1316,43 @@ class _Job:
             client_resources=self.migration.client_resources,
             client_key=self._client_key(),
             env_names=self._env_names(),
+            importable=self.wf_importable,
         )
 
     def _failure_hints(self, v: Verification | None) -> tuple[tuple[str, str], ...]:
-        """The migration's failure hints for the feedback on `v`, plus its uncalled-mock hint
-        (for verifier.UNCALLED_MOCK_MARKERS) when a non-test module of the working copy builds
-        a client without a key and the sandbox sets none (_client_key)."""
+        """The migration's failure hints for the feedback on `v`, plus its hints for a mock
+        that was never called (verifier.UNCALLED_MOCK_MARKERS): when such a test patches a
+        client class (no real client is built), `uncalled_patched_hint` naming those tests;
+        when one does not (or no test output names the marker), `uncalled_mock_hint` if a
+        non-test module of the working copy builds a client without a key and the sandbox
+        sets none (_client_key)."""
         hints = tuple(self.migration.failure_hints)
-        template = getattr(self.migration, "uncalled_mock_hint", "")
-        key = self._client_key()
-        if v is None or not template or key is None:
+        if v is None:
             return hints
         if id(v) not in self.hints_for:
+            self.hints_for[id(v)] = hints + self._uncalled_hints(v)
+        return self.hints_for[id(v)]
+
+    def _uncalled_hints(self, v: Verification) -> tuple[tuple[str, str], ...]:
+        uncalled = [
+            t.id
+            for t in v.fixed.tests
+            if t.outcome in ("failed", "error")
+            and any(marker in t.message for marker in UNCALLED_MOCK_MARKERS)
+        ]
+        classes = self.migration.client_classes
+        patched = [t for t in uncalled if self._patches_client_class(t, classes)]
+        texts: list[str] = []
+        template = getattr(self.migration, "uncalled_patched_hint", "")
+        if patched and template:
+            shown = ", ".join(patched[:MAX_HINT_TESTS])
+            extra = len(patched) - MAX_HINT_TESTS
+            texts.append(
+                template.format(tests=shown + (f" (and {extra} more)" if extra > 0 else ""))
+            )
+        template = getattr(self.migration, "uncalled_mock_hint", "")
+        key = self._client_key()
+        if template and key is not None and len(patched) < max(len(uncalled), 1):
             python = [
                 p.relative_to(self.work).as_posix()
                 for p in iter_files(self.work)
@@ -1326,14 +1365,21 @@ class _Job:
                 key,
                 library_modules=self.migration.api_modules,
             )
-            extra: tuple[tuple[str, str], ...] = ()
             if found is not None:
-                text = template.format(
-                    where=f"{found.rel}:{found.line} builds {found.call}()", target=found.target
-                )
-                extra = tuple((marker, text) for marker in UNCALLED_MOCK_MARKERS)
-            self.hints_for[id(v)] = hints + extra
-        return self.hints_for[id(v)]
+                where = f"{found.rel}:{found.line} builds {found.call}()"
+                texts.append(template.format(where=where, target=found.target))
+        return tuple((marker, text) for text in texts for marker in UNCALLED_MOCK_MARKERS)
+
+    def _patches_client_class(self, test_id: str, client_classes: Collection[str]) -> bool:
+        """Does runtime test `test_id` patch one of `client_classes` (working copy)?"""
+        (file,) = test_files_of([test_id], self.work)
+        if not file.endswith(".py") or not (self.work / file).is_file():
+            return False
+        classname, _, name = test_id.partition("::")
+        owner = classname[len(file[:-3].replace("/", ".")) + 1 :]
+        qualified = f"{owner}.{name}" if owner else name
+        source = self._read(self.work, file)
+        return patches_client_class(source, qualified.split("[", 1)[0], client_classes)
 
     def _env_names(self) -> tuple[str, ...]:
         """The library's environment variables (its client key's), which a rewrite may set."""
@@ -2058,6 +2104,12 @@ class _Job:
             if problem:
                 return "aborted", f"preflight: {problem}"
         self.undeclared = undeclared_imports(self.repo, requirements_override(self.sandbox))
+        if self.whole_file:
+            self.wf_importable = importable_modules(
+                self.repo,
+                requirements_override(self.sandbox),
+                self.migration.api_modules | self.migration.companion_modules,
+            )
         start = time.monotonic()
         self.baseline = self.sandbox.run(self.repo, env=self.sandbox_env)
         self.baseline_seconds = time.monotonic() - start
@@ -2132,7 +2184,7 @@ class _Job:
             if not self._retryable(attempt.verification):
                 break
             if self.whole_file:
-                self._after_rejection(number, attempt.verification)
+                attempt.resend = self._after_rejection(number, attempt.verification)
                 if not self.wf_pending:
                     break  # nothing the model may edit is implicated: another run changes nothing
 
@@ -2331,6 +2383,85 @@ def _dependency_problem(path: str, v: Verification) -> bool:
         or any(r.file == path for r in v.reasons)
         or any(f.file == path for f in v.remaining_findings)
     )
+
+
+def failing_tests(v: Verification) -> list[str]:
+    """The tests a rejection is about: newly failing or erroring ones, and those its reject /
+    unverified reasons name (collection errors as their module, failures without a usable
+    baseline), in order."""
+    ids = [*v.delta.newly_failing, *v.delta.newly_erroring]
+    ids += [t for r in v.reasons if r.severity in ("reject", "unverified") for t in r.tests]
+    return list(dict.fromkeys(ids))
+
+
+def implicated_files(
+    v: Verification,
+    candidates: Sequence[str],
+    repo: Path,
+    *,
+    reaches: Callable[[str], list[str]],
+    still_failing: Collection[str] = (),
+) -> dict[str, str]:
+    """Which of `candidates` (the files whole-file mode can send) a rejection implicates, and
+    why, in candidates' order:
+
+    - the files the failing tests live in (failing_tests);
+    - files a failing test's output points at (`path:N`, `"path", line N`), except non-test
+      files in the output of a test that failed on its own mock (verifier.mock_failure: that
+      line is only where the code called the test's mock), and files in the fixed run's error;
+    - files a reject / unverified reason names, files with remaining findings, and dependency
+      files the install or smoke check implicates (_dependency_problem);
+    - for a failing test whose own file cannot be sent (no findings), and for one in
+      `still_failing` (it failed the previous verification too, so changing what was sent did
+      not fix it), the non-test candidates its file reaches through imports (`reaches(test
+      file)`): the code under test, which an assertion in the test does not show.
+
+    When none of these is a candidate, every Python candidate (a run that failed without
+    naming any file)."""
+    out: dict[str, str] = {}
+
+    def add(path: str, why: str) -> None:
+        if path in candidates and path not in out:
+            out[path] = why
+
+    python = [p for p in candidates if p.endswith(".py")]
+    failing = failing_tests(v)
+    mocks = mock_failures(v)
+    for test, file in zip(failing, (test_files_of([t], repo)[0] for t in failing), strict=True):
+        add(file, f"failing test {test}")
+        if file not in candidates:
+            for module in reaches(file):
+                add(module, f"imported by {file} (failing test {test}; its file is not sent)")
+    wanted = set(failing)
+    for result in v.fixed.tests:
+        if result.id not in wanted or not result.message:
+            continue
+        for path in python:
+            if result.id in mocks and not is_test_file(path, root=repo):
+                continue
+            if re.search(_TRACEBACK_LINE.format(path=re.escape(path)), result.message, re.M):
+                add(path, f"in the output of {result.id}")
+    errors = "\n".join(e for e in (v.fixed.reason, v.fixed.runner_error or "") if e)
+    for path in python:
+        if errors and re.search(_TRACEBACK_LINE.format(path=re.escape(path)), errors, re.M):
+            add(path, "in the fixed run's error")
+    for r in v.reasons:
+        if r.file and r.severity in ("reject", "unverified"):
+            add(r.file, f"verifier: {r.code}")
+    for f in v.remaining_findings:
+        add(f.file, "remaining finding")
+    for path in candidates:
+        if is_dependency_file(path) and _dependency_problem(path, v):
+            add(path, "dependency problem")
+    for test in failing:
+        if test in still_failing and test not in mocks:
+            file = test_files_of([test], repo)[0]
+            for module in reaches(file):
+                add(module, f"imported by {file} ({test} still fails)")
+    if not out:
+        for path in python:
+            out[path] = "nothing narrower implicated"
+    return {p: out[p] for p in candidates if p in out}
 
 
 def _install_reads(path: str, run: SandboxResult) -> bool:
