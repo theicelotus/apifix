@@ -15,17 +15,21 @@ from apifix.engine.regions import (
     OUTLINE_CHARS,
     Region,
     apply_blocks,
+    attribute_errors,
     check_block,
     coverage,
     fenced_blocks,
     find_regions,
     is_whole_file,
     labels_nudge,
+    map_line,
     names_context,
+    ordered_ids,
     outline,
     parse_region_blocks,
     region_instruction,
     region_text,
+    regions_diff,
     render_block,
     splice,
     split_lines,
@@ -626,3 +630,74 @@ def test_a_syntax_error_only_splicing_reveals_names_the_region():
         "R1, line 1 of your block: SyntaxError after splicing: "
         "expected an indented block after function definition on line 1"
     ]
+
+
+# --- attribution and region diffs -------------------------------------------------------------
+
+
+def two_regions():
+    plan = plan_for(MODULE, "openai.ChatCompletion.create", "openai.Model.list")
+    texts = {
+        "R1": "@decorator\ndef ask(prompt):\n    r = client.chat.completions.create()\n"
+        "    return undefined_thing(r)",
+        "R2": 'if __name__ == "__main__":\n    print(client.models.list())',
+    }
+    return plan, texts, splice(MODULE, plan, texts)
+
+
+def test_errors_are_attributed_by_prefix_original_line_and_target():
+    plan, texts, spliced = two_regions()
+    ask = plan.regions[0]
+    errors = [
+        "R2: SyntaxError: invalid syntax (line 1 of your block)",
+        f'original line {ask.start + 1}: changed code unrelated to the migration ("x")',
+        f'after original line {ask.end + 1}: added code unrelated to the migration ("y")',
+        "mock target 'app.client.chat': app.py has no top-level name 'client'",
+        "something with no place",
+    ]
+    texts = {**texts, "R2": texts["R2"] + "\n@patch('app.client.chat')"}
+    got = attribute_errors(errors, plan, spliced, spliced.text, texts, fallback=["R1"])
+    assert [ids for _, ids in got] == [["R2"], ["R1"], ["R1"], ["R2"], ["R1"]]
+    assert [e for e, _ in got] == errors  # these forms are not rewritten
+
+
+def test_candidate_lines_are_rewritten_to_the_region_block_line():
+    plan, texts, spliced = two_regions()
+    n = spliced.text.splitlines().index("    return undefined_thing(r)") + 1
+    checked = "import json\n" + spliced.text  # an auto-import shifts every line by one
+    (got,) = attribute_errors(
+        [f"line {n + 1}: 'undefined_thing' is used but never imported or defined"],
+        plan,
+        spliced,
+        checked,
+        texts,
+        fallback=[],
+    )
+    assert got == (
+        "R1, line 4 of your block: 'undefined_thing' is used but never imported or defined",
+        ["R1"],
+    )
+
+
+def test_map_line_through_insertions():
+    before, after = "a\nb\nc\n", "a\nNEW\nb\nc\n"
+    assert [map_line(before, after, n) for n in (1, 2, 3, 4)] == [1, 1, 2, 3]
+
+
+def test_regions_diff_uses_file_line_numbers_and_skips_unchanged():
+    plan, texts, _ = two_regions()
+    unchanged = {"R2": region_text(MODULE, plan.regions[1])}
+    assert regions_diff("m.py", MODULE, plan, unchanged, ["R2"]) == ""
+    diff = regions_diff("m.py", MODULE, plan, texts, ["R2", "R1"])
+    assert diff.index("--- a/m.py R1") < diff.index("--- a/m.py R2")  # file order
+    start = plan.regions[0].start
+    assert f"@@ -{start + 1}," in diff
+    assert len(regions_diff("m.py", MODULE, plan, texts, ["R1"], limit=60)) <= 60 + 25
+    assert ordered_ids(plan, ["R2", IMPORTS, "R1", "R2"]) == [IMPORTS, "R1", "R2"]
+
+
+def test_region_instruction_with_required_imports():
+    text = region_instruction([IMPORTS, "R2"])
+    assert text.startswith("Return every region (IMPORTS, R2)")
+    assert "only if you change it" not in text
+    assert region_instruction(["R1"]).startswith("Return the region (R1)")

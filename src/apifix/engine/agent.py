@@ -54,6 +54,21 @@ from apifix.engine.pin_edits import (
     plan_pin_edits,
 )
 from apifix.engine.project import ci_env_vars, is_test_file
+from apifix.engine.regions import (
+    IMPORTS,
+    RegionPlan,
+    apply_blocks,
+    attribute_errors,
+    coverage,
+    find_regions,
+    labels_nudge,
+    names_context,
+    ordered_ids,
+    outline,
+    parse_region_blocks,
+    region_text,
+    regions_diff,
+)
 from apifix.engine.sandbox import Sandbox, SandboxResult
 from apifix.engine.scanner import scan
 from apifix.engine.verifier import (
@@ -72,6 +87,10 @@ from apifix.engine.walk import copy_repo, iter_files
 from apifix.engine.whole_file import (
     CODE_BLOCK_NUDGE,
     DEFAULT_MAX_BYTES,
+    DEFAULT_REGION_THRESHOLD,
+    KEPT_DIFF_CHARS,
+    REGION_COVERAGE_MAX,
+    CheckResult,
     as_file,
     check_candidate,
     context_candidates,
@@ -83,6 +102,8 @@ from apifix.engine.whole_file import (
     parse_code_block,
     pins_note,
     previous_version_note,
+    region_previous_note,
+    region_prompt,
     reply_budget,
     select_context,
     select_files,
@@ -103,6 +124,8 @@ Outcome = Literal[
 _NO_ATTEMPTS = ("aborted", "no_findings", "already_migrated")
 EditMode = Literal["agent", "whole-file"]
 EDIT_MODES: tuple[EditMode, ...] = ("agent", "whole-file")
+FileEdits = Literal["auto", "whole", "regions"]
+FILE_EDITS: tuple[FileEdits, ...] = ("auto", "whole", "regions")
 TRAJECTORY_VERSION = 1
 CHARS_PER_TOKEN = 3  # conservative estimate for the pre-call budget check
 MAX_FEEDBACK_REASONS = 40
@@ -145,17 +168,35 @@ class AgentConfig:
     whole_file_max_bytes: int = DEFAULT_MAX_BYTES
     max_code_block_nudges: int = 3
     # whole-file mode: a candidate failing a check gets its error back once per file per attempt
+    # (region edits: once per batch)
     max_check_retries_per_file: int = 1
+    # whole-file mode: send each Python file whole or as regions (regions.py): `auto` picks
+    # regions for files over region_threshold_bytes (or the size limit)
+    file_edits: FileEdits = "auto"
+    region_threshold_bytes: int = DEFAULT_REGION_THRESHOLD
 
     def __post_init__(self) -> None:
         if self.edit_mode not in EDIT_MODES:
             raise ValueError(f"unknown edit mode {self.edit_mode!r} (available: agent, whole-file)")
+        if self.file_edits not in FILE_EDITS:
+            raise ValueError(
+                f"unknown file edits {self.file_edits!r} (available: auto, whole, regions)"
+            )
 
 
 class _Abort(Exception):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, limit: int | None = None) -> None:
         super().__init__(message)
         self.code = code
+        self.limit = limit  # a per-minute token limit the refused request could not fit
+
+
+class _CannotFit(LLMError):
+    """A request over the server's per-minute token limit that fewer reply tokens cannot fix."""
+
+    def __init__(self, message: str, limit: int) -> None:
+        super().__init__(message)
+        self.limit = limit
 
 
 @dataclass
@@ -385,6 +426,13 @@ class _Job:
         # the check of library patch targets against `from <library> import X` modules
         self.wf_python_modules: tuple[str, ...] = ()
         self.wf_test_files: tuple[str, ...] = ()
+        # whole-file region edits: per Python file its regions, its form (whole / regions) and
+        # why, the region texts of its last accepted version, and of the version a later
+        # request follows (like wf_previous)
+        self.wf_plans: dict[str, RegionPlan] = {}
+        self.wf_form: dict[str, tuple[str, str]] = {}
+        self.wf_region_texts: dict[str, dict[str, str]] = {}
+        self.wf_region_previous: dict[str, dict[str, str] | None] = {}
         if self.whole_file:
             checker = getattr(migration, "rewrite_checker", None)
             self.rewrite_checks = checker(repo, findings) if callable(checker) else None
@@ -471,7 +519,8 @@ class _Job:
                     fit = self._fitting_max_tokens(exc, max_tokens, need_tokens, lowered_from)
                     lowered_from, max_tokens = max_tokens, fit
         except LLMError as exc:
-            raise _Abort("provider_error", str(exc)) from exc
+            limit = exc.limit if isinstance(exc, _CannotFit) else None
+            raise _Abort("provider_error", str(exc), limit=limit) from exc
         finally:
             duration = time.monotonic() - start
             self.llm_seconds += duration
@@ -516,9 +565,10 @@ class _Job:
         """max_tokens that makes a refused request fit the server's per-minute limit (it counts
         the prompt plus max_tokens), or raise LLMError when one retry cannot help."""
         if lowered_from is not None:
-            raise LLMError(
+            raise _CannotFit(
                 f"{exc} (already sent again with max_tokens lowered from {lowered_from:,} to "
-                f"{max_tokens:,})"
+                f"{max_tokens:,})",
+                exc.limit,
             )
         prompt = exc.requested - max_tokens  # the server's count of the prompt itself
         fit = exc.limit - prompt - token_limit_margin(exc.limit)
@@ -526,9 +576,10 @@ class _Job:
             raise LLMError(str(exc))
         if fit < need:
             left = f"{max(fit, 0):,} reply tokens" if fit > 0 else "no reply tokens"
-            raise LLMError(
+            raise _CannotFit(
                 f"{exc}. The prompt alone is ~{prompt:,} tokens; lowering max_tokens to fit "
-                f"would leave {left}, less than the reply needs (~{need:,})"
+                f"would leave {left}, less than the reply needs (~{need:,})",
+                exc.limit,
             )
         self.lowered_requests += 1
         self.llm.notes[:] = [n for n in self.llm.notes if LOWERED_NOTE not in n]
@@ -622,13 +673,16 @@ class _Job:
         pending = self.wf_pending
         attempt.kept_files = [p for p in self.wf_all if p not in pending]
         for i, path in enumerate(pending):
-            entry, candidate = self._whole_file_request(attempt, path)
+            if self._form(path)[0] == "regions":
+                entry, candidate = self._region_request(attempt, path)
+            else:
+                entry, candidate = self._whole_file_request(attempt, path)
             if not entry["accepted"]:
                 rest = {p: self.wf_previous[p] for p in pending[i + 1 :] if p in self.wf_previous}
                 self.wf_pending = pending[i:]
                 self.wf_previous = {path: (candidate, entry["error"]), **rest}
                 return False
-        self.wf_pending, self.wf_previous = [], {}
+        self.wf_pending, self.wf_previous, self.wf_region_previous = [], {}, {}
         return True
 
     def _after_rejection(self, number: int, v: Verification) -> None:
@@ -641,6 +695,9 @@ class _Job:
             p for p in self.wf_all if not is_dependency_file(p) or _dependency_problem(p, v)
         ]
         self.wf_previous = {p: (self._read(self.work, p), "") for p in self.wf_pending}
+        self.wf_region_previous = {
+            p: self.wf_region_texts[p] for p in self.wf_pending if p in self.wf_region_texts
+        }
 
     def _read(self, root: Path, path: str) -> str:
         return (root / path).read_bytes().decode("utf-8")
@@ -654,13 +711,10 @@ class _Job:
         would carry the whole rejected file)."""
         original = self._read(self.repo, path)
         required = must_change(path, self.findings)
-        updated = [
-            (p, self._read(self.work, p))
-            for p in context_candidates(path, self.wf_files, self.repo)
-            if self._read(self.work, p) != self._read(self.repo, p)
-        ]
         own_bytes = len(original.encode("utf-8"))
-        context, left_out = select_context(updated, own_bytes, self.config.whole_file_max_bytes)
+        context, left_out = select_context(
+            self._updated_context(path), own_bytes, self.config.whole_file_max_bytes
+        )
         previous = ""
         if path in self.wf_previous:
             text, reason = self.wf_previous[path]
@@ -701,6 +755,8 @@ class _Job:
         sent = [first]  # every message of the file's requests, in order
         entry: dict[str, Any] = {
             "path": path,
+            "form": "whole",
+            "form_reason": self._form(path)[1],
             "bytes_sent": own_bytes,
             "context_files": [p for p, _ in context],
             "context_left_out": left_out,
@@ -715,6 +771,7 @@ class _Job:
         attempt.files.append(entry)
         retries = 0
         candidate: str | None = None
+        switched = False
         try:
             while True:
                 response = self._call_llm(
@@ -751,23 +808,7 @@ class _Job:
                     entry["error"] = _PARSE_ERRORS[parsed.outcome]
                     break
                 candidate = as_file(parsed.body, original)
-                result = check_candidate(
-                    path,
-                    original,
-                    candidate,
-                    required=required,
-                    read_module=self._working_copy_reader(path, candidate),
-                    library_modules=self.migration.api_modules,
-                    known_imports=self.known_imports,
-                    mock_responses=self.migration.mock_responses,
-                    module_roots=module_roots(
-                        path, self.baseline.import_paths if self.baseline else ()
-                    ),
-                    python_modules=self.wf_python_modules,
-                    test_files=self.wf_test_files,
-                    findings=[f for f in self.findings if f.file == path],
-                    rewrite_checks=self.rewrite_checks,
-                )
+                result = self._check(path, original, candidate, required=required)
                 reply["checks"] = result.checks
                 reply["auto_imports"] = result.auto_imports
                 reply["reverted"] = result.reverted
@@ -800,18 +841,406 @@ class _Job:
                         continue
                     entry["error"] = error
                     break
-                (self.work / path).write_bytes(candidate.encode("utf-8"))
-                entry["auto_imports"] = result.auto_imports
-                entry["reverted"] = result.reverted
-                entry["accepted"] = True
-                entry["changed"] = candidate != original
+                self._accept(entry, path, original, result)
                 break
+        except _Abort as abort:
+            entry["error"] = f"{abort.code}: {abort}"
+            if not self._switch_to_regions(path, abort):
+                raise _Abort(abort.code, f"{abort} (request for {path})") from abort
+            entry["switched_to_regions"] = True
+            switched = True
+        finally:
+            entry["messages"] = [_message_dict(m) for m in sent]
+        if switched:
+            return self._region_request(attempt, path)
+        return entry, candidate
+
+    def _accept(self, entry: dict[str, Any], path: str, original: str, result: CheckResult) -> None:
+        """Write a candidate that passed the checks (with apifix's imports and reverts)."""
+        (self.work / path).write_bytes(result.text.encode("utf-8"))
+        entry["auto_imports"] = result.auto_imports
+        entry["reverted"] = result.reverted
+        entry["accepted"] = True
+        entry["changed"] = result.text != original
+
+    def _check(self, path: str, original: str, candidate: str, *, required: bool) -> CheckResult:
+        """check_candidate with the job's settings."""
+        return check_candidate(
+            path,
+            original,
+            candidate,
+            required=required,
+            read_module=self._working_copy_reader(path, candidate),
+            library_modules=self.migration.api_modules,
+            known_imports=self.known_imports,
+            mock_responses=self.migration.mock_responses,
+            module_roots=module_roots(path, self.baseline.import_paths if self.baseline else ()),
+            python_modules=self.wf_python_modules,
+            test_files=self.wf_test_files,
+            findings=[f for f in self.findings if f.file == path],
+            rewrite_checks=self.rewrite_checks,
+        )
+
+    def _updated_context(self, path: str) -> list[tuple[str, str]]:
+        """The files a request for `path` may show as read-only context, as they are now:
+        those changed in the working copy (context_candidates)."""
+        return [
+            (p, self._read(self.work, p))
+            for p in context_candidates(path, self.wf_files, self.repo)
+            if self._read(self.work, p) != self._read(self.repo, p)
+        ]
+
+    # --- region edits -----------------------------------------------------------------------
+
+    def _plan_regions(self) -> None:
+        """Region plans for the Python files to send (from their open findings); files over
+        the size limit that cannot be sent as regions either move to the skipped files."""
+        limit = self.config.whole_file_max_bytes
+        kept = []
+        for path in self.wf_files:
+            original = self._read(self.repo, path)
+            if path.endswith(".py") and not is_dependency_file(path):
+                lines = [
+                    n
+                    for f in self.open_findings
+                    if f.file == path
+                    for n in range(f.line, max(f.line, f.end_line) + 1)
+                ]
+                plan = find_regions(original, lines)
+                if plan is not None and plan.regions:
+                    self.wf_plans[path] = plan
+            size = len(original.encode("utf-8"))
+            problem = self._oversized(path, original, size) if size > limit else None
+            if problem:
+                self.wf_skipped.append({"path": path, "bytes": size, "reason": problem})
+            else:
+                kept.append(path)
+        self.wf_files = kept
+
+    def _oversized(self, path: str, original: str, size: int) -> str | None:
+        """Why a file over the size limit cannot be sent as regions, or None if it can."""
+        limit = self.config.whole_file_max_bytes
+        reason = f"over the size limit ({size:,} > {limit:,} bytes)"
+        plan = self.wf_plans.get(path)
+        if plan is None:
+            return f"{reason}; no regions to send instead"
+        imports = len(region_text(original, plan.imports).encode("utf-8"))
+        for r in plan.regions:
+            n = len(region_text(original, r).encode("utf-8"))
+            if n + imports > limit:
+                return f"{reason}, and so is region {r.id} ({r.describe()}, {n:,} bytes)"
+        return None
+
+    def _form(self, path: str) -> tuple[str, str]:
+        """(form, reason) of a file: chosen when it is first sent, kept for the job (a refused
+        whole file switches to regions)."""
+        if path not in self.wf_form:
+            self.wf_form[path] = self._choose_form(path)
+        return self.wf_form[path]
+
+    def _choose_form(self, path: str) -> tuple[str, str]:
+        plan = self.wf_plans.get(path)
+        if plan is None:
+            return "whole", "no_regions"
+        if self.config.file_edits != "auto":
+            return self.config.file_edits, "forced"
+        original = self._read(self.repo, path)
+        size = len(original.encode("utf-8"))
+        if size > self.config.whole_file_max_bytes:
+            return "regions", "size"
+        if size > self.config.region_threshold_bytes:
+            if coverage(original, plan) >= REGION_COVERAGE_MAX:
+                return "whole", "coverage"
+            return "regions", "size"
+        return "whole", "small"
+
+    def _switch_to_regions(self, path: str, abort: _Abort) -> bool:
+        """A whole file the server refused for its per-minute limit, which fewer reply tokens
+        could not fix, is sent as regions instead (auto only, once)."""
+        if abort.limit is None or self.config.file_edits != "auto" or path not in self.wf_plans:
+            return False
+        if self._form(path)[0] != "whole":
+            return False
+        self.wf_form[path] = ("regions", "refused")
+        return True
+
+    def _batches(self, original: str, plan: RegionPlan) -> list[list[str]]:
+        """The regions in requests of at most the size limit (with the import block), in
+        file order."""
+        budget = self.config.whole_file_max_bytes - len(
+            region_text(original, plan.imports).encode("utf-8")
+        )
+        batches: list[list[str]] = []
+        current: list[str] = []
+        used = 0
+        for r in plan.regions:
+            n = len(region_text(original, r).encode("utf-8"))
+            if current and used + n > budget:
+                batches.append(current)
+                current, used = [], 0
+            current.append(r.id)
+            used += n
+        if current:
+            batches.append(current)
+        return batches
+
+    def _region_request(self, attempt: Attempt, path: str) -> tuple[dict[str, Any], str | None]:
+        """One region-edited file's requests (regions.py): its batches in order, each spliced
+        over the ones before and checked on the whole file (the last batch with the "changed"
+        check too); a failing check is sent back once per batch, with only the regions its
+        errors concern. Returns like _whole_file_request (the candidate: the spliced file)."""
+        original = self._read(self.repo, path)
+        plan = self.wf_plans[path]
+        required = must_change(path, self.findings)
+        entry: dict[str, Any] = {
+            "path": path,
+            "form": "regions",
+            "form_reason": self._form(path)[1],
+            "regions": [
+                {**r.to_dict(), "bytes": len(region_text(original, r).encode("utf-8"))}
+                for r in plan.regions
+            ],
+            "batches": [],
+            "bytes_sent": 0,
+            "context_files": [],
+            "context_left_out": [],
+            "previous_version_sent": path in self.wf_previous,
+            "change_required": required,
+            "max_tokens": 0,
+            "prompt_parts": {},
+            "replies": [],
+            "accepted": False,
+            "error": "",
+        }
+        attempt.files.append(entry)
+        sent: list[Message] = []
+        texts: dict[str, str] = {}
+        batches = self._batches(original, plan)
+        try:
+            for number, ids in enumerate(batches, 1):
+                outcome = self._region_batch(
+                    attempt, entry, path, plan, ids, texts, number, len(batches), sent
+                )
+                if outcome.whole is not None:  # the model returned the whole file instead
+                    self.wf_region_texts.pop(path, None)
+                    self._accept(entry, path, original, outcome.whole)
+                    return entry, outcome.whole.text
+                if outcome.error:
+                    entry["error"] = outcome.error
+                    self.wf_region_previous[path] = outcome.rejected
+                    return entry, outcome.candidate
+                texts = outcome.texts
+                if number == len(batches):
+                    assert outcome.result is not None
+                    self.wf_region_texts[path] = texts
+                    self._accept(entry, path, original, outcome.result)
+            changed = regions_diff(path, original, plan, texts, texts)
+            for r in entry["regions"]:
+                r["returned"] = r["id"] in texts
+                r["changed"] = f"b/{path} {r['id']}\n" in changed
+            return entry, self._read(self.work, path)
         except _Abort as abort:
             entry["error"] = f"{abort.code}: {abort}"
             raise _Abort(abort.code, f"{abort} (request for {path})") from abort
         finally:
             entry["messages"] = [_message_dict(m) for m in sent]
-        return entry, candidate
+
+    def _first_note(self, path: str, original: str, plan: RegionPlan, ids: Sequence[str]) -> str:
+        """The previous-version note of a region request that follows a failed one."""
+        if path not in self.wf_previous:
+            return ""
+        text, reason = self.wf_previous[path]
+        texts = self.wf_region_previous.get(path)
+        if texts is None and text is not None:  # the last version was a whole file
+            return previous_version_note(path, original, text, reason)
+        return region_previous_note(path, original, plan, texts, ids, reason)
+
+    def _region_batch(
+        self,
+        attempt: Attempt,
+        entry: dict[str, Any],
+        path: str,
+        plan: RegionPlan,
+        ids: list[str],
+        texts: dict[str, str],
+        number: int,
+        count: int,
+        sent: list[Message],
+    ) -> _BatchOutcome:
+        original = self._read(self.repo, path)
+        last = number == count
+        required = must_change(path, self.findings)
+        names = names_context(original, plan, ids)
+        outline_text = outline(original, plan)
+        guide = self._extra_guide(path)
+        imports_bytes = len(region_text(original, plan.imports).encode("utf-8"))
+        own_bytes = imports_bytes + sum(
+            len(region_text(original, plan.get(i)).encode("utf-8")) for i in ids
+        )
+        context, left_out = select_context(
+            self._updated_context(path), own_bytes, self.config.whole_file_max_bytes
+        )
+
+        def budget(send: Sequence[str]) -> tuple[int, int]:
+            shown = [texts.get(IMPORTS, region_text(original, plan.imports))]
+            shown += [region_text(original, plan.get(i)) for i in send if i != IMPORTS]
+            tokens = file_tokens("".join(shown))
+            return tokens, reply_budget(tokens, self.config.max_output_tokens)
+
+        def request(
+            send: Sequence[str], previous: str, kept: str, imports_text: str | None
+        ) -> tuple[Message, dict[str, int]]:
+            built = region_prompt(
+                path,
+                original,
+                plan,
+                send,
+                self.findings,
+                summary=self.migration.summary,
+                imports_text=imports_text,
+                names=names,
+                outline_text=outline_text,
+                context=context,
+                required=required,
+                feedback=self.wf_feedback,
+                previous=previous,
+                kept=kept,
+                guide=guide,
+            )
+            parts = {
+                "rules": len(self.system) - len(self.wf_guide),
+                "guide": len(self.wf_guide),
+                **built.parts,
+            }
+            return Message("user", text=built.text), parts
+
+        earlier = [i for i in texts if i != IMPORTS and i not in ids]
+        kept = regions_diff(path, original, plan, texts, earlier, limit=KEPT_DIFF_CHARS)
+        send: list[str] = list(ids)
+        tokens, max_tokens = budget(send)
+        first, parts = request(
+            send, self._first_note(path, original, plan, ids), kept, texts.get(IMPORTS)
+        )
+        entry["batches"].append(
+            {"number": number, "ids": list(ids), "max_tokens": max_tokens, "prompt_parts": parts}
+        )
+        entry["bytes_sent"] += own_bytes
+        entry["context_files"] = list(
+            dict.fromkeys([*entry["context_files"], *(p for p, _ in context)])
+        )
+        entry["context_left_out"] = list(dict.fromkeys([*entry["context_left_out"], *left_out]))
+        if number == 1:
+            entry["max_tokens"], entry["prompt_parts"] = max_tokens, parts
+        messages = [first]
+        sent.append(first)
+        retries = 0
+        base = dict(texts)
+        while True:
+            response = self._call_llm(attempt, messages, max_tokens=max_tokens, need_tokens=tokens)
+            sent.append(messages[-1])
+            if response.stop_reason == "refusal":
+                raise _Abort("refusal", f"the model declined the request ({response.refusal})")
+            parsed = parse_region_blocks(
+                response.text,
+                send,
+                original=original,
+                truncated=response.stop_reason == "max_tokens",
+            )
+            reply: dict[str, Any] = {
+                "response": len(attempt.responses) - 1,
+                "parse": parsed.outcome,
+                "batch": number,
+            }
+            if parsed.labels:
+                reply["labels"] = parsed.labels
+            entry["replies"].append(reply)
+            problem = parsed.problem
+            if parsed.outcome == "whole":
+                whole = self._check(
+                    path, original, as_file(parsed.body, original), required=required
+                )
+                reply["form_returned"] = "whole"
+                reply["checks"] = whole.checks
+                if whole.ok:
+                    return _BatchOutcome(whole=whole)
+                problem = (
+                    "You returned the whole file, and it failed apifix's checks ("
+                    f"{join_errors(whole.errors)}). Return only the regions."
+                )
+            if parsed.outcome in ("no_block", "labels", "whole"):
+                if self._nudges(attempt, "code_block") < self.config.max_code_block_nudges:
+                    nudge = labels_nudge(send, problem)
+                    attempt.nudges.append(
+                        {
+                            "kind": "code_block",
+                            "file": path,
+                            "outcome": parsed.outcome,
+                            "response": reply["response"],
+                            "message": nudge,
+                        }
+                    )
+                    messages.append(Message("user", text=nudge))
+                    sent.append(messages[-1])
+                    continue
+                error = _REGION_PARSE_ERRORS[parsed.outcome]
+                return _BatchOutcome(error=f"{error}: {problem}" if problem else error)
+            if parsed.outcome == "truncated":
+                return _BatchOutcome(error=_REGION_PARSE_ERRORS["truncated"])
+            applied = apply_blocks(original, plan, parsed.blocks, base)
+            result: CheckResult | None = None
+            errors = applied.errors
+            if not errors:
+                result = self._check(path, original, applied.text, required=required and last)
+                reply["checks"] = result.checks
+                reply["auto_imports"] = result.auto_imports
+                reply["reverted"] = result.reverted
+                errors = result.errors
+            if not errors:
+                return _BatchOutcome(texts=applied.texts, result=result)
+            rejected = {**parsed.blocks, **applied.texts}  # checked texts where they passed
+            attributed = attribute_errors(
+                errors,
+                plan,
+                applied.spliced,
+                result.text if result else "",
+                rejected,
+                fallback=[i for i in send if i != IMPORTS] or plan.ids,
+            )
+            shown = [e for e, _ in attributed]
+            error = join_errors(shown)
+            affected = ordered_ids(plan, [i for _, where in attributed for i in where])
+            reply["attributed"] = [{"error": e, "regions": where} for e, where in attributed]
+            history = self.wf_error_history.setdefault(path, [])
+            current = {error_key(e) for e in shown}
+            keep_fixed = [k for k in history if k not in current]
+            history += [k for k in dict.fromkeys(map(error_key, shown)) if k not in history]
+            if retries >= self.config.max_check_retries_per_file:
+                return _BatchOutcome(error=error, candidate=applied.text or None, rejected=rejected)
+            retries += 1
+            note = region_previous_note(path, original, plan, rejected, affected, error, keep_fixed)
+            others = [i for i in rejected if i not in affected and i != IMPORTS]
+            kept = regions_diff(path, original, plan, rejected, others, limit=KEPT_DIFF_CHARS)
+            base = dict(applied.texts)
+            for i in affected:
+                base.pop(i, None)
+            send = affected
+            tokens, max_tokens = budget(send)
+            retry, retry_parts = request(send, note, kept, rejected.get(IMPORTS))
+            attempt.nudges.append(
+                {
+                    "kind": "check_retry",
+                    "file": path,
+                    "error": error,
+                    "keep_fixed": keep_fixed,
+                    "response": reply["response"],
+                    "message": note,
+                    "prompt_parts": retry_parts,
+                    "regions_resent": list(send),
+                    "attributed": reply["attributed"],
+                }
+            )
+            messages = [retry]
+            sent.append(retry)
 
     def _extra_guide(self, path: str) -> str:
         """Guide parts a file's request needs that the job's system prompt left out (a
@@ -879,9 +1308,13 @@ class _Job:
         self._set_pins()
         if self.whole_file:
             selection = select_files(
-                self.repo, self.open_findings, self.config.whole_file_max_bytes
+                self.repo,
+                self.open_findings,
+                self.config.whole_file_max_bytes,
+                regions=self.config.file_edits != "whole",
             )
             self.wf_files, self.wf_skipped = selection.files, selection.skipped
+            self._plan_regions()
             self.wf_pending = list(self.wf_files)
             deps = sorted(p for p in (*self.wf_pinned, *self.wf_files) if is_dependency_file(p))
             self.wf_all = deps + [p for p in self.wf_files if not is_dependency_file(p)]
@@ -1148,6 +1581,27 @@ def _install_reads(path: str, run: SandboxResult) -> bool:
     return any(s == path or s.startswith(f"{path} ") for s in sources)
 
 
+@dataclass
+class _BatchOutcome:
+    """How one batch of a region-edited file ended: its regions' texts and the checked file
+    (passed), the whole file the model returned instead (passed its checks), or an error with
+    the rejected spliced file and region texts."""
+
+    texts: dict[str, str] = field(default_factory=dict)
+    result: CheckResult | None = None
+    whole: CheckResult | None = None
+    error: str = ""
+    candidate: str | None = None
+    rejected: dict[str, str] | None = None
+
+
+_REGION_PARSE_ERRORS = {
+    "no_block": "the reply had no complete code block",
+    "labels": "the reply's code blocks did not match the regions",
+    "whole": "the reply was the whole file, and it failed the checks",
+    "truncated": "the reply hit the output limit before the regions were complete",
+}
+
 _PARSE_ERRORS = {
     "no_block": "the reply had no complete code block",
     "several_blocks": "the reply had several code blocks",
@@ -1211,6 +1665,37 @@ def _install_retries(job: _Job) -> list[str]:
         if v is not None and (v.fixed.install_retried or (v.rerun and v.rerun.install_retried)):
             found.append(f"attempt {a.number}")
     return found
+
+
+def region_edit_lines(job: _Job) -> list[str]:
+    """One report line per file sent as regions: why, which regions, how much of the file."""
+    out, seen = [], set()
+    config = job.config
+    for a in job.attempts:
+        for f in a.files:
+            path = f["path"]
+            if f.get("form") != "regions" or path in seen:
+                continue
+            seen.add(path)
+            original = job._read(job.repo, path)
+            size = len(original.encode("utf-8"))
+            why = {
+                "size": f"over the {config.whole_file_max_bytes:,}-byte size limit"
+                if size > config.whole_file_max_bytes
+                else f"over {config.region_threshold_bytes:,}",
+                "refused": "the server refused it as a whole file",
+                "forced": "--file-edits regions",
+            }.get(f["form_reason"], f["form_reason"])
+            listed = ", ".join(
+                f"{r['id']} {r['name'] or 'statement'} (lines {r['lines'][0]}-{r['lines'][1]})"
+                for r in f["regions"]
+            )
+            share = round(100 * coverage(original, job.wf_plans[path]))
+            out.append(
+                f"- Region edits: `{path}` ({size:,} bytes, {why}): {listed}; {share}% of the "
+                "file sent"
+            )
+    return out
 
 
 def report_markdown(
@@ -1303,6 +1788,7 @@ def report_markdown(
                         f"- apifix reverted: {f['path']}:{r['fixed_line']} ({revert_text(r)}; "
                         f"attempt {a.number})"
                     )
+        lines += region_edit_lines(job)
         if job.guide_sections is not None:
             lines.append(f"- Guide sections sent: {', '.join(job.guide_sections)}")
         lines += [f"- Not sent: `{f['path']}` ({f['reason']})" for f in job.wf_skipped]

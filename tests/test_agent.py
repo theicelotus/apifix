@@ -1407,12 +1407,12 @@ def test_agent_mode_records_response_timing_too(repo):
     assert "(2 responses); sandbox" in result.report_markdown
 
 
-def test_files_over_the_size_limit_are_not_sent(repo):
+def test_files_over_the_size_limit_are_not_sent_whole(repo):
     padded = TESTS_OLD + "# padding\n" * 3000
     (repo / "tests" / "test_app.py").write_text(padded)
     size = len(padded.encode())
     llm = FakeLLM([block(APP_NEW)])
-    result = wf(repo, llm, max_retries=0)
+    result = wf(repo, llm, max_retries=0, file_edits="whole")  # auto sends it as regions
     assert first_lines(llm) == ["Migrate this file: app.py"]
     assert all("test_app" not in r[0].text for r in llm.requests)
     skipped = {
@@ -1962,7 +1962,7 @@ def test_todays_refusals_fit_with_the_new_margin(requested, max_tokens, recounte
 def test_request_that_cannot_fit_stops_the_job(repo):
     need = -(-len(APP_OLD) // 3)
     llm = FakeLLM([too_large(1000, 990 + budget(APP_OLD))])
-    result = wf(repo, llm)
+    result = wf(repo, llm, file_edits="whole")  # auto sends a refused file as regions
     assert result.outcome == "aborted"
     assert result.reason.startswith("provider_error: HTTP 413 from x")
     assert "The prompt alone is ~990 tokens; lowering max_tokens to fit would leave no reply" in (
@@ -1985,7 +1985,7 @@ def test_request_that_cannot_fit_stops_the_job(repo):
 def test_a_second_refusal_stops_the_job(repo):
     first = budget(APP_OLD)
     llm = FakeLLM([too_large(3000, 2000 + first), too_large(3000, 3100)])
-    result = wf(repo, llm)
+    result = wf(repo, llm, file_edits="whole")
     assert result.outcome == "aborted"
     assert f"(already sent again with max_tokens lowered from {first:,} to 744)" in result.reason
 

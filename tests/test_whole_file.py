@@ -9,7 +9,7 @@ import pytest
 from apifix.engine.code_checks import STDLIB_IMPORTS, import_table
 from apifix.engine.migrations import get_migration
 from apifix.engine.models import Finding
-from apifix.engine.regions import MIN_LINES_FOR_LENGTH_CHECK
+from apifix.engine.regions import IMPORTS, MIN_LINES_FOR_LENGTH_CHECK, find_regions
 from apifix.engine.verifier import feedback_lines
 from apifix.engine.whole_file import (
     PREVIOUS_DIFF_CHARS,
@@ -25,6 +25,8 @@ from apifix.engine.whole_file import (
     must_change,
     parse_code_block,
     previous_version_note,
+    region_previous_note,
+    region_prompt,
     reply_budget,
     select_context,
     select_files,
@@ -631,3 +633,91 @@ def test_reply_budget_is_twice_the_file_plus_a_margin_and_capped():
     assert reply_budget(9000, 16_000) == 16_000
     # the the hosted provider run: a 4,229-byte app.py took 3,298 reply tokens with gpt-oss-120b
     assert reply_budget(file_tokens("x" * 4229), 16_000) > 3298
+
+
+# --- region requests --------------------------------------------------------------------------
+
+
+BIG = (
+    "import openai\n\n\ndef helper():\n    return 1\n\n\n"
+    "def ask():\n    return openai.ChatCompletion.create(model='m', n=helper())\n"
+)
+
+
+def test_region_prompt_layout_and_parts():
+    plan = find_regions(BIG, [9])
+    request = region_prompt(
+        "app.py",
+        BIG,
+        plan,
+        ["R1"],
+        [finding(line=9), finding(file="other.py", line=9), finding(line=4)],
+        summary="0.x -> 1.x",
+        names="# line 4\ndef helper():  # body not shown",
+        outline_text="4-5 def helper\n8-9 def ask  [R1]",
+        feedback="The verifier did not accept attempt 1.",
+        previous="Your previous version of R1 was rejected: x.",
+        kept="--- a/app.py R0\n",
+    )
+    text = request.text
+    assert text.startswith("The verifier did not accept attempt 1.\n\nMigrate this file: app.py")
+    assert text.count("\n- ") == 1 and "- 9: api_call [certain]" in text  # only R1's findings
+    order = [
+        "Scanner findings in the regions below",
+        "Edit only these regions of app.py",
+        "Imports (IMPORTS, original lines 1-1; return it only if you change it):",
+        "Region R1: def ask (original lines 8-9)",
+        "Defined elsewhere in app.py (read-only; do not return):",
+        "Outline of app.py (read-only):",
+        "Your previous version of R1 was rejected",
+        "Your other changes to app.py, kept as they are (read-only):",
+        "Return the region (R1)",
+    ]
+    positions = [text.index(part) for part in order]
+    assert positions == sorted(positions)
+    assert "def helper():\n    return 1" not in text
+    parts = request.parts
+    assert parts["regions"] == len(
+        "def ask():\n    return openai.ChatCompletion.create(model='m', n=helper())\n"
+    )
+    assert parts["imports"] == len("import openai\n")
+    assert sum(parts.values()) == len(text)
+
+
+def test_region_prompt_with_required_imports_and_not_required():
+    plan = find_regions(BIG, [9])
+    text = region_prompt(
+        "app.py",
+        BIG,
+        plan,
+        [IMPORTS, "R1"],
+        [],
+        summary="s",
+        imports_text="import os\n",
+        required=False,
+    ).text
+    assert "Imports (IMPORTS, original lines 1-1):\n```python IMPORTS\nimport os\n```" in text
+    assert text.endswith("If a region needs no change, return it unchanged.")
+
+
+def test_region_previous_note_forms():
+    plan = find_regions(BIG, [9])
+    texts = {"R1": "def ask():\n    return client.chat.completions.create(model='m', n=helper())"}
+    note = region_previous_note("app.py", BIG, plan, texts, ["R1"], "R1: bad", ["old problem"])
+    assert note.startswith("Your previous version of R1 was rejected: R1: bad. Its changes from")
+    assert "```diff\n--- a/app.py R1\n+++ b/app.py R1\n@@ -8,2 +8,2 @@" in note
+    assert note.endswith(
+        "Keep these fixed (problems in your earlier replies for this file):\n- old problem"
+    )
+    same = {"R1": "def ask():\n    return openai.ChatCompletion.create(model='m', n=helper())"}
+    assert region_previous_note("app.py", BIG, plan, same, ["R1"], "").startswith(
+        "Your previous version of R1 was identical to the original and did not pass"
+    )
+    assert region_previous_note("app.py", BIG, plan, None, ["R1"], "no block") == (
+        "Your previous reply for app.py (R1) was rejected: no block."
+    )
+
+
+def test_error_key_drops_region_prefixes():
+    assert error_key("R1, line 3 of your block: 'x' is used") == "'x' is used"
+    assert error_key("IMPORTS: only imports") == "only imports"

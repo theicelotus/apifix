@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import difflib
 import io
 import re
 import tokenize
@@ -519,15 +520,17 @@ def outline(original: str, plan: RegionPlan) -> str:
 # --- the request's region section -------------------------------------------------------------
 
 
-def render_block(region: Region, text: str, fence: str) -> str:
-    """A region as the request shows it: a heading and a fenced block labelled with its id."""
+def render_block(region: Region, text: str, fence: str, *, required: bool = False) -> str:
+    """A region as the request shows it: a heading and a fenced block labelled with its id.
+    The import block is optional unless `required` (a check retry that concerns it)."""
     if region.kind == "imports":
         where = (
             f"original lines {region.start}-{region.end}"
             if region.lines > 0
             else "the file has none yet"
         )
-        head = f"Imports ({IMPORTS}, {where}; return it only if you change it):"
+        optional = "" if required else "; return it only if you change it"
+        head = f"Imports ({IMPORTS}, {where}{optional}):"
     else:
         head = f"Region {region.id}: {region.describe()}"
     body = text.rstrip("\n")
@@ -535,13 +538,22 @@ def render_block(region: Region, text: str, fence: str) -> str:
 
 
 def region_instruction(ids: Sequence[str], fence: str = "```") -> str:
+    """What to return: every id in `ids` (IMPORTS among them only when it is required)."""
+    regions = [i for i in ids if i != IMPORTS]
     listed = ", ".join(ids)
+    example = regions[0] if regions else IMPORTS
+    text = (
+        f"Return {'every region' if len(ids) > 1 else 'the region'} ({listed}), each complete "
+        f"from its first line (decorators included) to its last, in its own fenced code block "
+        f"with its label after the language ({fence}python {example})."
+    )
+    if IMPORTS not in ids:
+        text += f" Return {IMPORTS} only if you change it;"
+    else:
+        text += f" In {IMPORTS}"
     return (
-        f"Return every region ({listed}), each complete from its first line (decorators "
-        f"included) to its last, in its own fenced code block with its label after the "
-        f"language ({fence}python {ids[0] if ids else 'R1'}). Return {IMPORTS} only if you "
-        f"change it; you may add imports, module-level assignments and module-level functions "
-        f"the migration needs there. Do not return the rest of the file."
+        text + " you may add imports, module-level assignments and module-level functions the "
+        "migration needs there. Do not return the rest of the file."
     )
 
 
@@ -885,3 +897,124 @@ def apply_blocks(
         where = f"{rid}, line {k} of your block" if rid else f"line {exc.lineno}"
         return SpliceResult(texts=texts, errors=[f"{where}: SyntaxError after splicing: {exc.msg}"])
     return SpliceResult(spliced.text, texts, [], spliced)
+
+
+# --- after the checks: which regions an error concerns ----------------------------------------
+
+_REGION_PREFIX = re.compile(r"^(R\d+|IMPORTS)(?:, line \d+ of your block)?: ")
+_ORIGINAL_LINE = re.compile(r"^(after |before )?original line (\d+): ")
+_CANDIDATE_LINE = re.compile(r"^line (\d+): ")
+_TARGET = re.compile(r"mock target '([^']+)'|patch\(\"([^\"]+)\"\) does not affect")
+
+
+def map_line(before: str, after: str, line: int) -> int:
+    """The line of `before` that line `line` of `after` comes from (an inserted line: the
+    line before the insertion, at least 1)."""
+    a, b = split_lines(before), split_lines(after)
+    matcher = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if j1 <= line - 1 < j2:
+            if tag == "equal" or tag == "replace":
+                return min(i1 + (line - 1 - j1), max(i2 - 1, i1)) + 1
+            return max(i1, 1)
+    return max(min(line, len(a)), 1)
+
+
+def attribute_errors(
+    errors: Sequence[str],
+    plan: RegionPlan,
+    spliced: Spliced | None,
+    checked: str,
+    texts: Mapping[str, str],
+    fallback: Sequence[str],
+) -> list[tuple[str, list[str]]]:
+    """Each check error with the regions it concerns, rewritten where it names a line of the
+    checked file ("line N: ..." becomes "R1, line K of your block: ..."). `spliced`: the
+    splice the checked file (`checked`: it plus apifix's auto-imports and reverts) came from;
+    `texts`: the regions' texts; `fallback`: the regions of errors that name no place."""
+    out: list[tuple[str, list[str]]] = []
+    for error in errors:
+        m = _REGION_PREFIX.match(error)
+        if m:
+            out.append((error, [m.group(1)]))
+            continue
+        m = _ORIGINAL_LINE.match(error)
+        if m:
+            n = int(m.group(2))
+            held = plan.holding(n) or (plan.holding(n + 1) if m.group(1) == "after " else None)
+            out.append((error, [(held or plan.nearest(n)).id]))
+            continue
+        m = _CANDIDATE_LINE.match(error)
+        if m and spliced is not None:
+            rid, k = spliced.locate(map_line(spliced.text, checked, int(m.group(1))))
+            if rid:
+                out.append((f"{rid}, line {k} of your block: {error[m.end() :]}", [rid]))
+            else:
+                out.append((error, [plan.nearest(k).id]))
+            continue
+        m = _TARGET.search(error)
+        if m:
+            target = m.group(1) or m.group(2)
+            hits = [
+                r.id
+                for r in plan.all()
+                if f'"{target}"' in texts.get(r.id, "") or f"'{target}'" in texts.get(r.id, "")
+            ]
+            if hits:
+                out.append((error, hits))
+                continue
+        out.append((error, list(fallback)))
+    return out
+
+
+def ordered_ids(plan: RegionPlan, ids: Iterable[str]) -> list[str]:
+    """`ids` in file order, once each."""
+    wanted = set(ids)
+    return [r.id for r in plan.all() if r.id in wanted]
+
+
+_HUNK = re.compile(r"^@@ -(\d+)(,\d+)? \+(\d+)(,\d+)? @@", re.MULTILINE)
+
+
+def regions_diff(
+    path: str,
+    original: str,
+    plan: RegionPlan,
+    texts: Mapping[str, str],
+    ids: Iterable[str],
+    *,
+    context: int = 1,
+    limit: int | None = None,
+) -> str:
+    """A unified diff of each region in `ids` that `texts` changes, against its original
+    lines (hunk headers in the original file's line numbers), at most `limit` characters."""
+    parts = []
+    for rid in ordered_ids(plan, ids):
+        if rid not in texts:
+            continue
+        region = plan.get(rid)
+        old = region_text(original, region)
+        new = texts[rid].replace("\r\n", "\n")
+        new = new + "\n" if new and not new.endswith("\n") else new
+        if old.replace("\r\n", "\n") == new:
+            continue
+        diff = "".join(
+            difflib.unified_diff(
+                old.replace("\r\n", "\n").splitlines(keepends=True),
+                new.splitlines(keepends=True),
+                f"a/{path} {rid}",
+                f"b/{path} {rid}",
+                n=context,
+            )
+        )
+        offset = max(region.start - 1, 0)
+
+        def shift(m: re.Match[str], offset: int = offset) -> str:
+            a, b = int(m.group(1)) + offset, int(m.group(3)) + offset
+            return f"@@ -{a}{m.group(2) or ''} +{b}{m.group(4) or ''} @@"
+
+        parts.append(_HUNK.sub(shift, diff))
+    text = "".join(parts)
+    if limit is not None and len(text) > limit:
+        text = text[:limit].rsplit("\n", 1)[0] + "\n... (diff truncated)"
+    return text

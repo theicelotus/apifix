@@ -3,6 +3,7 @@
 apifix scan <path> --migration openai-v1 [--json]
 apifix fix <path> --migration openai-v1 [--model M] [--max-cost USD] [--out DIR]
     [--edit-mode agent|whole-file] [--max-file-bytes N]
+    [--file-edits auto|whole|regions] [--region-threshold BYTES]
 apifix fix <path> --migration openai-v1 --provider openai-compat --model M [--base-url URL]
     [--strict-tool-calls] [--api-key-env NAME] [--request-timeout S] [--max-output-tokens N]
 apifix verify <path> --migration openai-v1 --diff FILE [--out DIR]
@@ -95,6 +96,20 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         help="whole-file: byte budget for one file plus its read-only context; larger files "
         "are not sent (default 24000)",
+    )
+    p_fix.add_argument(
+        "--file-edits",
+        choices=["auto", "whole", "regions"],
+        help="whole-file: send each Python file whole or only the regions that need changing "
+        "(top-level functions, methods, statements with findings, plus the imports); auto "
+        "(default) sends files over --region-threshold as regions",
+    )
+    p_fix.add_argument(
+        "--region-threshold",
+        type=int,
+        metavar="BYTES",
+        help="whole-file, --file-edits auto: Python files over this size are sent as regions "
+        "(default 8000)",
     )
     p_fix.add_argument(
         "--strict-tool-calls",
@@ -236,6 +251,16 @@ def _fix(args: argparse.Namespace) -> int:
     if args.max_file_bytes is not None and args.max_file_bytes <= 0:
         print("apifix: --max-file-bytes must be positive", file=sys.stderr)
         return EXIT_USAGE
+    for flag, value in (
+        ("--file-edits", args.file_edits),
+        ("--region-threshold", args.region_threshold),
+    ):
+        if value is not None and args.edit_mode != "whole-file":
+            print(f"apifix: {flag} only applies to --edit-mode whole-file", file=sys.stderr)
+            return EXIT_USAGE
+    if args.region_threshold is not None and args.region_threshold <= 0:
+        print("apifix: --region-threshold must be positive", file=sys.stderr)
+        return EXIT_USAGE
     if args.request_timeout is not None and args.request_timeout <= 0:
         print("apifix: --request-timeout must be positive", file=sys.stderr)
         return EXIT_USAGE
@@ -264,6 +289,8 @@ def _fix(args: argparse.Namespace) -> int:
             for key, value in (
                 ("whole_file_max_bytes", args.max_file_bytes),
                 ("max_output_tokens", args.max_output_tokens),
+                ("file_edits", args.file_edits),
+                ("region_threshold_bytes", args.region_threshold),
             )
             if value is not None
         }

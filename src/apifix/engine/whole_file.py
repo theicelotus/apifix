@@ -29,14 +29,27 @@ from apifix.engine.migrations import Migration
 from apifix.engine.models import CERTAIN, Finding
 from apifix.engine.project import is_test_file
 from apifix.engine.regions import (
+    IMPORTS,
+    RegionPlan,
     fenced_blocks,
+    ordered_ids,
     placeholder_problem,
+    region_instruction,
+    region_text,
+    regions_diff,
+    render_block,
     too_short,
 )
 from apifix.engine.unrelated import Revert, relocate, revert_text_edits, unrelated_edits
 from apifix.engine.verifier import Verification, feedback_lines
 
 DEFAULT_MAX_BYTES = 24_000
+# Region edits (regions.py): Python files over this many bytes are sent as regions, unless the
+# regions cover REGION_COVERAGE_MAX of the file or more (then the whole file is simpler); a
+# region request shows the file's other changes as a diff of at most KEPT_DIFF_CHARS.
+DEFAULT_REGION_THRESHOLD = 8_000
+REGION_COVERAGE_MAX = 0.8
+KEPT_DIFF_CHARS = 1_500
 CODE_BLOCK_NUDGE = "Return the complete updated file in exactly one code block."
 # Retry feedback bounds: failing-test output is untrusted and can be huge.
 FEEDBACK_TESTS = 10
@@ -70,15 +83,19 @@ def _group(path: str, repo: Path) -> int:
     return 2 if is_test_file(path, root=repo) else 1
 
 
-def select_files(repo: Path, findings: list[Finding], max_bytes: int) -> FileSelection:
-    """Files with findings that can be sent; the rest with the reason they are not."""
+def select_files(
+    repo: Path, findings: list[Finding], max_bytes: int, *, regions: bool = False
+) -> FileSelection:
+    """Files with findings that can be sent; the rest with the reason they are not. With
+    `regions`, Python files over `max_bytes` are kept: they may be sent as regions (the caller
+    decides)."""
     files, skipped = [], []
     for path in sorted({f.file for f in findings}):
         data = (repo / path).read_bytes()
         reason = ""
         if not (path.endswith(".py") or is_dependency_file(path)):
             reason = "not a Python or dependency file"
-        elif len(data) > max_bytes:
+        elif len(data) > max_bytes and not (regions and path.endswith(".py")):
             reason = f"over the size limit ({len(data):,} > {max_bytes:,} bytes)"
         else:
             try:
@@ -158,9 +175,10 @@ encoded data.
 - Never delete, skip, xfail or weaken tests. Do not remove or loosen assertions, change expected \
 values, or broaden except/pytest.raises clauses. In tests, only update mock/patch targets, \
 imports and mock data to the new API.
-- Reply with the complete updated file in exactly one fenced code block. Include every line, \
-changed or not. Never abbreviate with placeholders such as "# ... rest unchanged" or a bare \
-"...". Text outside the code block is ignored.
+- Reply in the form the request asks for: the complete updated file in exactly one fenced code \
+block, or each requested region in its own labelled fenced code block. Include every line of \
+what you return, changed or not. Never abbreviate with placeholders such as \
+"# ... rest unchanged" or a bare "...". Text outside the code blocks is ignored.
 {note}
 Migration guide:
 
@@ -232,6 +250,157 @@ def file_prompt(
         instruction += " If the file needs no change, return it unchanged."
     lines.append(instruction)
     return "\n".join(lines)
+
+
+def _findings_lines(findings: Sequence[Finding]) -> list[str]:
+    out = []
+    for f in findings:
+        out += [
+            f"- {f.line}: {f.category} [{f.confidence}]",
+            f"    old: {f.old_pattern}",
+            f"    fix: {f.suggestion}",
+        ]
+    return out
+
+
+@dataclass(frozen=True)
+class RegionRequest:
+    """One region request's text, and its parts' sizes for the trajectory."""
+
+    text: str
+    parts: dict[str, int]
+
+
+def region_prompt(
+    path: str,
+    original: str,
+    plan: RegionPlan,
+    ids: Sequence[str],
+    findings: Sequence[Finding],
+    *,
+    summary: str,
+    imports_text: str | None = None,
+    names: str = "",
+    outline_text: str = "",
+    context: Sequence[tuple[str, str]] = (),
+    required: bool = True,
+    feedback: str = "",
+    previous: str = "",
+    kept: str = "",
+    guide: str = "",
+) -> RegionRequest:
+    """A region request: like file_prompt (feedback first, for a cached prefix), with the
+    regions `ids` of the original (IMPORTS among them when it must come back) and the import
+    block (`imports_text`: as the model last returned it) instead of the file, then the names
+    the regions use, the outline, the previous version (`previous`), the file's other changes
+    (`kept`, read-only) and the context files."""
+    sent = [plan.get(i) for i in ordered_ids(plan, [*ids, IMPORTS])]
+    imports = imports_text if imports_text is not None else region_text(original, plan.imports)
+    shown = {r.id: imports if r.id == IMPORTS else region_text(original, r) for r in sent}
+    fence = fence_for(*shown.values(), names, *(t for _, t in context))
+    own = [
+        f
+        for f in findings
+        if f.file == path and any(r.start <= f.line <= max(r.end, r.start) for r in sent)
+    ]
+    head = [feedback, ""] if feedback else []
+    if guide:
+        head += ["Migration guide for this file:", "", guide.rstrip(), ""]
+    head += [f"Migrate this file: {path}", f"Breaking change: {summary}", ""]
+    if own:
+        head.append("Scanner findings in the regions below (line: category [confidence]):")
+        head += _findings_lines(own)
+        head.append("")
+    head += [
+        f"Edit only these regions of {path}; the rest of the file stays as it is and is not shown.",
+        "",
+    ]
+    blocks = [
+        render_block(r, shown[r.id], fence, required=r.id == IMPORTS and IMPORTS in ids)
+        for r in sent
+    ]
+    lines = list(head)
+    for block in blocks:
+        lines += [block, ""]
+    if names:
+        lines += [f"Defined elsewhere in {path} (read-only; do not return):", f"{fence}python"]
+        lines += [names, fence, ""]
+    if outline_text:
+        lines += [f"Outline of {path} (read-only):", outline_text, ""]
+    if previous:
+        lines += [previous, ""]
+    if kept:
+        lines += [
+            f"Your other changes to {path}, kept as they are (read-only):",
+            f"{fence}diff",
+            kept.rstrip(),
+            fence,
+            "",
+        ]
+    if context:
+        lines.append(
+            "Files already updated for this migration (read-only context; do not return them):"
+        )
+        for ctx_path, ctx_text in context:
+            lines += [f"--- {ctx_path}", f"{fence}{_language(ctx_path)}", ctx_text.rstrip("\n")]
+            lines += [fence]
+        lines.append("")
+    instruction = region_instruction([i for i in ordered_ids(plan, ids)], fence)
+    if not required:
+        instruction += " If a region needs no change, return it unchanged."
+    lines.append(instruction)
+    text = "\n".join(lines)
+    parts = {
+        "feedback": len(feedback),
+        "file_guide": len(guide),
+        "regions": sum(len(shown[r.id]) for r in sent if r.id != IMPORTS),
+        "imports": len(imports),
+        "names": len(names),
+        "outline": len(outline_text),
+        "previous": len(previous),
+        "kept": len(kept),
+        "context": sum(len(t) for _, t in context),
+    }
+    parts["findings_and_instructions"] = len(text) - sum(parts.values())
+    return RegionRequest(text, parts)
+
+
+def region_previous_note(
+    path: str,
+    original: str,
+    plan: RegionPlan,
+    texts: Mapping[str, str] | None,
+    ids: Sequence[str],
+    reason: str,
+    keep_fixed: Sequence[str] = (),
+) -> str:
+    """For a region request that follows a failed one: the model's previous version of the
+    regions `ids` as a diff against their original lines, and why it failed (`reason`, or ""
+    when the verifier's feedback above says why). `texts` None: no usable reply."""
+    named = ", ".join(i for i in ordered_ids(plan, ids)) or path
+    if "\n" in reason:
+        why = f" was rejected:\n{reason}\n"
+    else:
+        why = f" was rejected: {reason}." if reason else " did not pass verification (see above)."
+    if texts is None:
+        note = f"Your previous reply for {path} ({named}){why}".rstrip()
+    else:
+        diff = regions_diff(path, original, plan, texts, ids, limit=PREVIOUS_DIFF_CHARS)
+        if not diff:
+            note = f"Your previous version of {named} was identical to the original and{why}"
+            note = note.rstrip()
+        else:
+            fence = fence_for(diff)
+            sep = "" if why.endswith("\n") else " "
+            note = (
+                f"Your previous version of {named}{why}{sep}Its changes from the original (do "
+                f"not copy them back unchanged; fix what failed):\n{fence}diff\n{diff.rstrip()}"
+                f"\n{fence}"
+            )
+    if keep_fixed:
+        note += "\nKeep these fixed (problems in your earlier replies for this file):\n"
+        note += "\n".join(f"- {k}" for k in keep_fixed)
+    return note
 
 
 def verification_feedback(
@@ -326,12 +495,16 @@ def join_errors(errors: list[str]) -> str:
     return "; ".join(errors)
 
 
-_LINE_PREFIX = re.compile(r"^(?:(?:after |before )?original line|line) \d+: ")
+_LINE_PREFIX = re.compile(
+    r"^(?:(?:R\d+|IMPORTS)(?:, line \d+ of your block)?: "
+    r"|(?:(?:after |before )?original line|line) \d+: )"
+)
 
 
 def error_key(error: str) -> str:
     """An error's identity across replies: its first line without the `line N: ` prefix
-    (also `original line N: `, `after original line N: `)."""
+    (also `original line N: `, `after original line N: `, and a region's `R1: ` or
+    `R1, line N of your block: `)."""
     return _LINE_PREFIX.sub("", error.split("\n", 1)[0])
 
 
