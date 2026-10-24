@@ -1445,7 +1445,8 @@ AUTOSPEC_PROBLEM = (
     "OpenAI.return_value.chat.completions (line 12) (and likewise in: "
     "test_suggest_passes_the_error): an autospecced 1.x client has no chat.completions "
     "(resources are cached properties), so drop autospec=True when patching the client class "
-    '(patch("assist.generate.OpenAI")), or autospec the method instead'
+    '(patch("assist.generate.OpenAI")); patching the method instead leaves the real client '
+    "being built, so the test would also need a placeholder API key"
 )
 
 

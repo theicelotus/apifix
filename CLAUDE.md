@@ -130,7 +130,9 @@ src/apifix/
                       `from openai import` never see; when the patched module gives no target,
                       the repo modules that call the library (those the test reaches first),
                       each with the target that fits how it binds the library; a client class
-                      patched with autospec=True whose instance's resources the test uses
+                      patched with autospec=True whose instance's resources the test uses;
+                      a patched resource method (`openai.resources...create`) in a test that
+                      sets no key while the code under test builds a client without api_key=
 benchmark/            real repos + scoring
 docs/plans/           approved plans, one file per step (request, plan, amendments)
 tests/                pytest; fixtures/ holds realistic sample code
@@ -653,8 +655,13 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   prefix; found anywhere in the clipped message) adds `Migration.mock_failure_hint` per distinct
   problem, at most 3 ("the test's mock client is incomplete: SimpleNamespace has no create;
   build the client mock with MagicMock() ..."); spec'd mocks (`Mock object has no attribute`)
-  keep the autospec hint only. Agent mode's feedback after a failed verification gets
-  the same hints. Dependency files get
+  keep the autospec hint only. A mock that was never called (`Called 0 times`, `Actual: not
+  called`: `verifier.UNCALLED_MOCK_MARKERS`) adds `Migration.uncalled_mock_hint` once, when a
+  non-test module of the working copy builds a client without a key in a function
+  (`code_checks.keyless_client`, the first in walk order; computed once per verification) and
+  the repo's CI does not set the key: the missing key, errors the code's own try/except may
+  swallow, both fixes with the module's client class target. Agent mode's feedback after a
+  failed verification gets the same hints. Dependency files get
   the problem list without test output, plus the tail of pip's output when the install failed.
 - The file plus its read-only context (the other files already changed in the working copy)
   share one byte budget, `whole_file_max_bytes` (24,000 by default, `--max-file-bytes`). Python
@@ -686,7 +693,10 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   they use (either side) an *openai-bound* name or a name a near code hunk binds or introduces
   (used on its candidate side, never in the original) in the same scope, and are otherwise a
   check error ("original line N: changed/removed code unrelated to the migration (...)"; "after
-  original line N: added code ..."). Attribute names alone never count (`.chat`, `.choices`:
+  original line N: added code ..."). A code hunk whose candidate side names the library's key
+  variable (a string constant `OPENAI_API_KEY`: `Migration.client_key.env`, check_candidate's
+  `env_names`) is related wherever it is (a placeholder key a test sets for the real client);
+  removing one is judged as before. Attribute names alone never count (`.chat`, `.choices`:
   other SDKs share them), nor do names bound by non-library imports (`SimpleNamespace`).
   openai-bound (`unrelated._Bound`, per version, scope-aware, flow-insensitive, to a fixed
   point): the library's module names and names imported from it; names and `self.x` assigned
@@ -833,6 +843,34 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   `patch.object(module, "OpenAI", autospec=True)`, `create_autospec(OpenAI)`, mocks passed
   on through fixtures or helpers, `autospec=<class>`. Whole-file mode only; agent mode and
   `apifix verify` see it as a regression (`Mock object has no attribute 'completions'`).
+- Patched resource method without a key (`code_checks.unkeyed_method_patch_problems`, check
+  `mock_targets`, test files; `Migration.client_key`, openai-v1: `OPENAI_API_KEY`, `api_key`,
+  clients OpenAI and AsyncOpenAI, resources under `openai.resources`): a string-target patch
+  new or changed versus the original (its call text) of `<...>.openai.resources.<path>.<Class>
+  .<method>` (any module prefix; the client path for the message from the modules and the
+  class in snake case, `chat.completions.create`), applying to a test function (decorator,
+  class decorator, `with` / `mocker.patch` in its body), while a non-test module the test file
+  reaches through imports (`context.reachable_modules`, working copy) builds one of the
+  clients inside a function with no `api_key=` and no `**kwargs` (resolved through the
+  module's imports and aliases). Rejected for each such test that gets no key: environment
+  patches (`setenv` / `putenv` / `setdefault` of the variable, `patch.dict` with it as a dict
+  key or keyword, `environ.update`, `X["OPENAI_API_KEY"] = ...`) or any call with `api_key=`
+  (not None) in the test, on its class (decorators, `setUp` / `setup_method` / ...), in a
+  fixture it uses (parameters, `usefixtures` on the test, class or module `pytestmark`,
+  autouse; nearest definition first: class, test file, conftest.py files up to the root;
+  transitively through fixtures' parameters); module-level code or `pytest_configure` /
+  `pytest_sessionstart` in the test file or those conftests; `OPENAI_API_KEY=` anywhere in
+  pyproject.toml / pytest.ini / setup.cfg / tox.ini (pytest-env, read as text). Also not:
+  a test that patches a client class too; the whole check when the repo's CI sets the key
+  (the sandbox has a placeholder). One error per target naming the module:line, the first
+  test "(and likewise in: ...)", both fixes (a placeholder key, or the client class at the
+  module's own path, `<module>.openai.OpenAI` / `<module>.OpenAI`, without autospec, with the
+  chain). It follows the rule, not the code path: a test whose code fails before the client
+  is built (genai's `test_custom_exc_error_inside`) is flagged too. Not detected: patches in
+  fixtures or at module level, `patch.object(Completions, "create")`, Azure clients, clients
+  built at module level (they fail at import, before any test), modules the test reaches
+  only without imports. Whole-file mode only; agent mode gets the uncalled-mock hint after
+  the regression instead, and `apifix verify` reports the regression.
 - A failing candidate gets its error back once (`check_retry`) as a fresh request: the file's
   request again, with the rejected candidate as a diff against the original and the error (not
   the conversation, which would carry the whole rejected file). A second failure (or a parse

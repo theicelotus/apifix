@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from apifix.engine.models import CERTAIN, LIKELY, CompanionPin, Confidence
+from apifix.engine.models import CERTAIN, LIKELY, ClientKey, CompanionPin, Confidence
 
 CLIENT = "client = openai.OpenAI()"
 ASYNC_CLIENT = "client = openai.AsyncOpenAI()"
@@ -295,6 +295,15 @@ GUIDE_SELECTORS: dict[str, tuple[tuple[frozenset[str], tuple[str, ...]], ...]] =
 # (apifix adds it; see code_checks.add_missing_imports).
 _CLIENT_CLASSES = ("OpenAI", "AsyncOpenAI", "AzureOpenAI", "AsyncAzureOpenAI")
 CLIENT_CLASSES = frozenset(_CLIENT_CLASSES)
+# The clients that read OPENAI_API_KEY when no api_key= is given, and raise OpenAIError when
+# neither is set; their resource methods live under openai.resources (Azure clients read other
+# variables and are not checked).
+CLIENT_KEY = ClientKey(
+    env="OPENAI_API_KEY",
+    keyword="api_key",
+    classes=frozenset({"OpenAI", "AsyncOpenAI"}),
+    resources="resources",
+)
 # A client's resources, cached properties of the class (openai 1.109.1): a client patched with
 # autospec=True has none of them usable (code_checks.autospec_client_problems).
 CLIENT_RESOURCES = frozenset(

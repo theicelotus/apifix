@@ -30,7 +30,12 @@ from typing import Any, Literal
 
 from apifix.engine.agent_tools import TOOLS, EditRecord, Workspace
 from apifix.engine.already_migrated import AlreadyMigrated, detect_already_migrated
-from apifix.engine.code_checks import STDLIB_IMPORTS, import_table, module_roots
+from apifix.engine.code_checks import (
+    STDLIB_IMPORTS,
+    import_table,
+    keyless_client,
+    module_roots,
+)
 from apifix.engine.context import changed_statements, library_uses, reachable_modules
 from apifix.engine.dependencies import is_dependency_file
 from apifix.engine.diffing import diff_trees, read_text, unified_diff
@@ -50,7 +55,7 @@ from apifix.engine.llm import (
     Usage,
 )
 from apifix.engine.migrations import Migration, get_migration
-from apifix.engine.models import Finding
+from apifix.engine.models import ClientKey, Finding
 from apifix.engine.pin_edits import (
     PinFallback,
     PinFile,
@@ -79,6 +84,7 @@ from apifix.engine.regions import (
 from apifix.engine.sandbox import Sandbox, SandboxResult
 from apifix.engine.scanner import scan
 from apifix.engine.verifier import (
+    UNCALLED_MOCK_MARKERS,
     Verification,
     VerifierConfig,
     downloads_line,
@@ -428,6 +434,9 @@ class _Job:
         self.wf_skipped: list[dict[str, object]] = []
         self.wf_pending: list[str] = []
         self.wf_verification: tuple[int, Verification] | None = None  # the last rejection
+        # per verification (by id): its failure hints, with the uncalled-mock hint when the
+        # working copy builds a client without a key (_failure_hints)
+        self.hints_for: dict[int, tuple[tuple[str, str], ...]] = {}
         self.wf_previous: dict[str, tuple[str | None, str]] = {}
         self.guide_sections: list[str] | None = None  # whole-file: the job guide's parts
         # whole-file: every check error of every reply so far, per file (error_key form), for
@@ -971,7 +980,7 @@ class _Job:
         return verification_feedback(
             number,
             v,
-            hints=self.migration.failure_hints,
+            hints=self._failure_hints(v),
             mock_hint=_mock_hint(self.migration),
             short=short,
         )
@@ -1291,7 +1300,51 @@ class _Job:
             unmigrated_modules={f.file for f in self.open_findings} - self.wf_accepted - {path},
             client_classes=self.migration.client_classes,
             client_resources=self.migration.client_resources,
+            client_key=self._client_key(),
+            env_names=self._env_names(),
         )
+
+    def _failure_hints(self, v: Verification | None) -> tuple[tuple[str, str], ...]:
+        """The migration's failure hints for the feedback on `v`, plus its uncalled-mock hint
+        (for verifier.UNCALLED_MOCK_MARKERS) when a non-test module of the working copy builds
+        a client without a key and the sandbox sets none (_client_key)."""
+        hints = tuple(self.migration.failure_hints)
+        template = getattr(self.migration, "uncalled_mock_hint", "")
+        key = self._client_key()
+        if v is None or not template or key is None:
+            return hints
+        if id(v) not in self.hints_for:
+            python = [
+                p.relative_to(self.work).as_posix()
+                for p in iter_files(self.work)
+                if p.suffix == ".py"
+            ]
+            modules = [r for r in python if not is_test_file(r, root=self.repo)]
+            found = keyless_client(
+                self._working_copy_reader("", ""),
+                modules,
+                key,
+                library_modules=self.migration.api_modules,
+            )
+            extra: tuple[tuple[str, str], ...] = ()
+            if found is not None:
+                text = template.format(
+                    where=f"{found.rel}:{found.line} builds {found.call}()", target=found.target
+                )
+                extra = tuple((marker, text) for marker in UNCALLED_MOCK_MARKERS)
+            self.hints_for[id(v)] = hints + extra
+        return self.hints_for[id(v)]
+
+    def _env_names(self) -> tuple[str, ...]:
+        """The library's environment variables (its client key's), which a rewrite may set."""
+        key = getattr(self.migration, "client_key", None)
+        return (key.env,) if key is not None else ()
+
+    def _client_key(self) -> ClientKey | None:
+        """The migration's ClientKey for the unkeyed-method-patch check, unless the repo's CI
+        sets the key's variable (the sandbox's test phase then has a placeholder)."""
+        key = getattr(self.migration, "client_key", None)
+        return None if key is None or key.env in self.sandbox_env else key
 
     def _updated_context(self, path: str) -> list[tuple[str, str]]:
         """The files a request for `path` may show as read-only context, as they are now:
@@ -2031,9 +2084,10 @@ class _Job:
                 else:
                     prompt = self._task_prompt()
                     if number > 1:
+                        previous = self.attempts[-2]
                         feedback = feedback_prompt(
-                            self.attempts[-2],
-                            self.migration.failure_hints,
+                            previous,
+                            self._failure_hints(previous.verification),
                             _mock_hint(self.migration),
                         )
                         prompt = f"{prompt}\n\n{feedback}" if not self.messages else feedback

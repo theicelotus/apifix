@@ -10,7 +10,9 @@ The candidate is compared with the original line by line (the same diff as
   original (so an added, removed or changed docstring is put back, however the diff splits it);
 - code hunks near a finding's statement are kept; so are code hunks elsewhere that use an
   openai-bound name (see _Bound: the library's names and what is assigned from them, in scope)
-  or a name a near code hunk binds or introduces, in the same scope; any other is an error
+  or a name a near code hunk binds or introduces, in the same scope, and hunks whose new side
+  names one of the library's environment variables (`env_names`: a test setting a placeholder
+  `OPENAI_API_KEY` for the real client); any other is an error
   (sent back through the check retry). Attribute names alone (`.chat`, `.choices`, which other
   SDKs share) never make a hunk related.
 
@@ -668,8 +670,10 @@ class _Diff:
         candidate: str,
         findings: Sequence[Finding],
         library_modules: Collection[str],
+        env_names: Collection[str] = (),
     ) -> None:
         self.old, self.new = _Version(original), _Version(candidate)
+        self.env_names = frozenset(env_names)
         self.hunks = hunks(original, candidate)
         lines = {line for f in findings for line in range(f.line, f.end_line + 1)}
         self.regions = regions(self.old.tree, sorted({f.line for f in findings}))
@@ -780,10 +784,22 @@ class _Diff:
                 keep = self._touches_exempt(h) or (self._strings_equal(h) and self._near(h))
                 verdict = "keep" if keep else "revert"
             else:
-                related = self._near(h) or self._uses_migration_names(h, scoped, scoped_attrs)
+                related = (
+                    self._near(h)
+                    or self._names_library_env(h)
+                    or self._uses_migration_names(h, scoped, scoped_attrs)
+                )
                 verdict = "keep" if related else "reject"
             judged.append(_Judged(h, kind, verdict))
         return judged
+
+    def _names_library_env(self, h: Hunk) -> bool:
+        """Does the hunk's new side name one of the library's environment variables (a string
+        constant), e.g. `monkeypatch.setenv("OPENAI_API_KEY", "test")`?"""
+        return any(
+            isinstance(n, ast.Constant) and n.value in self.env_names
+            for n in self.new.nodes_in(*self._new_side(h))
+        )
 
     def _uses_migration_names(
         self, h: Hunk, scoped: set[tuple[str, str]], scoped_attrs: set[tuple[str, str]]
@@ -926,12 +942,13 @@ def revert_text_edits(
     candidate: str,
     findings: Sequence[Finding],
     library_modules: Collection[str] = (),
+    env_names: Collection[str] = (),
 ) -> RevertResult:
     """Put back text-only hunks unrelated to the migration (strings, docstrings, comments away
     from the findings). If the result does not parse, nothing is reverted and each such hunk is
     an error instead. Both versions must parse; a file that does not tokenize is left as is."""
     try:
-        diff = _Diff(original, candidate, findings, library_modules)
+        diff = _Diff(original, candidate, findings, library_modules, env_names)
     except (SyntaxError, tokenize.TokenError, ValueError):
         return RevertResult(candidate, [], [])
     targets = [j.hunk for j in diff.judged if j.verdict == "revert"]
@@ -980,12 +997,13 @@ def unrelated_edits(
     candidate: str,
     findings: Sequence[Finding],
     library_modules: Collection[str] = (),
+    env_names: Collection[str] = (),
 ) -> list[str]:
     """Check errors for code hunks unrelated to the migration and for original strings that
     are missing (see the module docstring). Text-only hunks are revert_text_edits' job; any
     still left are not reported here."""
     try:
-        diff = _Diff(original, candidate, findings, library_modules)
+        diff = _Diff(original, candidate, findings, library_modules, env_names)
     except (SyntaxError, tokenize.TokenError, ValueError):
         return []
     rejected = [j.hunk for j in diff.judged if j.verdict == "reject"]

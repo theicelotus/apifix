@@ -8,7 +8,9 @@ A patch of a library name (`patch("openai.OpenAI")`) is also checked against the
 non-test modules: one that binds the name at import time (`from openai import OpenAI`) never
 sees it, so the message names the module's own target. A client class patched with
 autospec=True is reported when the test uses a resource of its instance (`chat.completions`),
-which an autospecced instance does not have.
+which an autospecced instance does not have. A patch of one of the library's resource methods
+(`openai.resources.chat.completions.Completions.create`) leaves the client constructor running,
+which is reported when the code under test builds a client without a key and the test sets none.
 
 Pure functions (source text in, messages out); repo modules are read through a callback.
 """
@@ -16,6 +18,7 @@ Pure functions (source text in, messages out); repo modules are read through a c
 from __future__ import annotations
 
 import ast
+import re
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import PurePosixPath
@@ -23,6 +26,7 @@ from pathlib import PurePosixPath
 from pyflakes import checker, messages
 
 from apifix.engine.context import reachable_modules
+from apifix.engine.models import ClientKey
 
 # Imports suggested for common standard-library names a rewrite forgets to import.
 STDLIB_IMPORTS = {
@@ -305,6 +309,7 @@ class _PatchSite:
     target: str
     function: str  # the patch function as written: "mock.patch", "patch", "mocker.patch", ...
     tests: tuple[ast.FunctionDef | ast.AsyncFunctionDef, ...]  # test functions it applies to
+    text: str = ""  # the patch call as written (ast.unparse)
 
 
 def _is_test_function(node: ast.AST) -> bool:
@@ -337,7 +342,9 @@ def _patch_sites(tree: ast.Module) -> list[_PatchSite]:
                     tests = (parent,)
                 break
             child, parent = parent, parents.get(parent)
-        sites.append(_PatchSite(node.lineno, target, _dotted(node.func) or "", tests))
+        sites.append(
+            _PatchSite(node.lineno, target, _dotted(node.func) or "", tests, ast.unparse(node))
+        )
     return sorted(sites, key=lambda s: (s.line, s.target))
 
 
@@ -1186,7 +1193,331 @@ def autospec_client_problems(
             f"mock target {target!r} is patched with autospec=True, and {where} uses {text} "
             f"(line {line}){also}: an autospecced 1.x client has no {lacks} (resources are "
             "cached properties), so drop autospec=True when patching the client class "
-            f'(patch("{target}")), or autospec the method instead'
+            f'(patch("{target}")); patching the method instead leaves the real client being '
+            "built, so the test would also need a placeholder API key"
+        )
+    return problems
+
+
+# --- a patched resource method while the code under test builds a client without a key -------
+
+PYTEST_CONFIGS = ("pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini")
+# Methods that run before a test of their class (unittest and pytest styles).
+SETUP_METHODS = frozenset({"setUp", "setUpClass", "setup_method", "setup_class", "setup"})
+# conftest.py hooks that run before any test.
+SETUP_HOOKS = frozenset({"pytest_configure", "pytest_sessionstart"})
+
+
+def _snake(name: str) -> str:
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+
+
+def resource_method(target: str, library_modules: Collection[str], resources: str) -> str | None:
+    """The client path a patch of a resource method stands for, under any module prefix:
+    `openai.resources.chat.completions.Completions.create` -> `chat.completions.create`
+    (`openai.resources.chat.Completions.create` too); None for any other target."""
+    parts = target.split(".")
+    for i, part in enumerate(parts[:-2]):
+        if part not in library_modules or parts[i + 1] != resources:
+            continue
+        rest = parts[i + 2 :]
+        if not rest[-2][:1].isupper() or any(p[:1].isupper() for p in rest[:-2]):
+            return None
+        modules, cls, method = rest[:-2], rest[-2], rest[-1]
+        name = _snake(cls.removeprefix("Async"))
+        if not modules or modules[-1] != name:
+            modules = [*modules, name]
+        return ".".join([*modules, method])
+    return None
+
+
+def _is_str(node: ast.AST | None, value: str) -> bool:
+    return isinstance(node, ast.Constant) and node.value == value
+
+
+def _sets_key(node: ast.AST, key: ClientKey, passed: bool = True) -> bool:
+    """Does the code under `node` set the key's environment variable (`monkeypatch.setenv`,
+    `patch.dict(os.environ, {...})`, `os.environ[...] = `, `os.environ.setdefault` /
+    `.update`), or, with `passed`, pass a key to a call (`api_key=` with a value other than
+    None)?"""
+    for n in ast.walk(node):
+        if isinstance(n, ast.Call):
+            func = _dotted(n.func) or ""
+            last = func.rsplit(".", 1)[-1]
+            first = n.args[0] if n.args else None
+            if last in ("setenv", "putenv", "setdefault") and _is_str(first, key.env):
+                return True
+            if func.endswith("patch.dict") or last == "update":
+                values = n.args[1:] if func.endswith("patch.dict") else n.args
+                if any(
+                    isinstance(v, ast.Dict) and any(_is_str(k, key.env) for k in v.keys)
+                    for v in values
+                ) or any(k.arg == key.env for k in n.keywords):
+                    return True
+            if passed and any(
+                k.arg == key.keyword
+                and not (isinstance(k.value, ast.Constant) and k.value.value is None)
+                for k in n.keywords
+            ):
+                return True
+        elif isinstance(n, ast.Assign | ast.AnnAssign):
+            targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+            if any(isinstance(t, ast.Subscript) and _is_str(t.slice, key.env) for t in targets):
+                return True
+    return False
+
+
+def _fixture(node: ast.stmt) -> tuple[str, bool] | None:
+    """(name, autouse) of a pytest fixture definition."""
+    if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+        return None
+    for deco in node.decorator_list:
+        call = deco if isinstance(deco, ast.Call) else None
+        func = _dotted(call.func if call else deco) or ""
+        if func.rsplit(".", 1)[-1] != "fixture":
+            continue
+        name, autouse = node.name, False
+        if call is not None:
+            named = _keyword(call, "name")
+            if isinstance(named, ast.Constant) and isinstance(named.value, str):
+                name = named.value
+            flag = _keyword(call, "autouse")
+            autouse = isinstance(flag, ast.Constant) and flag.value is True
+        return name, autouse
+    return None
+
+
+def _usefixtures(decorators: Sequence[ast.expr]) -> list[str]:
+    """Fixture names of `@pytest.mark.usefixtures("a", "b")` marks."""
+    names = []
+    for deco in decorators:
+        if isinstance(deco, ast.Call) and (_dotted(deco.func) or "").endswith("usefixtures"):
+            names += [a.value for a in deco.args if isinstance(a, ast.Constant)]
+    return [n for n in names if isinstance(n, str)]
+
+
+def _pytestmark(body: Sequence[ast.stmt]) -> list[ast.expr]:
+    """The marks of a module's or class's `pytestmark = mark` / `[mark, ...]`."""
+    for stmt in body:
+        if isinstance(stmt, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "pytestmark" for t in stmt.targets
+        ):
+            value = stmt.value
+            return list(value.elts) if isinstance(value, ast.List | ast.Tuple) else [value]
+    return []
+
+
+class _KeySources:
+    """Where a test file's tests can get a key: the test file and the conftest.py files above
+    it (module-level code, setup hooks, fixtures), and pytest-env settings in the repo's pytest
+    configuration."""
+
+    def __init__(self, path: str, tree: ast.Module, read_module: ReadModule, key: ClientKey):
+        self.key, self.tree = key, tree
+        self.modules = [tree]
+        parent = PurePosixPath(path).parent
+        for d in [parent, *parent.parents]:
+            rel = "conftest.py" if d.as_posix() in ("", ".") else f"{d.as_posix()}/conftest.py"
+            text = read_module(rel)
+            try:
+                conftest = ast.parse(text) if text is not None else None
+            except (SyntaxError, ValueError):
+                conftest = None
+            if conftest is not None:
+                self.modules.append(conftest)
+        configs = [read_module(c) or "" for c in PYTEST_CONFIGS]
+        self.global_key = any(f"{key.env}=" in c for c in configs) or any(
+            self._module_sets_key(m) for m in self.modules
+        )
+
+    def _module_sets_key(self, module: ast.Module) -> bool:
+        for stmt in module.body:
+            if isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef):
+                if stmt.name in SETUP_HOOKS and _sets_key(stmt, self.key, passed=False):
+                    return True
+            elif not isinstance(stmt, ast.ClassDef) and _sets_key(stmt, self.key, passed=False):
+                return True
+        return False
+
+    def _fixtures(self, cls: ast.ClassDef | None) -> list[tuple[str, bool, ast.stmt]]:
+        """(name, autouse, definition), nearest first: the class, the test file, conftests."""
+        bodies = ([cls.body] if cls else []) + [m.body for m in self.modules]
+        return [(*f, s) for body in bodies for s in body if (f := _fixture(s))]
+
+    def test_has_key(self, fn: ast.FunctionDef | ast.AsyncFunctionDef, cls: ast.ClassDef | None):
+        if self.global_key or _sets_key(fn, self.key):
+            return True
+        if cls is not None and (
+            any(_sets_key(d, self.key) for d in cls.decorator_list)
+            or any(
+                _sets_key(s, self.key)
+                for s in cls.body
+                if isinstance(s, ast.FunctionDef | ast.AsyncFunctionDef) and s.name in SETUP_METHODS
+            )
+        ):
+            return True
+        fixtures = self._fixtures(cls)
+        wanted = [a.arg for a in [*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs]]
+        marks = [*fn.decorator_list, *_pytestmark(self.tree.body)]
+        if cls is not None:
+            marks += [*cls.decorator_list, *_pytestmark(cls.body)]
+        wanted += _usefixtures(marks) + [name for name, autouse, _ in fixtures if autouse]
+        seen: set[str] = set()
+        while wanted:
+            name = wanted.pop(0)
+            if name in seen:
+                continue
+            seen.add(name)
+            found = next((s for n, _, s in fixtures if n == name), None)
+            if not isinstance(found, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            if _sets_key(found, self.key):
+                return True
+            wanted += [a.arg for a in [*found.args.posonlyargs, *found.args.args]]
+        return False
+
+
+@dataclass(frozen=True)
+class KeylessClient:
+    rel: str
+    line: int
+    call: str  # e.g. "openai.OpenAI"
+    target: str  # the client class where the module looks it up, e.g. "app.openai.OpenAI"
+
+
+def _keyless_client(
+    rel: str, imports: _RepoImports, options: _Options, key: ClientKey
+) -> KeylessClient | None:
+    """The first client construction inside a function or method of `rel` that passes no key
+    (no `api_key=`, no `**kwargs`). Module-level constructions are left out: they run at
+    import, before any test can set a key."""
+    tree = imports.tree(rel)
+    if tree is None:
+        return None
+    index = _ModuleIndex("", tree, options.library_modules)
+    calls = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Call):
+                continue
+            func = _dotted(node.func) or ""
+            root, _, rest = func.partition(".")
+            imported = index.imports.get(root, "")
+            full = f"{imported}.{rest}" if rest else imported
+            if (
+                full.split(".")[0] not in options.library_modules
+                or full.rsplit(".", 1)[-1] not in key.classes
+            ):
+                continue
+            if any(k.arg in (key.keyword, None) for k in node.keywords):
+                continue
+            calls.append((node.lineno, func))
+    if not calls:
+        return None
+    line, func = min(calls)
+    return KeylessClient(rel, line, func, f"{imports.module_path(rel)[0]}.{func}")
+
+
+def keyless_client(
+    read_module: ReadModule,
+    modules: Sequence[str],
+    key: ClientKey,
+    *,
+    library_modules: frozenset[str],
+    roots: Sequence[str] = MODULE_ROOTS,
+) -> KeylessClient | None:
+    """The first of `modules` (non-test files, in order) that builds a client without a key
+    inside a function (see _keyless_client)."""
+    options = _Options(library_modules, {}, (), tuple(roots), tuple(modules))
+    imports = _RepoImports(read_module, options)
+    return next((k for rel in modules if (k := _keyless_client(rel, imports, options, key))), None)
+
+
+def unkeyed_method_patch_problems(
+    original: str,
+    candidate: str,
+    read_module: ReadModule,
+    key: ClientKey,
+    *,
+    library_modules: frozenset[str],
+    roots: Sequence[str] = MODULE_ROOTS,
+    modules: Sequence[str] = (),
+    test_files: Sequence[str] = (),
+    path: str | None = None,
+) -> list[str]:
+    """A new or changed patch of one of the library's resource methods
+    (`openai.resources.chat.completions.Completions.create`, any module prefix) in a test that
+    sets no key, while a non-test module the test file reaches through imports (`path`; the
+    working copy's text) builds a client without one (`OpenAI()` in a function). The patch
+    leaves the constructor running, which raises without the key, and code that catches the
+    error never reaches the patched method ("Called 0 times"). A test gets a key from an
+    environment patch in the test, its class or a fixture it uses (by parameter,
+    usefixtures, autouse; in the test file or a conftest.py above it), module-level code or a
+    setup hook of those files, pytest-env settings (`OPENAI_API_KEY=` in the pytest config),
+    or a key passed to a call in the test. A test that also patches a client class needs none."""
+    if path is None:
+        return []
+    try:
+        tree = ast.parse(candidate)
+    except (SyntaxError, ValueError):
+        return []
+    options = _Options(
+        library_modules, {}, (), tuple(roots), tuple(modules), tuple(test_files), path
+    )
+    try:
+        before = {s.text for s in _patch_sites(ast.parse(original))}
+    except (SyntaxError, ValueError):
+        before = set()
+    sites = _patch_sites(tree)
+    methods = [
+        (site, client_path)
+        for site in sites
+        if site.text not in before
+        and site.tests
+        and (client_path := resource_method(site.target, library_modules, key.resources))
+    ]
+    if not methods:
+        return []
+    imports = _RepoImports(read_module, options)
+    reached = reachable_modules(path, read_module, options.roots, set(modules))
+    keyless = next(
+        (k for rel in reached if (k := _keyless_client(rel, imports, options, key))), None
+    )
+    if keyless is None:
+        return []
+    parents: dict[ast.AST, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    with_client = {
+        id(fn) for s in sites if s.target.rsplit(".", 1)[-1] in key.classes for fn in s.tests
+    }
+    sources = _KeySources(path, tree, read_module, key)
+    problems = []
+    for target in dict.fromkeys(site.target for site, _ in methods):
+        client_path = next(c for s, c in methods if s.target == target)
+        tests = [fn for s, _ in methods if s.target == target for fn in s.tests]
+        unkeyed = []
+        for fn in dict.fromkeys(tests):
+            cls = parents.get(fn)
+            cls = cls if isinstance(cls, ast.ClassDef) else None
+            if id(fn) not in with_client and not sources.test_has_key(fn, cls):
+                unkeyed.append(fn.name)
+        if not unkeyed:
+            continue
+        also = f" (and likewise in: {', '.join(unkeyed[1:])})" if unkeyed[1:] else ""
+        var = keyless.call.rsplit(".", 1)[-1]
+        problems.append(
+            f"mock target {target!r} patches a method, so the real client is still built: "
+            f"{keyless.rel}:{keyless.line} calls {keyless.call}() without {key.keyword}=, which "
+            f"raises when {key.env} is not set (tests run without it, and the code's own "
+            f"try/except may hide the error), and {unkeyed[0]} sets no key{also}. Set a "
+            f'placeholder key in the test (@mock.patch.dict(os.environ, {{"{key.env}": "test"}}) '
+            f'or monkeypatch.setenv("{key.env}", "test")), or patch the client class instead, '
+            f'without autospec: patch("{keyless.target}") and set '
+            f"{var}.return_value.{client_path}.return_value"
         )
     return problems
 
@@ -1205,6 +1536,7 @@ def mock_target_problems(
     unmigrated_modules: Collection[str] = (),
     client_classes: Collection[str] = (),
     client_resources: Collection[str] = (),
+    client_key: ClientKey | None = None,
 ) -> list[str]:
     """Mock targets new in the candidate that are wrong for a repo module (`read_module(relpath)`
     gives its current text, or None if there is no such file): a name the module does not
@@ -1224,7 +1556,9 @@ def mock_target_problems(
 
     With `client_classes` and `client_resources` (the library's client classes and the
     resource attributes of their instances), a client class newly patched with autospec=True
-    whose instance the test uses for a resource is reported too (autospec_client_problems)."""
+    whose instance the test uses for a resource is reported too (autospec_client_problems).
+    With `client_key`, so is a patched resource method in a test that sets no key while the
+    code under test builds a client without one (unkeyed_method_patch_problems)."""
     try:
         tree = ast.parse(candidate)
     except (SyntaxError, ValueError):
@@ -1266,5 +1600,17 @@ def mock_target_problems(
             client_resources=client_resources,
             library_modules=library_modules,
             roots=roots,
+        )
+    if client_key is not None:
+        problems += unkeyed_method_patch_problems(
+            original,
+            candidate,
+            read_module,
+            client_key,
+            library_modules=library_modules,
+            roots=roots,
+            modules=modules,
+            test_files=test_files,
+            path=path,
         )
     return problems

@@ -189,9 +189,10 @@ def completion(text):
 ```
 
 `openai.OpenAI()` raises `OpenAIError` when no API key is set (argument or `OPENAI_API_KEY`),
-and tests normally run without one. A test must keep the real constructor from running, or the
-module must not build a client at import. Pick the pattern from how the migrated module gets
-its client:
+and tests normally run without one; code that catches the error then never calls the mock
+("Called 0 times"). A test must keep the real constructor from running, or the module must not
+build a client at import. Patch the client class (without autospec), picking the pattern from
+how the migrated module gets its client:
 
 ```python
 # 0.x
@@ -226,14 +227,31 @@ def test_answer(get_client):
     )
 ```
 
+Patching the method instead leaves the real constructor running, so unless the code passes
+`api_key=`, the test must also set a placeholder key:
+
+```python
+# 1.x, the method patched (any client); the constructor still runs and needs a key
+@mock.patch.dict(os.environ, {"OPENAI_API_KEY": "test"})
+@mock.patch("openai.resources.chat.completions.Completions.create")
+def test_answer(create):
+    create.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(role="assistant", content="hi"))]
+    )
+
+
+# (pytest: monkeypatch.setenv("OPENAI_API_KEY", "test") in the test or a fixture)
+```
+
 - When the module does `from openai import OpenAI`, patch `app.OpenAI` instead of
   `app.openai.OpenAI`.
-- With any client, patching the class method also works:
-  `mock.patch("openai.resources.chat.completions.Completions.create")`.
 - Drop `autospec=True` when patching a client class (`patch("app.OpenAI", autospec=True)`): an
   autospecced 1.x client has no `chat.completions` (resources are cached properties), so
-  `OpenAI.return_value.chat.completions.create` fails. Autospec the method instead
-  (`mock.patch("openai.resources.chat.completions.Completions.create", autospec=True)`).
+  `OpenAI.return_value.chat.completions.create` fails. Patch the class without autospec. If
+  you patch the method instead (`...Completions.create`), the real client is still built, so
+  set `OPENAI_API_KEY` in the test as above; with `autospec=True` the method's mock also
+  receives the resource object as its first argument (`call_args.args[0]`), so assertions
+  such as `args == ()` fail.
 - Mock return values must support attribute access now that the code uses it; keep the same
   values. `SimpleNamespace` (`from types import SimpleNamespace`) or the real types
   (`openai.types.chat.ChatCompletion`) both work.

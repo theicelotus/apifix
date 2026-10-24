@@ -223,6 +223,9 @@ _MOCK_ERRORS = (
 )
 _SPEC_MOCK_ERROR = re.compile(r"AttributeError: Mock object has no attribute '(\w+)'")
 MAX_MOCK_HINTS = 3
+# unittest.mock's messages for a mock that was never called (assert_called_once[_with],
+# assert_called_with)
+UNCALLED_MOCK_MARKERS = ("Called 0 times", "Actual: not called")
 
 
 def mock_failure(test: str, message: str) -> MockFailure | None:
@@ -274,7 +277,7 @@ def failure_hints(
     texts = [t.message for t in v.fixed.tests if t.outcome in ("failed", "error")]
     if v.fixed.test is not None:
         texts += [v.fixed.test.stdout, v.fixed.test.stderr]
-    out = [text for marker, text in hints if any(marker in t for t in texts)]
+    out = list(dict.fromkeys(text for marker, text in hints if any(marker in t for t in texts)))
     if mock_hint:
         problems = dict.fromkeys(f.problem for f in mock_failures(v).values() if not f.spec)
         out += [mock_hint.format(problem=p) for p in list(problems)[:MAX_MOCK_HINTS]]

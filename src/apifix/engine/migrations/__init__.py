@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Protocol
 
 from apifix.engine.dependencies import DeclaredDependency
-from apifix.engine.models import CompanionPin, Finding, SmokeCheck
+from apifix.engine.models import ClientKey, CompanionPin, Finding, SmokeCheck
 
 
 class Migration(Protocol):
@@ -33,6 +33,10 @@ class Migration(Protocol):
     # For a test that failed on its own mock (verifier.mock_failure): the retry feedback's hint,
     # with {problem} ("SimpleNamespace has no create"). "" for none.
     mock_failure_hint: str
+    # For a mock that was never called (verifier.UNCALLED_MOCK_MARKERS) while the fixed code
+    # builds a client without a key (client_key): the retry feedback's hint, with {where}
+    # ("app.py:12 builds openai.OpenAI()") and {target} (the client class to patch). "" for none.
+    uncalled_mock_hint: str
     # name -> the import that defines it, for names the library's 1.x code uses (apifix adds
     # a missing one when it is the only import known for the name).
     known_imports: Mapping[str, str]
@@ -42,6 +46,9 @@ class Migration(Protocol):
     # patches a client class with autospec=True cannot use them (code_checks).
     client_classes: frozenset[str]
     client_resources: frozenset[str]
+    # How clients get their API key: a test that patches a resource method while the code
+    # under test builds a client without one fails (code_checks). None: not checked.
+    client_key: ClientKey | None
     # Runs in the sandbox after the fixed code's dependencies are installed (no network, no repo
     # code); a failure is reported to the model as a dependency problem. None: no check.
     smoke_check: SmokeCheck | None

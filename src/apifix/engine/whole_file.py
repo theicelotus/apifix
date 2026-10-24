@@ -26,7 +26,7 @@ from apifix.engine.code_checks import (
 )
 from apifix.engine.dependencies import dependency_file_problem, is_dependency_file
 from apifix.engine.migrations import Migration
-from apifix.engine.models import CERTAIN, Finding
+from apifix.engine.models import CERTAIN, ClientKey, Finding
 from apifix.engine.project import is_test_file
 from apifix.engine.regions import (
     IMPORTS,
@@ -617,6 +617,8 @@ def check_candidate(
     unmigrated_modules: Collection[str] = (),
     client_classes: Collection[str] = (),
     client_resources: Collection[str] = (),
+    client_key: ClientKey | None = None,
+    env_names: Collection[str] = (),
 ) -> CheckResult:
     """Syntax (Python files), well-formedness (dependency files), "differs from the original"
     (only when `required`), abbreviation (placeholders, or under half the original's lines
@@ -630,16 +632,19 @@ def check_candidate(
     patched module gives no target, the message lists the modules that call the library,
     except `unmigrated_modules`, which are still on the old API; `client_classes` and
     `client_resources` report a client class patched with autospec=True whose instance's
-    resources the test uses). Python
+    resources the test uses; `client_key` a patched resource method in a test that sets no
+    key while the code under test builds a client without one). Python
     files that parse first get an import for each new undefined name with exactly one
     `known_imports` entry, so every check sees the completed file (`text`, `auto_imports`).
 
     With `findings` (the file's own scanner findings), Python files also get the unrelated-edit
     check (unrelated.py): text-only hunks away from the migration are reverted before the
     imports are added (`reverted`), and code hunks unrelated to it, or original strings that
-    are missing, are errors. `rewrite_checks(path, original, candidate)`: the migration's own
-    checks (Migration.rewrite_checker, e.g. `config`, `streaming`), run last on the completed
-    file; without them, check `config` is n/a."""
+    are missing, are errors; hunks naming one of `env_names` (the library's environment
+    variables, e.g. a placeholder key a test sets) are related. `rewrite_checks(path,
+    original, candidate)`: the migration's own checks (Migration.rewrite_checker, e.g.
+    `config`, `streaming`), run last on the completed file; without them, check `config` is
+    n/a."""
     checks: dict[str, str] = {}
     errors: list[str] = []
     error_checks: list[str] = []
@@ -670,7 +675,7 @@ def check_candidate(
     reverts: list[dict[str, object]] = []
     revert_errors: list[str] = []
     if unrelated:
-        result = revert_text_edits(original, candidate, findings or (), library_modules)
+        result = revert_text_edits(original, candidate, findings or (), library_modules, env_names)
         candidate, reverted, revert_errors = result.text, result.reverted, result.errors
     added: list[str] = []
     if path.endswith(".py") and not syntax:
@@ -716,6 +721,7 @@ def check_candidate(
             unmigrated_modules=unmigrated_modules,
             client_classes=client_classes,
             client_resources=client_resources,
+            client_key=client_key,
         )
         if mocks and read_module is not None
         else []
@@ -723,7 +729,8 @@ def check_candidate(
     record("mock_targets", "; ".join(targets) or None, mocks)
 
     unrelated_problems = (
-        revert_errors + unrelated_edits(original, candidate, findings or (), library_modules)
+        revert_errors
+        + unrelated_edits(original, candidate, findings or (), library_modules, env_names)
         if unrelated
         else []
     )

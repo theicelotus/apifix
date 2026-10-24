@@ -981,6 +981,54 @@ def test_agent_mode_feedback_has_the_migration_failure_hints(repo):
     assert "Drop autospec=True when patching the client class" in feedback
 
 
+APP_KEYLESS = """\
+import openai
+
+
+def ask(q):
+    client = openai.OpenAI()
+    r = client.chat.completions.create(model="gpt-4", messages=[{"role": "user", "content": q}])
+    return r.choices[0].message.content.strip()
+"""
+UNCALLED = "AssertionError: Expected 'create' to have been called once. Called 0 times."
+UNCALLED_HINT = (
+    "Hint: a mock was never called, and app.py:5 builds openai.OpenAI() without api_key=: with "
+    "no OPENAI_API_KEY set (the tests run without one) the constructor raises OpenAIError "
+    "before the call, and the code's own try/except may swallow the error."
+)
+
+
+def _uncalled_feedback(repo, app_edit) -> str:
+    def judge_tree(tree: Path) -> SandboxResult:
+        if "openai.ChatCompletion" in (tree / "app.py").read_text():
+            return judge(tree)  # the baseline
+        return run((T_ASK, "failed", UNCALLED), (T_STRIP, "passed"))
+
+    llm = FakeLLM([tools(app_edit, FIX_TESTS), done(), done()])
+    go(repo, llm, JudgingSandbox(judge=judge_tree), max_retries=1)
+    return last_user_text(llm.requests[2])
+
+
+def test_an_uncalled_mock_with_a_keyless_client_gets_the_missing_key_hint(repo):
+    feedback = _uncalled_feedback(repo, edit("app.py", APP_OLD, APP_KEYLESS))
+    assert UNCALLED_HINT in feedback
+    assert 'patch("app.openai.OpenAI"), without autospec' in feedback
+    assert feedback.count("Hint: a mock was never called") == 1
+
+
+def test_no_missing_key_hint_for_a_keyed_client(repo):
+    feedback = _uncalled_feedback(repo, FIX_APP)  # client = openai.OpenAI(api_key="test")
+    assert "Hint: a mock was never called" not in feedback
+
+
+def test_no_missing_key_hint_when_ci_sets_the_key(repo):
+    workflow = repo / ".github" / "workflows" / "test.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text("jobs:\n  test:\n    env:\n      OPENAI_API_KEY: ${{ secrets.KEY }}\n")
+    feedback = _uncalled_feedback(repo, edit("app.py", APP_OLD, APP_KEYLESS))
+    assert "Hint: a mock was never called" not in feedback
+
+
 def test_strict_tool_calls_is_rejected_for_anthropic(repo, monkeypatch, capsys):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
     args = ["fix", str(repo), "--migration", "openai-v1", "--strict-tool-calls"]

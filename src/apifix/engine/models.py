@@ -36,6 +36,20 @@ class SmokeCheck:
 
 
 @dataclass(frozen=True)
+class ClientKey:
+    """How the library's clients get their API key: `classes` read it from the environment
+    variable `env` when no `keyword` argument is given, and raise when neither is set. A test
+    that patches one of the library's resource methods (a class under `<library>.<resources>.`)
+    leaves that constructor running, so it needs a key
+    (code_checks.unkeyed_method_patch_problems)."""
+
+    env: str
+    keyword: str
+    classes: frozenset[str]
+    resources: str
+
+
+@dataclass(frozen=True)
 class LibraryTarget:
     """The migrated library and the version a fix needs (from the migration): `package`, its
     first version with the new API, the spec apifix writes for it (`>=1.55.3,<2`), and what

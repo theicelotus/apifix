@@ -57,13 +57,23 @@ class OpenAIV1Migration:
             'a client class patched with autospec=True (patch("app.OpenAI", autospec=True)) '
             "gives an instance without chat.completions: in 1.x the client's resources are "
             "cached properties, which autospec does not follow. Drop autospec=True when "
-            'patching the client class (patch("app.OpenAI")), or autospec the method instead.',
+            'patching the client class (patch("app.OpenAI")). Patching the method instead '
+            "(openai.resources.chat.completions.Completions.create) leaves the real client "
+            "being built, so the test must then set a placeholder OPENAI_API_KEY.",
         ),
     )
     mock_failure_hint = (
         "the test's mock client is incomplete: {problem}; build the client mock with "
         "MagicMock() (or include the whole chat.completions.create chain) and set "
         ".return_value on create"
+    )
+    uncalled_mock_hint = (
+        "a mock was never called, and {where} without api_key=: with no OPENAI_API_KEY set "
+        "(the tests run without one) the constructor raises OpenAIError before the call, and "
+        "the code's own try/except may swallow the error. Set a placeholder key in the test "
+        '(mock.patch.dict(os.environ, {{"OPENAI_API_KEY": "test"}}) or '
+        'monkeypatch.setenv("OPENAI_API_KEY", "test")), or patch the client class where the '
+        'code looks it up (patch("{target}"), without autospec)'
     )
     # A client must be constructible with the installed versions (a dummy key; nothing is sent:
     # the network is off and constructing a client makes no request).
@@ -77,6 +87,7 @@ class OpenAIV1Migration:
     mock_responses = rules.MOCK_RESPONSES
     client_classes = rules.CLIENT_CLASSES
     client_resources = rules.CLIENT_RESOURCES
+    client_key = rules.CLIENT_KEY
     package = rules.PACKAGE
     pin_spec = rules.PIN_SPEC
     companion_pins = rules.COMPANION_PINS
