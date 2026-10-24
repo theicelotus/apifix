@@ -6,6 +6,7 @@ apifix fix <path> --migration openai-v1 [--model M] [--max-cost USD] [--out DIR]
     [--file-edits auto|whole|regions] [--region-threshold BYTES]
 apifix fix <path> --migration openai-v1 --provider openai-compat --model M [--base-url URL]
     [--strict-tool-calls] [--api-key-env NAME] [--request-timeout S] [--max-output-tokens N]
+    [--reasoning-effort low|medium|high]
 apifix verify <path> --migration openai-v1 --diff FILE [--out DIR]
                                  apply a saved diff to a copy and verify it (no LLM)
 apifix fix|verify ... --sandbox-requirements FILE
@@ -116,6 +117,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="openai-compat: only use the server's tool-call field; never parse a reply that "
         "is written as one JSON tool call",
+    )
+    p_fix.add_argument(
+        "--reasoning-effort",
+        choices=["low", "medium", "high"],
+        help="openai-compat: sent as reasoning_effort (reasoning models such as gpt-oss); "
+        "lower effort leaves more of each reply's tokens for the answer (default: not sent)",
     )
     p_fix.add_argument("--prices", help="TOML file overriding model prices ($APIFIX_PRICES)")
     cost = p_fix.add_mutually_exclusive_group()
@@ -274,6 +281,7 @@ def _fix(args: argparse.Namespace) -> int:
             ("api_key_env", args.api_key_env),
             ("timeout_s", args.request_timeout),
             ("strict_tool_calls", args.strict_tool_calls or None),
+            ("reasoning_effort", args.reasoning_effort),
         )
         if value is not None
     }

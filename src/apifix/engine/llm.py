@@ -116,6 +116,9 @@ class Usage:
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    # of output_tokens, the reasoning tokens a server reported separately (openai-compat:
+    # completion_tokens_details.reasoning_tokens); not counted again in the total
+    reasoning_tokens: int = 0
 
     def __add__(self, other: Usage) -> Usage:
         return Usage(
@@ -123,6 +126,7 @@ class Usage:
             self.output_tokens + other.output_tokens,
             self.cache_read_tokens + other.cache_read_tokens,
             self.cache_write_tokens + other.cache_write_tokens,
+            self.reasoning_tokens + other.reasoning_tokens,
         )
 
     @property
@@ -307,8 +311,8 @@ def get_llm(
     **options: Any,
 ) -> LLMClient:
     """Build the configured provider. Defaults: $APIFIX_PROVIDER / $APIFIX_MODEL, then
-    anthropic / claude-opus-5-5. openai-compat takes base_url, api_key_env, timeout_s and
-    strict_tool_calls."""
+    anthropic / claude-opus-5-5. openai-compat takes base_url, api_key_env, timeout_s,
+    strict_tool_calls and reasoning_effort."""
     provider = provider or os.environ.get("APIFIX_PROVIDER") or DEFAULT_PROVIDER
     if provider not in PROVIDERS:
         raise ValueError(f"unknown provider {provider!r} (available: {', '.join(PROVIDERS)})")
@@ -317,7 +321,12 @@ def get_llm(
         from apifix.engine.llm_openai_compat import OpenAICompatLLM
 
         return OpenAICompatLLM(model, models=load_model_table({}, prices), **options)
-    unsupported = set(options) & {"base_url", "api_key_env", "strict_tool_calls"}
+    unsupported = set(options) & {
+        "base_url",
+        "api_key_env",
+        "strict_tool_calls",
+        "reasoning_effort",
+    }
     if unsupported:
         raise ValueError(f"{', '.join(sorted(unsupported))} only apply to --provider openai-compat")
     from apifix.engine.llm_anthropic import AnthropicLLM

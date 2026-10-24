@@ -55,6 +55,9 @@ from apifix.engine.llm import (
 DEFAULT_BASE_URL = "http://localhost:11434/v1"  # Ollama
 BASE_URL_ENV = "APIFIX_BASE_URL"
 API_KEY_ENV = "APIFIX_LLM_API_KEY"
+# --reasoning-effort: sent as `reasoning_effort` (gpt-oss on a hosted endpoint, OpenAI reasoning models);
+# omitted when not set.
+REASONING_EFFORTS = ("low", "medium", "high")
 # Sent on every request: some hosted endpoints' firewalls block urllib's default
 # "Python-urllib/3.x" with a bare 403.
 USER_AGENT = f"apifix/{__version__}"
@@ -211,6 +214,7 @@ class OpenAICompatLLM:
         models: Mapping[str, ModelInfo] | None = None,
         timeout_s: float | None = None,
         strict_tool_calls: bool = False,
+        reasoning_effort: str | None = None,
         transport: Transport = urllib_transport,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -230,6 +234,12 @@ class OpenAICompatLLM:
             raise LLMError("the request timeout must be positive")
         self.timeout_s = float(timeout_s)
         self.strict_tool_calls = strict_tool_calls
+        if reasoning_effort is not None and reasoning_effort not in REASONING_EFFORTS:
+            raise LLMError(
+                f"unknown reasoning effort {reasoning_effort!r} (available: "
+                f"{', '.join(REASONING_EFFORTS)})"
+            )
+        self.reasoning_effort = reasoning_effort
         self.text_tool_calls_seen = False  # a call was parsed from reply text (never if strict)
         self.transport = transport
         self.sleep = sleep
@@ -412,6 +422,16 @@ class OpenAICompatLLM:
     def _error(self, status: int, data: Any, *, max_tokens: int | None = None) -> LLMError:
         message = self._server_message(data) or "(no error message)"
         low = message.lower()
+        if (
+            self.reasoning_effort
+            and status in (400, 422)
+            and ("reasoning_effort" in low or "reasoning effort" in low)
+        ):
+            return LLMError(
+                f"the server rejected reasoning_effort={self.reasoning_effort!r} (HTTP {status} "
+                f"from {self.endpoint}: {message}): model {self.model} or this server does not "
+                "accept --reasoning-effort; run without it"
+            )
         overflow = per_minute_overflow(message)
         if status in (413, 429) and overflow is not None:
             return self._too_large(status, message, *overflow, max_tokens=max_tokens)
@@ -497,6 +517,8 @@ class OpenAICompatLLM:
             body["tool_choice"] = "auto"
         if temperature is not None:
             body["temperature"] = temperature
+        if self.reasoning_effort:
+            body["reasoning_effort"] = self.reasoning_effort
         return body
 
     def complete(
@@ -579,6 +601,7 @@ class OpenAICompatLLM:
                 input_tokens=max(0, usage_data["prompt_tokens"] - cached),
                 output_tokens=usage_data.get("completion_tokens") or 0,
                 cache_read_tokens=cached,
+                reasoning_tokens=_reasoning_tokens(usage_data),
             )
         else:
             self._usage_estimated = True
@@ -675,6 +698,13 @@ class OpenAICompatLLM:
 
 
 # --- conversion -------------------------------------------------------------------------------
+
+
+def _reasoning_tokens(usage: dict[str, Any]) -> int:
+    """Reasoning tokens a server reported (part of completion_tokens), or 0."""
+    details = usage.get("completion_tokens_details")
+    value = details.get("reasoning_tokens") if isinstance(details, dict) else None
+    return value if isinstance(value, int) and value > 0 else 0
 
 
 def to_openai(messages: Sequence[Message]) -> list[dict[str, Any]]:

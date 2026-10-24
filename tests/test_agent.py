@@ -925,6 +925,62 @@ def test_cli_strict_tool_calls(repo, tmp_path, monkeypatch):
     assert seen == {}
 
 
+def test_cli_reasoning_effort(repo, tmp_path, monkeypatch, capsys):
+    seen = {}
+
+    def fake_get_llm(provider, model, *, prices=None, **options):
+        seen.update(options)
+        return FakeLLM([done()], price=None)
+
+    monkeypatch.setattr("apifix.engine.llm.get_llm", fake_get_llm)
+    monkeypatch.setattr("apifix.engine.sandbox.Sandbox", lambda *a, **k: JudgingSandbox())
+    args = ["fix", str(repo), "--migration", "openai-v1", "--provider", "openai-compat"]
+    args += ["--model", "m", "--no-cost-limit", "--max-retries", "0"]
+    args += ["--out", str(tmp_path / "out")]
+    cli.main([*args, "--reasoning-effort", "low"])
+    assert seen == {"reasoning_effort": "low"}
+    with pytest.raises(SystemExit):
+        cli.main([*args, "--reasoning-effort", "max"])
+    monkeypatch.undo()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    args = ["fix", str(repo), "--migration", "openai-v1", "--reasoning-effort", "low"]
+    assert cli.main(args) == 2
+    assert "reasoning_effort only apply to --provider openai-compat" in capsys.readouterr().err
+
+
+def test_reasoning_effort_and_tokens_in_the_report_and_trajectory(repo):
+    usage = Usage(input_tokens=1000, output_tokens=400, reasoning_tokens=150)
+    llm = FakeLLM([block(APP_NEW, usage=usage), block(TESTS_NEW, usage=usage)])
+    llm.reasoning_effort = "low"
+    result = wf(repo, llm)
+    job = result.trajectory["job"]
+    assert job["reasoning_effort"] == "low"
+    assert result.trajectory["usage"]["reasoning_tokens"] == 300
+    assert result.trajectory["attempts"][0]["usage"]["reasoning_tokens"] == 300
+    report = result.report_markdown
+    assert "`fake` / `fake-model`; reasoning effort: low (sent as reasoning_effort)" in report
+    assert "- Tokens: 2,800 (300 of the output tokens reasoning, as the server reported)" in report
+    plain = wf(repo, FakeLLM(list(GOOD)))
+    assert plain.trajectory["job"]["reasoning_effort"] is None
+    assert "reasoning" not in plain.report_markdown.split("- Edit mode")[0]
+
+
+def test_agent_mode_feedback_has_the_migration_failure_hints(repo):
+    autospec = "AttributeError: Mock object has no attribute 'completions'"
+
+    def judge_tree(tree: Path) -> SandboxResult:
+        if "openai.ChatCompletion" in (tree / "app.py").read_text():
+            return judge(tree)  # the baseline
+        return run((T_ASK, "failed", autospec), (T_STRIP, "passed"))
+
+    llm = FakeLLM([tools(FIX_APP, FIX_TESTS), done(), done()])
+    go(repo, llm, JudgingSandbox(judge=judge_tree), max_retries=1)
+    feedback = last_user_text(llm.requests[2])
+    assert feedback.startswith("The verifier did not accept attempt 1")
+    assert "Hint: a client class patched with autospec=True" in feedback
+    assert "Drop autospec=True when patching the client class" in feedback
+
+
 def test_strict_tool_calls_is_rejected_for_anthropic(repo, monkeypatch, capsys):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
     args = ["fix", str(repo), "--migration", "openai-v1", "--strict-tool-calls"]
@@ -1055,8 +1111,10 @@ def test_anthropic_provider_gets_neither(repo):
 REQS_NEW = "openai>=1.55.3,<2\npytest\n"
 
 
-def block(text: str, lang: str = "python") -> LLMResponse:
-    return done(f"Here is the updated file:\n\n```{lang}\n{text}```\n\nI migrated the calls.")
+def block(text: str, lang: str = "python", usage: Usage = USAGE) -> LLMResponse:
+    return done(
+        f"Here is the updated file:\n\n```{lang}\n{text}```\n\nI migrated the calls.", usage
+    )
 
 
 def two_blocks(text: str) -> LLMResponse:
@@ -1198,13 +1256,17 @@ def test_code_block_nudges_are_capped_per_attempt(repo):
 
 def test_truncated_reply_fails_the_file_without_a_nudge(repo):
     cut = LLMResponse("```python\nimport openai\n", [], "max_tokens", USAGE, "fake-model", "")
-    llm = FakeLLM([cut])
+    llm = FakeLLM([cut, cut])
     result = wf(repo, llm, max_retries=0)
     (attempt,) = result.trajectory["attempts"]
     assert attempt["nudges"] == [] and attempt["result"] == "check_failed"
-    assert attempt["files"][0]["error"] == (
-        "the reply hit the output limit before the file was complete"
+    # sent again with the most reply tokens; app.py is nearly all regions, so not as regions
+    assert llm.max_tokens_seen == [budget(APP_OLD), 16_000]
+    entry = attempt["files"][0]
+    assert entry["error"] == (
+        "the reply hit the output limit before the file was complete (at 16,000 reply tokens)"
     )
+    assert [t["then"] for t in entry["truncations"]] == ["more_reply_tokens", "failed"]
     assert (result.outcome, result.reason) == (
         "aborted",
         "check_failed: no attempt's files passed the checks",

@@ -30,7 +30,7 @@ src/apifix/
   cli.py              `apifix scan <path> --migration openai-v1 [--json]`,
                       `apifix fix <path> --migration openai-v1 [--model] [--max-cost] [--out]`,
                       (openai-compat: `--base-url`, `--strict-tool-calls`,
-                      `--request-timeout`, `--api-key-env`;
+                      `--request-timeout`, `--api-key-env`, `--reasoning-effort`;
                       `--edit-mode agent|whole-file`, `--max-file-bytes`,
                       `--max-output-tokens`; whole-file: `--file-edits auto|whole|regions`,
                       `--region-threshold BYTES`),
@@ -510,15 +510,34 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   the report suggests `apifix verify ... --sandbox-requirements FILE`.
 - Reply budget: `max_tokens` is `--max-output-tokens` in agent mode; in whole-file mode
   `min(--max-output-tokens, 2 * est + 2,048)`, `est` = chars / 3 of the longer of the original
-  file and its working-copy version (`whole_file.reply_budget`). A reasoning model whose
-  thinking exceeds the margin hits the limit and the file fails (truncated, not nudged).
+  file and its working-copy version (`whole_file.reply_budget`). A reply cut off at the limit
+  (a reasoning model thinking past it; never nudged) is sent again within the attempt: first
+  the same request with the most reply tokens (`--max-output-tokens`, lowered to fit a known
+  limit) when that is more, and the file keeps that allowance for the rest of the job
+  (`_Job.wf_full_reply`, region requests too); else a whole file goes as regions (auto only,
+  when the regions and IMPORTS are under 80% of the file; `form_reason` `truncated`,
+  `switched_to_regions`) and a region request in halves by bytes (IMPORTS with the first;
+  `splits` reason `truncated`), down to one region. A single region (or a whole file with no
+  smaller form) cut off at the full allowance fails the file: "... (at N reply tokens)".
+  Recorded per entry as `truncations` (`response`, `max_tokens`, region `ids`, `then`:
+  `more_reply_tokens` | `regions` | `smaller_groups` | `failed`); report "Replies cut off at
+  the output limit", with a `--reasoning-effort low` suggestion for openai-compat when one
+  failed and no effort was set.
 - Per-minute token limits (`RequestTooLarge`: a 413 or 429 message with "per minute"/TPM and
   "Limit N, [Used U, ]Requested M"; a 429 only when M > N, else it is waited out): the request
   is sent once more with `max_tokens = N - (M - max_tokens) - max(256, ceil(3% of N))` (the hosted provider
   counted a resent prompt 79 tokens higher than its first refusal implied) if that leaves at
   least `est`
-  (agent mode: 1,024) and is lower; else, or if refused again, the job stops
-  (`provider_error`). The limit is kept for the job: every later request whose estimate
+  (agent mode: 1,024) and is lower; else, or if refused again, the request cannot fit
+  (`_CannotFit`): a whole file goes as regions and a region request is split (Known
+  limitations (region edits), groups); anything else stops the job (`provider_error`). A
+  refusal whose count leaves room for the reply (the server does not count it) is treated
+  the same. Refused again after lowering: `server_ratio` = the server's count (M if it did not
+  change with max_tokens, as the hosted provider's 9,125 for genai at both 6,000 and 4,619; else M -
+  max_tokens + est) / apifix's estimate (prompt / chars per token + est), kept for the job
+  (largest seen, `job.limits.server_ratio`); every estimate against the limit (`_fits`,
+  batch planning) is multiplied by it. The in-advance cap below is not. The limit is kept
+  for the job: every later request whose estimate
   (prompt characters / the job's lowest characters per token, plus the margin) leaves less
   than its `max_tokens` is sent with `max_tokens` lowered to fit in advance, when that still
   leaves `est` (`max_tokens_capped_from` on the response); otherwise as before.
@@ -603,7 +622,10 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   failed or a verifier reason or remaining finding points at it (`attempts[].kept_files`).
 - Verifier feedback for Python files shows a test whose output starts with the same line as an
   earlier one's as "(same error as ...)", and adds the migration's `failure_hints` when their
-  marker appears in failing output (openai: the missing-API-key error). Dependency files get
+  marker appears in failing output (openai: the missing-API-key error, httpx 0.28's
+  `proxies`, and `Mock object has no attribute 'completions'`: autospec on a client class,
+  the advice of the autospec check). Agent mode's feedback after a failed verification gets
+  the same hints. Dependency files get
   the problem list without test output, plus the tail of pip's output when the install failed.
 - The file plus its read-only context (the other files already changed in the working copy)
   share one byte budget, `whole_file_max_bytes` (24,000 by default, `--max-file-bytes`). Python
@@ -895,7 +917,11 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   not sent yet stay at their original text. Applies to a batch's first request (later
   attempts: previous diffs) and to check retries (each group with its own regions' errors; a
   split retry is one `check_retry` nudge, and a failed group fails the batch). Recorded per
-  batch as `splits` (`ids`, `groups`, `reason` `limit` | `refused`, `check_retry`). A single
+  batch as `splits` (`ids`, `groups`, `reason` `limit` | `refused` | `truncated`,
+  `check_retry`). After a refusal (refused again after lowering, or not fixable by fewer reply
+  tokens) the groups come from the estimate scaled by `server_ratio`; when that still packs
+  every region into one group (the server counted it over the limit whatever the estimate
+  says), they go in halves by bytes. A refused group is split again the same way. A single
   region that does not fit is sent as it is (a refusal then stops the job).
 - Later attempts send every region from the original with per-region previous diffs (a file
   last accepted as a whole file gets the whole-file diff), plus regions the verification points
@@ -984,6 +1010,15 @@ Known limitations:
   (chat completions, preflight); model listing and `/api/ps` do not wait. Waits count in
   request `duration_s`; one job note keeps the running total. Other `x-ratelimit-*` headers
   are not read, and nothing paces requests before the server refuses one.
+- `--reasoning-effort low|medium|high`: sent as `reasoning_effort` in every request body,
+  preflight included; omitted by default. An HTTP 400/422 whose message names
+  `reasoning_effort` / "reasoning effort" while it is set is reported as "the server rejected
+  reasoning_effort=... : model M or this server does not accept --reasoning-effort; run without
+  it" (the job stops). Recorded as `job.reasoning_effort` and on the report's Model line.
+  Reasoning tokens: `usage.completion_tokens_details.reasoning_tokens` when the server reports
+  it (`Usage.reasoning_tokens`, part of `output_tokens`, not added to the total; summed per
+  attempt and job; the report's Tokens line names them). Reasoning text the server returns
+  (`message.reasoning`) is kept in `provider_blocks` but never counted or estimated.
 - HTTP 413 / "request too large" gets an error naming `--max-output-tokens` and
   `--max-file-bytes` (some free tiers count the requested `max_tokens`, 16,000 by default,
   against their per-minute token limit). When the message states the per-minute limit and the

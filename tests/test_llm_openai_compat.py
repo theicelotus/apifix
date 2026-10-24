@@ -1184,3 +1184,77 @@ def test_preflight_without_tools_still_reports_server_errors():
     llm, _ = make(error(404, "model 'nope' not found"), error(404, "x"))
     with pytest.raises(LLMError, match="not found"):
         llm.preflight(require_tools=False)
+
+
+# --- --reasoning-effort (docs/plans/genai-run-5.md) -------------------------------------------
+
+
+def test_reasoning_effort_is_sent_only_when_set():
+    llm, http = make(reply("done"), reply("done"))
+    complete(llm)
+    assert "reasoning_effort" not in http.body()
+    llm, http = make(reply("done"), reasoning_effort="low")
+    complete(llm)
+    assert http.body()["reasoning_effort"] == "low"
+    assert llm.reasoning_effort == "low"
+
+
+def test_reasoning_effort_is_in_the_preflight_too():
+    llm, http = make(reply("OK"), error(404, "not found"), reasoning_effort="high")
+    llm.preflight(require_tools=False)  # then /api/ps: not Ollama
+    assert http.body(0)["reasoning_effort"] == "high"
+
+
+def test_unknown_reasoning_effort_is_refused():
+    with pytest.raises(LLMError, match="unknown reasoning effort 'max'"):
+        make(reasoning_effort="max")
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "`reasoning_effort` is not supported with this model",
+        "Unrecognized request argument supplied: reasoning_effort",
+        "reasoning effort is not available for this model",
+    ],
+)
+def test_a_rejected_reasoning_effort_says_so(message):
+    llm, _ = make(error(400, message), reasoning_effort="medium", model="llama-3.3-70b")
+    with pytest.raises(LLMError) as exc:
+        complete(llm)
+    text = str(exc.value)
+    assert text.startswith("the server rejected reasoning_effort='medium' (HTTP 400")
+    assert "model llama-3.3-70b or this server does not accept --reasoning-effort" in text
+    assert "run without it" in text
+
+
+def test_a_400_about_something_else_is_not_blamed_on_reasoning_effort():
+    llm, _ = make(error(400, "invalid message role"), reasoning_effort="low")
+    with pytest.raises(LLMError, match="HTTP 400 from .*: invalid message role$"):
+        complete(llm)
+    # without the option, a message naming it is an ordinary error
+    llm, _ = make(error(400, "reasoning_effort: bad"))
+    with pytest.raises(LLMError, match="^HTTP 400"):
+        complete(llm)
+
+
+def test_reasoning_tokens_are_read_from_the_usage():
+    body = {
+        "model": "openai/gpt-oss-20b",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "x"}}],
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 900,
+            "completion_tokens_details": {"reasoning_tokens": 700},
+        },
+    }
+    llm, _ = make(HTTPResponse(200, json.dumps(body).encode()))
+    usage = complete(llm).usage
+    assert (usage.output_tokens, usage.reasoning_tokens, usage.total) == (900, 700, 1000)
+    llm, _ = make(reply("x"))  # not reported: 0
+    assert complete(llm).usage.reasoning_tokens == 0
+
+
+def test_usage_adds_reasoning_tokens():
+    total = Usage(1, 10, reasoning_tokens=4) + Usage(2, 20, reasoning_tokens=5)
+    assert (total.output_tokens, total.reasoning_tokens, total.total) == (30, 9, 33)

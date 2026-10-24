@@ -303,8 +303,22 @@ sections, less failing-test output, and test files see the other changed files a
 statements or just the lines that use the library; a file that would not fit whole goes as
 regions, and regions that would not fit one request (a retry, or a later attempt with each
 region's previous version) go in groups, with the reply allowance lowered in advance instead of
-waiting for a refusal. If a single region is still refused, the job stops and says why; use a
-model with a higher limit then.
+waiting for a refusal. A request that is refused again after the allowance was lowered (the hosted provider
+counted one at 9,125 tokens both with 6,000 and with 4,619 reply tokens) is split into smaller
+groups, by an estimate scaled to what the server counted, else in halves, and apifix counts
+that much more per request for the rest of the job. If a single region is still refused, the
+job stops and says why; use a model with a higher limit then.
+
+Replies cut off at the output limit: reasoning models (gpt-oss, for example) spend reply tokens
+thinking before they answer, so a reply can stop before its code block is complete. apifix
+then sends the same request again with the most reply tokens it may have (`--max-output-tokens`,
+within a known per-minute limit), and keeps that allowance for the file; if that reply is cut
+off too, a whole file goes again as regions and a region request in halves, down to one region.
+Only a single region cut off at the full allowance fails the file. Each step is in the
+trajectory (`truncations`, `splits`) and the report. `--reasoning-effort low|medium|high`
+(openai-compat) sends `reasoning_effort` with every request (the hosted provider accepts it for gpt-oss);
+it is not sent by default, a server that rejects it stops the job with a message saying so,
+and reasoning tokens the server reports are listed in the report's token line.
 
 Network blips: once the endpoint has answered, a connection that fails mid-job (DNS failure,
 refused, reset) is retried after 30, 60 and 120 s before the job stops; the report notes the

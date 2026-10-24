@@ -50,6 +50,15 @@ class OpenAIV1Migration:
             "openai>=1.55.3 (it needs typing_extensions>=4.11, so raise an older pin of that "
             "too), or keep the old openai and pin httpx<0.28.",
         ),
+        (
+            # agent mode and `apifix verify` see autospec on a client class only here
+            # (whole-file mode rejects it before verifying: code_checks.autospec_client_problems)
+            "Mock object has no attribute 'completions'",
+            'a client class patched with autospec=True (patch("app.OpenAI", autospec=True)) '
+            "gives an instance without chat.completions: in 1.x the client's resources are "
+            "cached properties, which autospec does not follow. Drop autospec=True when "
+            'patching the client class (patch("app.OpenAI")), or autospec the method instead.',
+        ),
     )
     # A client must be constructible with the installed versions (a dummy key; nothing is sent:
     # the network is off and constructing a client makes no request).

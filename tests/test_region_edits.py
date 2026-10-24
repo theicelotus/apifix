@@ -9,6 +9,7 @@ import pytest
 from apifix import cli
 from tests.test_agent import (
     APP_NEW,
+    GOOD,
     TESTS_OLD,
     FakeLLM,
     JudgingSandbox,
@@ -512,3 +513,141 @@ def test_a_request_over_a_known_limit_is_split_before_it_is_sent(big, monkeypatc
     assert entry["batches"][0]["splits"][0]["reason"] == "limit"
     assert entry["batches"][0]["splits"][0]["groups"] == [["R1"], ["R2"]]
     assert len(llm.requests) == 4  # nothing refused: split before sending
+
+
+# --- replies cut off, refusals fewer reply tokens cannot fix (docs/plans/genai-run-5.md) -------
+
+
+def cut() -> object:
+    """A reply that hit the output limit (a reasoning model thinking past max_tokens)."""
+    from apifix.engine.llm import LLMResponse
+    from tests.test_agent import USAGE
+
+    return LLMResponse(
+        "```python\nimport openai\n", [], "max_tokens", USAGE, "fake-model", "length"
+    )
+
+
+def test_a_cut_off_whole_file_is_sent_again_with_more_reply_tokens(repo):
+    from tests.test_agent import budget
+
+    llm = FakeLLM([cut(), block(APP_NEW), block(TESTS_NEW)])
+    result = wf(repo, llm)
+    assert result.outcome == "verified"
+    assert llm.max_tokens_seen == [budget(APP_OLD), 16_000, budget(TESTS_OLD)]
+    assert request_texts(llm)[0] == request_texts(llm)[1]  # the same request again
+    app_entry = files_of(result)[0]
+    assert app_entry["accepted"] and len(app_entry["replies"]) == 2
+    assert app_entry["truncations"] == [
+        {"response": 0, "max_tokens": budget(APP_OLD), "then": "more_reply_tokens"}
+    ]
+    # later attempts of the file keep the most reply tokens (the file needed them)
+    llm = FakeLLM([cut(), block(APP_NEW + "# BREAK\n"), block(TESTS_NEW)] + list(GOOD))
+    result = wf(repo, llm, JudgingSandbox())
+    assert result.outcome == "verified" and llm.max_tokens_seen[3] == 16_000
+
+
+def test_a_whole_file_cut_off_at_the_most_reply_tokens_goes_as_regions(big):
+    llm = FakeLLM([block(APP_NEW), cut(), cut(), GOOD_REGIONS])
+    result = wf(big, llm, region_threshold_bytes=100_000)  # whole by size
+    assert result.outcome == "verified"
+    whole, entry = files_of(result)[1:]
+    assert whole["form"] == "whole" and whole["switched_to_regions"]
+    assert [t["then"] for t in whole["truncations"]] == ["more_reply_tokens", "regions"]
+    assert whole["error"].endswith("(at 16,000 reply tokens)")
+    assert (entry["form"], entry["form_reason"], entry["accepted"]) == (
+        "regions",
+        "truncated",
+        True,
+    )
+    assert llm.max_tokens_seen[3] == 16_000  # regions get the most reply tokens too
+    assert "its whole-file reply was cut off at the output limit" in result.report_markdown
+
+
+def test_a_cut_off_region_request_is_retried_with_fewer_regions(big):
+    llm = FakeLLM(
+        [
+            block(APP_NEW),
+            cut(),  # R1 and R2 at the estimated budget
+            cut(),  # R1 and R2 at the most reply tokens
+            regions(("IMPORTS", IMPORTS_NEW), ("R1", R1_NEW)),
+            regions(("R2", R2_NEW)),
+        ]
+    )
+    result = wf(big, llm)
+    assert result.outcome == "verified"
+    entry = files_of(result)[1]
+    assert [(t["ids"], t["then"]) for t in entry["truncations"]] == [
+        (["R1", "R2"], "more_reply_tokens"),
+        (["R1", "R2"], "smaller_groups"),
+    ]
+    assert entry["batches"][0]["splits"] == [
+        {
+            "ids": ["R1", "R2"],
+            "groups": [["R1"], ["R2"]],
+            "reason": "truncated",
+            "check_retry": False,
+        }
+    ]
+    assert llm.max_tokens_seen[2:] == [16_000, 16_000, 16_000]
+    first_group, second_group = request_texts(llm)[3:]
+    assert "Region R1:" in first_group and "Region R2:" not in first_group
+    assert "Region R2:" in second_group and "b/tests/test_app.py R1" in second_group
+
+
+def test_a_single_region_cut_off_at_the_most_reply_tokens_fails_the_file(big):
+    llm = FakeLLM([block(APP_NEW), cut(), cut(), cut()])
+    result = wf(big, llm, max_retries=0)
+    entry = files_of(result)[1]
+    assert not entry["accepted"]
+    assert entry["error"] == (
+        "the reply hit the output limit before the regions were complete (at 16,000 reply tokens)"
+    )
+    assert [t["then"] for t in entry["truncations"]] == [
+        "more_reply_tokens",
+        "smaller_groups",
+        "failed",
+    ]
+    assert len(llm.requests) == 4  # R2's group is not sent
+    assert "Replies cut off at the output limit: 3" in result.report_markdown
+
+
+def test_a_region_request_refused_again_after_lowering_is_split(big):
+    # genai-gptoss20b-1: the hosted provider counted the request at 9,125 both at max_tokens 6,000 and at the
+    # lowered 4,619, while apifix's estimate said all four regions fit 8,000
+    llm = FakeLLM(
+        [
+            block(APP_NEW),
+            too_large(8_000, 8_100),
+            too_large(8_000, 8_100),  # the same count with fewer reply tokens
+            regions(("IMPORTS", IMPORTS_NEW), ("R1", R1_NEW)),
+            regions(("R2", R2_NEW)),
+        ]
+    )
+    result = wf(big, llm)
+    assert result.outcome == "verified"
+    assert llm.max_tokens_seen[2] == llm.max_tokens_seen[1] - 356  # lowered once
+    entry = files_of(result)[1]
+    assert entry["batches"][0]["splits"] == [
+        {"ids": ["R1", "R2"], "groups": [["R1"], ["R2"]], "reason": "refused", "check_retry": False}
+    ]
+    limits = result.trajectory["job"]["limits"]
+    assert limits["per_minute"] == 8_000 and limits["server_ratio"] > 1
+
+
+def test_a_refusal_the_estimate_cannot_explain_is_sent_in_halves(big):
+    # the server's count leaves room for the reply, yet it refused: no estimate says how to
+    # split, so the regions go in halves
+    llm = FakeLLM(
+        [
+            block(APP_NEW),
+            too_large(8_000, 7_000),
+            regions(("IMPORTS", IMPORTS_NEW), ("R1", R1_NEW)),
+            regions(("R2", R2_NEW)),
+        ]
+    )
+    result = wf(big, llm)
+    assert result.outcome == "verified"
+    (split,) = files_of(result)[1]["batches"][0]["splits"]
+    assert (split["groups"], split["reason"]) == ([["R1"], ["R2"]], "refused")
+    assert result.trajectory["job"]["limits"]["server_ratio"] == 1.0

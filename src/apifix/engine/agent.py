@@ -353,7 +353,9 @@ def task_prompt(
     return "\n".join(lines)
 
 
-def feedback_prompt(attempt: Attempt) -> str:
+def feedback_prompt(attempt: Attempt, hints: Sequence[tuple[str, str]] = ()) -> str:
+    """Agent mode: the verifier's problems after a failed attempt, with the migration's
+    failure hints whose marker appears in the failing output."""
     v = attempt.verification
     if v is None:
         return (
@@ -364,7 +366,7 @@ def feedback_prompt(attempt: Attempt) -> str:
         f"The verifier did not accept attempt {attempt.number} (verdict: {v.verdict}). "
         "Fix the problems below by editing the code; do not weaken, skip or delete tests.",
         "",
-        *feedback_lines(v, max_reasons=MAX_FEEDBACK_REASONS),
+        *feedback_lines(v, max_reasons=MAX_FEEDBACK_REASONS, hints=hints),
     ]
     out.append("Continue editing; end your turn with a short summary when done.")
     return "\n".join(out).rstrip()
@@ -438,6 +440,15 @@ class _Job:
         # it), and the fewest characters per prompt token its responses showed.
         self.token_limit: int | None = None
         self.chars_per_token: float | None = None
+        # How much more than apifix's estimate (prompt / chars_per_token + the reply estimate)
+        # the server counted a request it refused even after max_tokens was lowered (the hosted provider
+        # counted genai's 9,125 both at max_tokens 6,000 and 4,619): estimates against the
+        # limit are scaled by it for the rest of the job. 1.0 until such a refusal.
+        self.server_ratio = 1.0
+        # whole-file: files whose reply was cut off at the output limit; their requests get
+        # the most reply tokens a request may have (--max-output-tokens, within a known
+        # limit) instead of reply_budget's estimate, for the rest of the job
+        self.wf_full_reply: set[str] = set()
         # Dependency pins apifix set itself (pin_edits): the files written into the working
         # copy, the entries it did not set, the files it never sends (hash-pinned), and the
         # findings the model still has to handle.
@@ -544,14 +555,11 @@ class _Job:
         self._check_budget_before_call(messages, max_tokens, system)
         prompt_chars = self._input_chars(messages, system)
         capped_from = None
-        if self.token_limit is not None:
-            # a known per-minute limit counts max_tokens: lower it in advance (by estimate)
-            # rather than be refused first, if that leaves the reply what it needs
-            room = self.token_limit - token_limit_margin(self.token_limit)
-            room -= self._tokens(prompt_chars)
-            if need_tokens <= room < max_tokens:
-                capped_from, max_tokens = max_tokens, room
+        capped = self._capped_max_tokens(prompt_chars, max_tokens, need_tokens)
+        if capped < max_tokens:
+            capped_from, max_tokens = max_tokens, capped
         lowered_from: int | None = None
+        first_requested = 0
         start = time.monotonic()
         try:
             while True:
@@ -565,8 +573,21 @@ class _Job:
                     )
                     break
                 except RequestTooLarge as exc:
-                    fit = self._fitting_max_tokens(exc, max_tokens, need_tokens, lowered_from)
+                    try:
+                        fit = self._fitting_max_tokens(exc, max_tokens, need_tokens, lowered_from)
+                    except _CannotFit:
+                        if lowered_from is not None:  # refused again with fewer reply tokens
+                            self._learn_server_count(
+                                exc,
+                                prompt_chars,
+                                need_tokens,
+                                max_tokens,
+                                # the count did not change with max_tokens: it ignores them
+                                counts_reply=exc.requested != first_requested,
+                            )
+                        raise
                     lowered_from, max_tokens = max_tokens, fit
+                    first_requested = exc.requested
         except LLMError as exc:
             limit = exc.limit if isinstance(exc, _CannotFit) else None
             raise _Abort("provider_error", str(exc), limit=limit) from exc
@@ -613,6 +634,33 @@ class _Job:
         self._check_budget_after_call()
         return response
 
+    def _capped_max_tokens(self, prompt_chars: int, max_tokens: int, need: int) -> int:
+        """`max_tokens` lowered in advance to fit a known per-minute limit (which counts them),
+        by estimate, if that still leaves the reply what it needs; else unchanged."""
+        if self.token_limit is None:
+            return max_tokens
+        room = self.token_limit - token_limit_margin(self.token_limit)
+        room -= self._tokens(prompt_chars)
+        return room if need <= room < max_tokens else max_tokens
+
+    def _learn_server_count(
+        self,
+        exc: RequestTooLarge,
+        prompt_chars: int,
+        need: int,
+        max_tokens: int,
+        *,
+        counts_reply: bool,
+    ) -> None:
+        """A request the server refused again after max_tokens was lowered: how much more than
+        apifix's estimate (as `_fits` makes it: prompt plus the reply estimate) the server
+        counted. A server that counts max_tokens is compared with its reply allowance replaced
+        by the estimate."""
+        server = exc.requested - max_tokens + need if counts_reply else exc.requested
+        ours = self._tokens(prompt_chars) + need
+        if ours > 0 and server > ours:
+            self.server_ratio = max(self.server_ratio, server / ours)
+
     def _fitting_max_tokens(
         self, exc: RequestTooLarge, max_tokens: int, need: int, lowered_from: int | None
     ) -> int:
@@ -629,7 +677,7 @@ class _Job:
         prompt = exc.requested - max_tokens  # the server's count of the prompt itself
         fit = exc.limit - prompt - token_limit_margin(exc.limit)
         if fit >= max_tokens:  # the server's figure does not include the reply allowance
-            raise LLMError(str(exc))
+            raise _CannotFit(str(exc), exc.limit)
         if fit < need:
             left = f"{max(fit, 0):,} reply tokens" if fit > 0 else "no reply tokens"
             raise _CannotFit(
@@ -861,9 +909,13 @@ class _Job:
         return math.ceil(chars / (self.chars_per_token or DEFAULT_CHARS_PER_TOKEN))
 
     def _fits(self, chars: int, reply: int) -> bool:
-        """Does a request of `chars` prompt characters plus `reply` tokens fit the limit?"""
+        """Does a request of `chars` prompt characters plus `reply` tokens fit the limit (by
+        estimate, scaled by what refusals showed the server counts)?"""
         limit = self._limit()
-        return limit is None or self._tokens(chars) + reply + token_limit_margin(limit) <= limit
+        if limit is None:
+            return True
+        estimate = math.ceil((self._tokens(chars) + reply) * self.server_ratio)
+        return estimate + token_limit_margin(limit) <= limit
 
     def _system_for(self, path: str) -> tuple[str, str, list[str] | None]:
         """(system prompt, its guide, guide part ids) of a request for `path`: the job's, or
@@ -948,7 +1000,7 @@ class _Job:
                 path, original, text, reason, repeated=_repeated_text(repeated)
             )
         tokens = file_tokens(original, self._read(self.work, path))
-        max_tokens = reply_budget(tokens, self.config.max_output_tokens)
+        max_tokens = self._reply_tokens(path, tokens)
         guide = self._extra_guide(path)
         system, system_guide, sections = self._system_for(path)
         compact = self._limit() is not None and is_test_file(path, root=self.repo)
@@ -1036,11 +1088,34 @@ class _Job:
                 }
                 entry["replies"].append(reply)
                 entry.pop("failed_checks", None)
+                if parsed.outcome == "truncated":
+                    # a smaller request: the same one with more reply tokens, else as regions
+                    sent_max = attempt.responses[-1]["max_tokens"]
+                    prompt_chars = self._input_chars(messages[:1], system)
+                    most = self._capped_max_tokens(
+                        prompt_chars, self.config.max_output_tokens, tokens
+                    )
+                    record = {"response": reply["response"], "max_tokens": sent_max}
+                    entry.setdefault("truncations", []).append(record)
+                    was_full = path in self.wf_full_reply
+                    self.wf_full_reply.add(path)  # regions get the most reply tokens too
+                    if most > sent_max and not was_full:
+                        record["then"] = "more_reply_tokens"
+                        max_tokens = self._reply_tokens(path, tokens)
+                        messages = messages[:1]  # the request again, without nudges
+                        sent.append(messages[0])
+                        continue
+                    if self._smaller_as_regions(path, original) and self._switch(path, "truncated"):
+                        record["then"] = "regions"
+                        entry["error"] = _truncated_error("file", sent_max)
+                        entry["switched_to_regions"] = True
+                        switched = True
+                        break
+                    record["then"] = "failed"
+                    entry["error"] = _truncated_error("file", sent_max)
+                    break
                 if parsed.outcome != "ok":
-                    if (
-                        parsed.outcome != "truncated"
-                        and self._nudges(attempt, "code_block") < self.config.max_code_block_nudges
-                    ):
+                    if self._nudges(attempt, "code_block") < self.config.max_code_block_nudges:
                         attempt.nudges.append(
                             {
                                 "kind": "code_block",
@@ -1205,6 +1280,20 @@ class _Job:
             return "regions", "size"
         return "whole", "small"
 
+    def _reply_tokens(self, path: str, tokens: int) -> int:
+        """`max_tokens` for a request that rewrites about `tokens` tokens of `path`: the
+        estimate (reply_budget), or the most a request may have once a reply of the file was
+        cut off at the output limit (lowered to fit a known limit when it is sent)."""
+        if path in self.wf_full_reply:
+            return self.config.max_output_tokens
+        return reply_budget(tokens, self.config.max_output_tokens)
+
+    def _smaller_as_regions(self, path: str, original: str) -> bool:
+        """Would sending `path` as regions make its reply clearly smaller than the whole file
+        (the regions and IMPORTS under REGION_COVERAGE_MAX of it)?"""
+        plan = self.wf_plans.get(path)
+        return plan is not None and coverage(original, plan) < REGION_COVERAGE_MAX
+
     def _switch_to_regions(self, path: str, abort: _Abort) -> bool:
         """A whole file the server refused for its per-minute limit, which fewer reply tokens
         could not fix, is sent as regions instead (auto only, once)."""
@@ -1232,7 +1321,8 @@ class _Job:
             fixed += (
                 len(imports) + len(outline(original, plan)) + len(names_context(original, plan))
             )
-            room = limit - token_limit_margin(limit) - self._tokens(fixed)
+            room = int((limit - token_limit_margin(limit)) / self.server_ratio)
+            room -= self._tokens(fixed)
             room -= -(-len(imports) // REPLY_CHARS_PER_TOKEN)
             per_char = 1 / (self.chars_per_token or DEFAULT_CHARS_PER_TOKEN)
             per_char += 1 / REPLY_CHARS_PER_TOKEN
@@ -1412,7 +1502,7 @@ class _Job:
                 {**parts, **built.parts},
                 chosen,
                 tokens,
-                reply_budget(tokens, self.config.max_output_tokens),
+                self._reply_tokens(path, tokens),
                 note,
                 len(system) + len(built.text),
                 len(kept),
@@ -1422,6 +1512,15 @@ class _Job:
             # a group also shows the changes of the groups before it (at most KEPT_DIFF_CHARS)
             extra = KEPT_DIFF_CHARS - built.kept_chars if grouped else 0
             return self._fits(built.chars + max(extra, 0), built.tokens)
+
+        def sends(send: _Send, groups: list[list[str]]) -> list[_Send]:
+            """One _Send per group of `send`'s regions, each with its own regions' errors."""
+            out = []
+            for group in groups:
+                errors = [e for e, where in send.attributed if set(where) & set(group)]
+                error = join_errors(errors) if errors and send.rejected is not None else send.error
+                out.append(dataclasses.replace(send, ids=group, error=error))
+            return out or [send]
 
         def split(send: _Send) -> list[_Send]:
             """`send`'s regions in groups whose requests fit the known limit, packed greedily
@@ -1436,15 +1535,31 @@ class _Job:
                         groups[-1] = trial
                         continue
                 groups.append([*(head if not groups else []), rid])
-            out = []
-            for group in groups:
-                errors = [e for e, where in send.attributed if set(where) & set(group)]
-                error = join_errors(errors) if errors and send.rejected is not None else send.error
-                out.append(dataclasses.replace(send, ids=group, error=error))
-            return out or [send]
+            return sends(send, groups)
+
+        def halve(send: _Send) -> list[_Send]:
+            """`send`'s regions in two groups of about equal size, in file order (IMPORTS with
+            the first); one group when it has a single region."""
+            ids = [i for i in send.ids if i != IMPORTS]
+            if len(ids) < 2:
+                return [send]
+            total, used, cut = sum(size(i) for i in ids), 0, 1
+            for n, rid in enumerate(ids[:-1], 1):
+                used += size(rid)
+                cut = n
+                if used * 2 >= total:
+                    break
+            head = [IMPORTS] if IMPORTS in send.ids else []
+            return sends(send, [[*head, *ids[:cut]], ids[cut:]])
 
         def requeue(send: _Send, reason: str, queue: list[_Send]) -> bool:
-            groups = split(send)
+            """Send `send` as smaller groups: by the known limit (`limit`); after a refusal,
+            by the limit and else in halves, since the server counted it over the limit
+            whatever the estimate says (`refused`); in halves (`truncated`). False when it
+            is a single region."""
+            groups = halve(send) if reason == "truncated" else split(send)
+            if len(groups) < 2 and reason == "refused":
+                groups = halve(send)
             if len(groups) < 2:
                 return False
             batch = entry["batches"][-1] if entry["batches"] else None
@@ -1525,6 +1640,29 @@ class _Job:
                 if abort.limit is None or not requeue(send, "refused", queue):
                     raise
                 continue
+            if outcome.truncated:
+                # a smaller request: the same one with more reply tokens, else fewer regions
+                sent_max = attempt.responses[-1]["max_tokens"]
+                most = self._capped_max_tokens(
+                    built.chars, self.config.max_output_tokens, built.tokens
+                )
+                record = {
+                    "response": len(attempt.responses) - 1,
+                    "ids": list(send.ids),
+                    "max_tokens": sent_max,
+                }
+                entry.setdefault("truncations", []).append(record)
+                was_full = path in self.wf_full_reply
+                self.wf_full_reply.add(path)  # smaller groups get the most reply tokens too
+                if most > sent_max and not was_full:
+                    record["then"] = "more_reply_tokens"
+                    queue.insert(0, send)
+                    continue
+                if requeue(send, "truncated", queue):
+                    record["then"] = "smaller_groups"
+                    continue
+                record["then"] = "failed"
+                return _BatchOutcome(error=_truncated_error("regions", sent_max))
             if outcome.batch is not None:
                 return outcome.batch
             applied, result = outcome.applied, outcome.result
@@ -1673,7 +1811,7 @@ class _Job:
                     batch=_BatchOutcome(error=f"{error}: {problem}" if problem else error)
                 )
             if parsed.outcome == "truncated":
-                return _Exchange(batch=_BatchOutcome(error=_REGION_PARSE_ERRORS["truncated"]))
+                return _Exchange(truncated=True)
             applied = apply_blocks(original, plan, parsed.blocks, base)
             result: CheckResult | None = None
             errors = applied.errors
@@ -1805,7 +1943,7 @@ class _Job:
                 else:
                     prompt = self._task_prompt()
                     if number > 1:
-                        feedback = feedback_prompt(self.attempts[-2])
+                        feedback = feedback_prompt(self.attempts[-2], self.migration.failure_hints)
                         prompt = f"{prompt}\n\n{feedback}" if not self.messages else feedback
                     self.messages.append(Message("user", text=prompt))
                     self._converse(attempt)
@@ -1973,6 +2111,7 @@ class _Job:
                     "chars_per_token": (
                         round(self.chars_per_token, 2) if self.chars_per_token else None
                     ),
+                    "server_ratio": round(self.server_ratio, 3),
                 },
                 "guide_sections": self.guide_sections,
                 "sandbox_env_placeholders": self.ci_env,
@@ -1985,6 +2124,7 @@ class _Job:
                 "pin_fallbacks": [asdict(b) for b in self.pin_fallbacks],
                 "pin_notes": [n for f in self.pin_files for n in f.notes],
                 "strict_tool_calls": getattr(self.llm, "strict_tool_calls", None),
+                "reasoning_effort": getattr(self.llm, "reasoning_effort", None),
                 "tool_call_example": self.tool_call_example,
                 "config": dataclasses.asdict(self.config),
                 "notes": list(self.llm.notes),
@@ -2141,7 +2281,8 @@ class _Built:
 @dataclass
 class _Exchange:
     """How one region request ended: the batch's outcome (a whole file returned that passed,
-    or a parse error), or the spliced reply with its check errors and the blocks returned."""
+    or a parse error), a reply cut off at the output limit, or the spliced reply with its
+    check errors and the blocks returned."""
 
     batch: _BatchOutcome | None = None
     applied: SpliceResult | None = None
@@ -2149,6 +2290,7 @@ class _Exchange:
     errors: list[str] = field(default_factory=list)
     checks: list[str] = field(default_factory=list)
     blocks: dict[str, str] = field(default_factory=dict)
+    truncated: bool = False  # the reply hit the output limit
 
 
 @dataclass
@@ -2173,6 +2315,39 @@ def _failed_checks(errors: Sequence[str], checks: Sequence[str]) -> list[list[st
 
 def _repeated_text(repeated: Sequence[dict[str, Any]]) -> str:
     return repeated_errors_note([(r["check"], r["error"], r["attempts"]) for r in repeated])
+
+
+_TRUNCATION_THEN = {
+    "more_reply_tokens": "sent again with more reply tokens",
+    "smaller_groups": "sent again in fewer regions per request",
+    "regions": "sent again as regions",
+    "failed": "failed the file (no smaller request left)",
+}
+
+
+def _truncation_lines(job: _Job) -> list[str]:
+    """The report line on replies cut off at the output limit (whole-file mode)."""
+    then = [t["then"] for a in job.attempts for f in a.files for t in f.get("truncations", [])]
+    if not then:
+        return []
+    counts = ", ".join(
+        f"{_TRUNCATION_THEN[k]}: {then.count(k)}" for k in _TRUNCATION_THEN if k in then
+    )
+    line = f"- Replies cut off at the output limit: {len(then)} ({counts})"
+    effort = getattr(job.llm, "reasoning_effort", None)
+    if "failed" in then and job.llm.provider == "openai-compat" and not effort:
+        line += (
+            "; a reasoning model spends reply tokens thinking: --reasoning-effort low "
+            "leaves more of them for the answer"
+        )
+    return [line]
+
+
+def _truncated_error(what: str, max_tokens: int) -> str:
+    """A file that failed because its reply was cut off, at the most reply tokens its request
+    could have (`what`: "file" or "regions")."""
+    errors = _PARSE_ERRORS if what == "file" else _REGION_PARSE_ERRORS
+    return f"{errors['truncated']} (at {max_tokens:,} reply tokens)"
 
 
 _REGION_PARSE_ERRORS = {
@@ -2268,6 +2443,7 @@ def region_edit_lines(job: _Job) -> list[str]:
                 if size > config.whole_file_max_bytes
                 else f"over {config.region_threshold_bytes:,}",
                 "refused": "the server refused it as a whole file",
+                "truncated": "its whole-file reply was cut off at the output limit",
                 "forced": "--file-edits regions",
             }.get(f["form_reason"], f["form_reason"])
             listed = ", ".join(
@@ -2298,6 +2474,7 @@ def report_markdown(
         "no_findings": "Nothing to migrate",
         "already_migrated": "Already migrated (only the tests look out of date)",
     }[result_outcome]
+    effort = getattr(job.llm, "reasoning_effort", None)
     lines = [
         f"# apifix fix: {title}",
         "",
@@ -2305,9 +2482,17 @@ def report_markdown(
         f"- Outcome: {reason}",
         f"- Attempts: {len(job.attempts)} (max {job.config.max_retries + 1})"
         + (f"; changes from attempt {chosen.number}" if chosen else ""),
-        f"- Model: `{job.llm.provider}` / `{job.llm.model}`",
+        f"- Model: `{job.llm.provider}` / `{job.llm.model}`"
+        + (f"; reasoning effort: {effort} (sent as reasoning_effort)" if effort else ""),
         f"- Edit mode: {job.config.edit_mode}",
-        f"- Tokens: {job.usage.total:,}; cost: ${job.cost:.2f}",
+        f"- Tokens: {job.usage.total:,}"
+        + (
+            f" ({job.usage.reasoning_tokens:,} of the output tokens reasoning, as the server "
+            "reported)"
+            if job.usage.reasoning_tokens
+            else ""
+        )
+        + f"; cost: ${job.cost:.2f}",
     ]
     if duration_s is not None:
         lines.append(time_line(job, duration_s))
@@ -2341,6 +2526,7 @@ def report_markdown(
         lines.append(
             f"- Files that failed a check and were sent back once: {nudges.count('check_retry')}"
         )
+    lines += _truncation_lines(job)
     for name, workflow in job.ci_env.items():
         lines.append(
             f"- Sandbox env: `{name}` set to a placeholder in the test phase, because the repo's "

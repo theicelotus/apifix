@@ -160,8 +160,15 @@ def test_client_config_part_only_for_values_that_must_be_kept():
 
 
 def test_module_client_failure_hint():
-    (_, hint), _ = get_migration("openai-v1").failure_hints
+    (_, hint), *_ = get_migration("openai-v1").failure_hints
     assert 'openai.api_key = "test"' in hint and "module-level client" in hint
+
+
+def test_autospec_client_failure_hint():
+    hints = dict(get_migration("openai-v1").failure_hints)
+    hint = hints["Mock object has no attribute 'completions'"]
+    assert "autospec=True" in hint and "cached properties" in hint
+    assert 'patch("app.OpenAI")' in hint
 
 
 def test_resources_table_keeps_only_used_rows():
