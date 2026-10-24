@@ -110,6 +110,49 @@ def test_fix_that_breaks_a_test_is_rejected(sandbox, original, baseline, tmp_pat
     assert v.rerun is not None  # the new failure was rerun before being blamed
 
 
+AUTOSPEC_APP = """\
+    from openai import OpenAI
+
+
+    def ask(question):
+        client = OpenAI(api_key="unused-in-tests")
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": question}],
+        )
+        return response.choices[0].message.content.strip()
+    """
+
+
+def test_autospec_on_the_client_class_is_a_regression_with_its_message(
+    sandbox, original, baseline, tmp_path
+):
+    # genai-gptoss-4: autospec=True kept when the patch moved to the client class; the real
+    # openai 1.x client's resources are cached properties, which autospec does not follow
+    tests = GOOD_TESTS.replace(
+        '@mock.patch("app.client.chat.completions.create")\n    def test_ask(create):\n'
+        "        create.return_value",
+        '@mock.patch("app.OpenAI", autospec=True)\n    def test_ask(OpenAI):\n'
+        "        OpenAI.return_value.chat.completions.create.return_value",
+    ).replace(
+        '@mock.patch("app.client.chat.completions.create")\n    def test_strips_whitespace(',
+        '@mock.patch("openai.resources.chat.completions.Completions.create", autospec=True)\n'
+        "    def test_strips_whitespace(",
+    )
+    files = {**GOOD_FIX, "app.py": AUTOSPEC_APP, "tests/test_app.py": tests}
+    v = check(sandbox, original, baseline, tmp_path, files)
+    assert v.verdict == "rejected", v.report_markdown()
+    (regression,) = [r for r in v.reasons if r.code == "regression"]
+    assert regression.tests == ("tests.test_app::test_ask",)  # autospec on the method passes
+    message = v.delta.regression_messages["tests.test_app::test_ask"]
+    assert message.startswith("AttributeError: Mock object has no attribute 'completions'")
+    assert 1 < len(message.splitlines()) <= 5
+    assert (
+        "- `tests.test_app::test_ask`: now fails: `AttributeError: Mock object has no "
+        "attribute 'completions'`\n"
+    ) in v.report_markdown()
+
+
 def test_fix_that_deletes_a_test_is_rejected(sandbox, original, baseline, tmp_path):
     # Keep everything up to the second test, i.e. delete test_strips_whitespace.
     fewer = GOOD_TESTS[: GOOD_TESTS.rindex('    @mock.patch("app.client')]

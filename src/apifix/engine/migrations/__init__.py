@@ -35,6 +35,10 @@ class Migration(Protocol):
     known_imports: Mapping[str, str]
     # call path (e.g. "chat.completions.create") -> an object-shaped example response for mocks
     mock_responses: Mapping[str, str]
+    # The library's client classes and the resource attributes of their instances: a test that
+    # patches a client class with autospec=True cannot use them (code_checks).
+    client_classes: frozenset[str]
+    client_resources: frozenset[str]
     # Runs in the sandbox after the fixed code's dependencies are installed (no network, no repo
     # code); a failure is reported to the model as a dependency problem. None: no check.
     smoke_check: SmokeCheck | None

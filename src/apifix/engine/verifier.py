@@ -65,8 +65,9 @@ MAX_LISTED = 15
 # of a hunk, at most this long)
 REVIEW_VERDICTS = frozenset({"verified_weak", "unverified"})
 REVIEW_CHARS = 100
-# first line of a no-signal test's failure message in the report
+# first line of a no-signal or newly failing test's failure message in the report
 MESSAGE_HEAD_CHARS = 160
+REGRESSION_MESSAGE_LINES = 5  # lines of a newly failing test's message kept in the outputs
 PYTEST_COLLECTION_FAILURE = "collection failure"
 # pip output kept per failed install phase in run summaries (the tail: that is where pip's
 # error is)
@@ -126,6 +127,9 @@ class TestDelta:
     # each no_signal_* entry -> why it fails: {"baseline": ..., "fixed": ...}, the runs' failure
     # messages (clipped when the test output is parsed, like every test's message)
     no_signal_messages: dict[str, dict[str, str]] = field(default_factory=dict)
+    # each newly_failing / newly_erroring test -> the first REGRESSION_MESSAGE_LINES lines of
+    # its failure message on the fixed code (already clipped when the output was parsed)
+    regression_messages: dict[str, str] = field(default_factory=dict)
     # No usable baseline: tests that fail or error on the fixed code (collection errors as their
     # module), which cannot be compared with anything and so are never regressions.
     failing_without_baseline: list[str] = field(default_factory=list)
@@ -471,6 +475,8 @@ def compare_runs(
                 delta.newly_failing.append(test_id)
             elif f.outcome == "error":
                 delta.newly_erroring.append(test_id)
+            if f.outcome in ("failed", "error"):
+                delta.regression_messages[test_id] = _message_lines(f.message)
             elif f.outcome == "skipped":
                 delta.newly_skipped.append(test_id)
         elif b.outcome in ("failed", "error"):
@@ -493,6 +499,8 @@ def compare_runs(
             delta.newly_failing.append(test_id)
         elif f.outcome == "error":
             delta.newly_erroring.append(test_id)
+        if f.outcome in ("failed", "error"):
+            delta.regression_messages[test_id] = _message_lines(f.message)
 
     if again:
         for bucket in (delta.newly_failing, delta.newly_erroring):
@@ -500,6 +508,7 @@ def compare_runs(
                 if again.get(test_id) and again[test_id].outcome == "passed":
                     bucket.remove(test_id)
                     delta.flaky.append(test_id)
+                    delta.regression_messages.pop(test_id, None)
     return delta
 
 
@@ -623,9 +632,25 @@ def review_by_hand(
     return out
 
 
+def _message_lines(message: str) -> str:
+    """The first REGRESSION_MESSAGE_LINES non-blank lines of a failure message."""
+    lines = [line.rstrip() for line in message.splitlines() if line.strip()]
+    return "\n".join(lines[:REGRESSION_MESSAGE_LINES])
+
+
 def _why_failing(delta: TestDelta, test_id: str) -> str:
     """ ": <first line of the original run's failure message>" for a no-signal test, or ""."""
-    message = delta.no_signal_messages.get(test_id, {}).get("baseline", "")
+    return _message_head(delta.no_signal_messages.get(test_id, {}).get("baseline", ""))
+
+
+def _why_regressed(delta: TestDelta, test_id: str) -> str:
+    """ ": <first line of the fixed run's failure message>" for a regression, or ""."""
+    return _message_head(delta.regression_messages.get(test_id, ""))
+
+
+def _message_head(message: str) -> str:
+    """ ": `<first line>`" of a failure message (pytest's bare collection-failure line
+    skipped), at most MESSAGE_HEAD_CHARS, or "" for an empty message."""
     lines = [line.strip() for line in message.splitlines() if line.strip()]
     if lines and lines[0] == PYTEST_COLLECTION_FAILURE and len(lines) > 1:
         lines = lines[1:]  # pytest's JUnit message for every collection error says only that
@@ -1411,6 +1436,14 @@ def _report(v: Verification) -> str:
         )
         out.append("")
 
+    d = v.delta
+    regressed = [(t, "now fails") for t in d.newly_failing]
+    regressed += [(t, "now errors") for t in d.newly_erroring]
+    if regressed:
+        out += ["### Tests that now fail", ""]
+        out += _bullets([f"`{t}`: {how}{_why_regressed(d, t)}" for t, how in regressed])
+        out.append("")
+
     if v.review_by_hand:
         out += ["### Review by hand", "", "No test executed these changes:", ""]
         out += [f"- {review_line(e)}" for e in v.review_by_hand[:MAX_LISTED]]
@@ -1420,7 +1453,6 @@ def _report(v: Verification) -> str:
 
     out += _not_installed_section(v.fixed.not_installed or v.baseline.not_installed)
 
-    d = v.delta
     if d.fixed_by_change:
         out += ["### Tests fixed by the change", ""] + _bullets(
             [f"`{t}`" for t in d.fixed_by_change]

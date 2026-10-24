@@ -122,3 +122,78 @@ carries this run's `openai = ">=1.0,<2"` (the old spec); verify uses the diff as
   examples and the Tests guide part ("drop autospec when patching the client class").
 - The verify outputs keep no failure messages for regressions (they were read by rerunning the
   fixed tree); a few lines per newly failing test in verification.json would help.
+
+## Amendments
+
+### Request: the two "Later" items
+
+Read CLAUDE.md and docs/plans/genai-run-4.md. Build its two “Later” items, recording this request verbatim in that plan’s Amendments section:
+
+autospec on a patched client class: in the mock-target check, reject a new or changed patch(..., autospec=True) (decorator, context manager or mocker.patch) whose target is an openai client class (OpenAI, AsyncOpenAI, AzureOpenAI, …, through any module path) when the test then uses .return_value.chat / .completions / other resource attributes. Message: an autospecced 1.x client has no chat.completions (resources are cached properties), so drop autospec=True when patching the client class, or autospec the method instead. Add a line saying so to the Tests guide part and the mock examples. Replay genai-gptoss-4 attempt 1’s test files: they must be rejected with this message.
+Failure messages for regressions: keep a few lines of each newly failing test’s message in verification.json and the trajectory (clipped like other messages) and show the first line in the report, as for no-signal tests.
+
+Synthetic fixtures. Fast suite, Docker if the network allows, and ruff, then commit.
+
+### Plan (as built)
+
+1. **Autospec on a patched client class** (`code_checks.autospec_client_problems`, run by
+   `mock_target_problems`, so check `mock_targets` in whole-file mode). The migration supplies
+   `client_classes` (openai-v1: `OpenAI`, `AsyncOpenAI`, `AzureOpenAI`, `AsyncAzureOpenAI`) and
+   `client_resources` (the client's cached properties in openai 1.109.1: `chat`, `completions`,
+   `embeddings`, ..., `with_raw_response`). A string-target patch with `autospec=True` whose
+   target ends in a client class (any module path), or names one through a repo module's
+   import (`from openai import OpenAI as Client`), is an error when the function its mock
+   lands in uses a resource on the instance: `<mock>.return_value.chat...`, or through a name
+   assigned from `<mock>.return_value` (genai's `client = OpenAI.return_value`). The mock is
+   the parameter a decorator fills (lowest first; class decorators per test method; patches
+   given `new` fill none), `with ... as m`, `m = mocker.patch(...)`, `m = patch(...).start()`.
+   Exempt: `return_value=` on the patch, a scope that sets `<mock>.return_value` itself, and
+   uses the original already had (same target and function), so "new or changed" means a
+   (target, function) pair the original did not have. One error per target:
+
+   > mock target 'genai.generate.OpenAI' is patched with autospec=True, and test_custom_exc
+   > uses OpenAI.return_value.chat.completions (line 28) (and likewise in: ...): an
+   > autospecced 1.x client has no chat.completions (resources are cached properties), so drop
+   > autospec=True when patching the client class (patch("genai.generate.OpenAI")), or
+   > autospec the method instead
+
+   It starts with `mock target '<target>'`, so region edits attribute it to the regions that
+   quote the target. Checked against openai 1.109.1: `patch("openai.OpenAI", autospec=True)`
+   gives `return_value.chat` (specced on the cached_property object) with no `completions`;
+   `patch("openai.resources.chat.completions.Completions.create", autospec=True)` works.
+2. **Guide**: a Tests-part bullet ("Drop `autospec=True` when patching a client class ...
+   Autospec the method instead (`...Completions.create`, autospec=True)") and a comment line
+   in the client-class mock example.
+3. **Regression messages** (`TestDelta.regression_messages`): each newly failing / erroring
+   test (new tests that fail too) -> the first 5 non-blank lines of the fixed run's message
+   (already clipped to 500 characters at parsing); dropped for a test that passes the flaky
+   rerun. verification.json and the trajectories carry it (`tests.regression_messages`). The
+   report gets "### Tests that now fail" after "Why this verdict": `` `id`: now fails:
+   `<first line>` `` (or "now errors"), with the no-signal list's first-line rule (shared
+   `_message_head`).
+4. Fixture `tests/fixtures/autospec_client` (synthetic, genai-shaped: the tests patch
+   `openai.ChatCompletion.create` with `autospec=True`). Tests: the check's forms and
+   exemptions, check_candidate, an agent check retry, a pytest run against an openai stub with
+   cached-property resources (autospec on the class fails, dropping it or autospeccing the
+   method passes), and a Docker test with the real openai 1.x (the autospecced test is a
+   regression whose message is `AttributeError: Mock object has no attribute 'completions'`).
+
+### Replay: genai-gptoss-4 attempt 1's test files
+
+The original from `~/apifix-targets/genai` (HEAD), attempt 1's diff applied to a copy, each
+test file through `check_candidate` with the job's settings (scanner findings, the
+migration's rewrite checks, the fixed copy as the working copy):
+
+- `tests/test_context.py`: rejected (`mock_targets`), "... and test_build_context_assistance
+  uses client.chat.completions (line 157): an autospecced 1.x client has no chat.completions
+  ...".
+- `tests/test_magics.py`: rejected, "test_assist_magic uses mock_client.chat.completions (line
+  12) (and likewise in: test_assist_magic_with_args, test_assist_magic_with_fresh_arg)".
+- `tests/test_suggestions.py`: rejected, "test_custom_exc uses
+  OpenAI.return_value.chat.completions (line 28) (and likewise in:
+  test_custom_exc_fallback_on_In, test_custom_exc_long_traceback,
+  test_custom_exc_error_inside)".
+- `tests/test_generate.py`: ok (it dropped autospec: `@mock.patch("genai.generate.OpenAI")`
+  with its own `mock.Mock()` client).
+
+Every one of the 5 regressions `apifix verify` found is in a test named there.

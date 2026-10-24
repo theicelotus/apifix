@@ -61,6 +61,8 @@ class OpenAIV1Migration:
 
     known_imports = rules.KNOWN_IMPORTS
     mock_responses = rules.MOCK_RESPONSES
+    client_classes = rules.CLIENT_CLASSES
+    client_resources = rules.CLIENT_RESOURCES
     package = rules.PACKAGE
     pin_spec = rules.PIN_SPEC
     companion_pins = rules.COMPANION_PINS

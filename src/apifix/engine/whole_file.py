@@ -612,6 +612,8 @@ def check_candidate(
     findings: Sequence[Finding] | None = None,
     rewrite_checks: Callable[[str, str, str], Mapping[str, list[str]]] | None = None,
     unmigrated_modules: Collection[str] = (),
+    client_classes: Collection[str] = (),
+    client_resources: Collection[str] = (),
 ) -> CheckResult:
     """Syntax (Python files), well-formedness (dependency files), "differs from the original"
     (only when `required`), abbreviation (placeholders, or under half the original's lines
@@ -623,7 +625,9 @@ def check_candidate(
     `test_files`, the repo's non-test and test Python files, let a patch of a library name be
     checked against modules that import that name with `from <library> import X`; when the
     patched module gives no target, the message lists the modules that call the library,
-    except `unmigrated_modules`, which are still on the old API). Python
+    except `unmigrated_modules`, which are still on the old API; `client_classes` and
+    `client_resources` report a client class patched with autospec=True whose instance's
+    resources the test uses). Python
     files that parse first get an import for each new undefined name with exactly one
     `known_imports` entry, so every check sees the completed file (`text`, `auto_imports`).
 
@@ -707,6 +711,8 @@ def check_candidate(
             test_files=test_files,
             path=path,
             unmigrated_modules=unmigrated_modules,
+            client_classes=client_classes,
+            client_resources=client_resources,
         )
         if mocks and read_module is not None
         else []

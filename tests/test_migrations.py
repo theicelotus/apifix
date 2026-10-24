@@ -218,6 +218,20 @@ def test_guide_advice_on_keys_and_mock_data():
     ) in tests
 
 
+def test_guide_says_to_drop_autospec_on_a_client_class():
+    from apifix.engine.migrations.openai_v1 import rules
+
+    tests = get_migration("openai-v1").guide.split("## Tests")[1].split("## Dependencies")[0]
+    assert "- Drop `autospec=True` when patching a client class" in tests
+    assert "an\n  autospecced 1.x client has no `chat.completions`" in tests
+    # the client-class mock example says so where it patches the class
+    example = tests.split("# 1.x, client created inside the function")[1].split("# 1.x,")[0]
+    assert "no autospec=True on a client class" in example
+    assert {"OpenAI", "AsyncOpenAI", "AzureOpenAI", "AsyncAzureOpenAI"} == rules.CLIENT_CLASSES
+    assert {"chat", "completions", "embeddings"} <= rules.CLIENT_RESOURCES
+    assert all(rules.KNOWN_IMPORTS[c] == f"from openai import {c}" for c in rules.CLIENT_CLASSES)
+
+
 def test_tests_part_for_a_test_file_recognised_by_content(tmp_path):
     from apifix.engine.migrations.openai_v1.guide_parts import selected_parts
 

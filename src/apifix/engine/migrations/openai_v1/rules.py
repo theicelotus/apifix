@@ -294,6 +294,34 @@ GUIDE_SELECTORS: dict[str, tuple[tuple[frozenset[str], tuple[str, ...]], ...]] =
 # Names a rewrite may use without importing them, and the one import that defines each
 # (apifix adds it; see code_checks.add_missing_imports).
 _CLIENT_CLASSES = ("OpenAI", "AsyncOpenAI", "AzureOpenAI", "AsyncAzureOpenAI")
+CLIENT_CLASSES = frozenset(_CLIENT_CLASSES)
+# A client's resources, cached properties of the class (openai 1.109.1): a client patched with
+# autospec=True has none of them usable (code_checks.autospec_client_problems).
+CLIENT_RESOURCES = frozenset(
+    {
+        "audio",
+        "batches",
+        "beta",
+        "chat",
+        "completions",
+        "containers",
+        "conversations",
+        "embeddings",
+        "evals",
+        "files",
+        "fine_tuning",
+        "images",
+        "models",
+        "moderations",
+        "realtime",
+        "responses",
+        "uploads",
+        "vector_stores",
+        "webhooks",
+        "with_raw_response",
+        "with_streaming_response",
+    }
+)
 _V1_ERRORS = sorted(
     {new for new, _, _ in ERROR_CLASSES.values() if new}
     | {"APIStatusError", "NotFoundError", "UnprocessableEntityError", "ConflictError"}

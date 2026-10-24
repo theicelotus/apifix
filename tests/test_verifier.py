@@ -251,6 +251,55 @@ def test_regression_is_rejected_after_rerun(trees):
     assert sandbox.last_session.coverage_args == [None, False]  # rerun without coverage
 
 
+AUTOSPEC_ERROR = (
+    "AttributeError: Mock object has no attribute 'completions'\n"
+    "OpenAI = <MagicMock name='OpenAI' spec='OpenAI' id='1'>\n\n"
+    '    @mock.patch("app.OpenAI", autospec=True)\n'
+    "    def test_ask(OpenAI):\n"
+    ">       OpenAI.return_value.chat.completions.create.return_value = reply\n"
+    "E       AttributeError: Mock object has no attribute 'completions'"
+)
+
+
+def test_regressions_keep_why_they_fail_in_json_and_report(trees):
+    # genai-gptoss-4: the verify outputs named the 5 regressions without their messages
+    original, fixed = trees({})
+    T_NEW = "tests.test_app::test_new"
+    broken = run(
+        (T_ASK, "failed", AUTOSPEC_ERROR),
+        (T_STRIP, "error", "fixture 'mocker' not found"),
+        (T_NEW, "failed", "assert 1 == 2"),
+        coverage=FULL_COVERAGE,
+    )
+    sandbox = FakeSandbox(baseline=PASSING, fixed=[broken, broken])
+    v = verify(original, fixed, "openai-v1", sandbox=sandbox)
+    assert v.verdict == "rejected"
+    lines = AUTOSPEC_ERROR.splitlines()
+    assert v.delta.regression_messages == {
+        T_ASK: "\n".join(lines[:2] + lines[3:6]),  # 5 lines: the blank one skipped
+        T_STRIP: "fixture 'mocker' not found",
+        T_NEW: "assert 1 == 2",  # a new test that fails
+    }
+    data = json.loads(json.dumps(v.to_dict()))
+    assert data["tests"]["regression_messages"][T_STRIP] == "fixture 'mocker' not found"
+    md = v.report_markdown()
+    assert (
+        "### Tests that now fail\n\n"
+        f"- `{T_ASK}`: now fails: `AttributeError: Mock object has no attribute 'completions'`\n"
+        f"- `{T_NEW}`: now fails: `assert 1 == 2`\n"
+        f"- `{T_STRIP}`: now errors: `fixture 'mocker' not found`\n"
+    ) in md
+    assert md.index("### Why this verdict") < md.index("### Tests that now fail")
+
+
+def test_flaky_tests_drop_their_regression_message(trees):
+    original, fixed = trees({})
+    flaky = run((T_ASK, "passed"), (T_STRIP, "failed", "Timeout"), coverage=FULL_COVERAGE)
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(PASSING, [flaky, PASSING]))
+    assert v.delta.flaky == [T_STRIP] and v.delta.regression_messages == {}
+    assert "### Tests that now fail" not in v.report_markdown()
+
+
 def test_flaky_failure_is_not_a_regression(trees):
     original, fixed = trees({})
     flaky = run((T_ASK, "passed"), (T_STRIP, "error", "Timeout"), coverage=FULL_COVERAGE)

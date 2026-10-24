@@ -6,7 +6,9 @@ the module's code reaches the migrated library in a recognisable way.
 
 A patch of a library name (`patch("openai.OpenAI")`) is also checked against the repo's
 non-test modules: one that binds the name at import time (`from openai import OpenAI`) never
-sees it, so the message names the module's own target.
+sees it, so the message names the module's own target. A client class patched with
+autospec=True is reported when the test uses a resource of its instance (`chat.completions`),
+which an autospecced instance does not have.
 
 Pure functions (source text in, messages out); repo modules are read through a callback.
 """
@@ -183,6 +185,19 @@ def _dotted(node: ast.AST) -> str | None:
     return None
 
 
+def _string_target(node: ast.AST) -> str | None:
+    """The target of a `patch("a.b.c")`-style call (PATCH_FUNCTIONS, string first argument)."""
+    if (
+        isinstance(node, ast.Call)
+        and _dotted(node.func) in PATCH_FUNCTIONS
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    ):
+        return node.args[0].value
+    return None
+
+
 def mock_targets(source: str) -> list[tuple[int, str]]:
     """(line, target) for each `patch("a.b.c")`-style call or decorator (patch, mock.patch,
     unittest.mock.patch, mocker.patch) whose first argument is a string literal."""
@@ -192,14 +207,9 @@ def mock_targets(source: str) -> list[tuple[int, str]]:
         return []
     found = []
     for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Call)
-            and _dotted(node.func) in PATCH_FUNCTIONS
-            and node.args
-            and isinstance(node.args[0], ast.Constant)
-            and isinstance(node.args[0].value, str)
-        ):
-            found.append((node.lineno, node.args[0].value))
+        target = _string_target(node)
+        if target is not None and isinstance(node, ast.Call):
+            found.append((node.lineno, target))
     return sorted(found)
 
 
@@ -311,13 +321,8 @@ def _patch_sites(tree: ast.Module) -> list[_PatchSite]:
             parents[child] = node
     sites = []
     for node in ast.walk(tree):
-        if not (
-            isinstance(node, ast.Call)
-            and _dotted(node.func) in PATCH_FUNCTIONS
-            and node.args
-            and isinstance(node.args[0], ast.Constant)
-            and isinstance(node.args[0].value, str)
-        ):
+        target = _string_target(node)
+        if target is None or not isinstance(node, ast.Call):
             continue
         tests: tuple[ast.FunctionDef | ast.AsyncFunctionDef, ...] = ()
         child, parent = node, parents.get(node)
@@ -332,7 +337,7 @@ def _patch_sites(tree: ast.Module) -> list[_PatchSite]:
                     tests = (parent,)
                 break
             child, parent = parent, parents.get(parent)
-        sites.append(_PatchSite(node.lineno, node.args[0].value, _dotted(node.func) or "", tests))
+        sites.append(_PatchSite(node.lineno, target, _dotted(node.func) or "", tests))
     return sorted(sites, key=lambda s: (s.line, s.target))
 
 
@@ -959,6 +964,227 @@ def _library_binding_problem(
     return text
 
 
+# --- autospec on a patched client class ------------------------------------------------------
+
+PATCH_OBJECT_FUNCTIONS = frozenset(f"{f}.object" for f in PATCH_FUNCTIONS - {"mocker.patch"})
+
+
+def _keyword(call: ast.Call, name: str) -> ast.expr | None:
+    return next((k.value for k in call.keywords if k.arg == name), None)
+
+
+def _injects(deco: ast.expr) -> bool:
+    """Does this patch decorator pass the test a mock (no `new` given)?"""
+    if not isinstance(deco, ast.Call) or _keyword(deco, "new") is not None:
+        return False
+    func = _dotted(deco.func)
+    if func in PATCH_FUNCTIONS:
+        return len(deco.args) < 2
+    return func in PATCH_OBJECT_FUNCTIONS and len(deco.args) < 3
+
+
+def _parameter(fn: ast.FunctionDef | ast.AsyncFunctionDef, slot: int) -> str | None:
+    """The parameter a patch decorator's mock fills: slot 0 is the first after self/cls."""
+    params = [a.arg for a in [*fn.args.posonlyargs, *fn.args.args]]
+    if params and params[0] in ("self", "cls"):
+        params = params[1:]
+    return params[slot] if slot < len(params) else None
+
+
+Scope = ast.Module | ast.FunctionDef | ast.AsyncFunctionDef
+
+
+def _mock_names(
+    call: ast.Call, tree: ast.Module, parents: Mapping[ast.AST, ast.AST]
+) -> list[tuple[Scope, str]]:
+    """(scope, name) of the mock a patch call gives: the parameter it fills as a decorator
+    (lowest decorator first; on a class, in each test method, after the method's own patch
+    decorators), `with patch(...) as m`, `m = mocker.patch(...)` or `m = patch(...).start()`
+    (in the enclosing function, or the module)."""
+    parent = parents.get(call)
+    if isinstance(parent, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+        if call not in parent.decorator_list or not _injects(call):
+            return []
+        below = parent.decorator_list[parent.decorator_list.index(call) + 1 :]
+        slot = sum(_injects(d) for d in below)
+        if not isinstance(parent, ast.ClassDef):
+            name = _parameter(parent, slot)
+            return [(parent, name)] if name else []
+        found = []
+        for method in parent.body:
+            if _is_test_function(method):
+                assert isinstance(method, ast.FunctionDef | ast.AsyncFunctionDef)
+                own = sum(_injects(d) for d in method.decorator_list)
+                name = _parameter(method, own + slot)
+                if name:
+                    found.append((method, name))
+        return found
+    target: ast.expr | None = None
+    if isinstance(parent, ast.withitem) and parent.context_expr is call:
+        target = parent.optional_vars
+    else:
+        if (
+            isinstance(parent, ast.Attribute)
+            and parent.attr == "start"
+            and isinstance(parents.get(parent), ast.Call)
+        ):
+            call_node = parents[parent]
+            assert isinstance(call_node, ast.Call)
+            parent = parents.get(call_node)
+        if isinstance(parent, ast.Assign) and len(parent.targets) == 1:
+            target = parent.targets[0]
+    if not isinstance(target, ast.Name):
+        return []
+    scope: ast.AST | None = parents.get(call)
+    while scope is not None and not isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef):
+        scope = parents.get(scope)
+    if scope is None:
+        return [(tree, target.id)]
+    assert isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef)
+    return [(scope, target.id)]
+
+
+def _return_value_of(node: ast.AST, name: str) -> bool:
+    """Is `node` `<name>.return_value`?"""
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "return_value"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == name
+    )
+
+
+def _resource_use(
+    scope: Scope, name: str, resources: Collection[str], parents: Mapping[ast.AST, ast.AST]
+) -> tuple[int, str, str] | None:
+    """(line, the expression, what the client lacks) of the first use of a client resource on
+    the mock's instance in `scope`: `<name>.return_value.chat.completions`, also through a
+    name assigned from `<name>.return_value`. None when the scope sets `<name>.return_value`
+    itself (the instance is then the test's own object)."""
+    instances = set()
+    for node in ast.walk(scope):
+        if isinstance(node, ast.Assign):
+            if any(_return_value_of(t, name) for t in node.targets):
+                return None
+            if (
+                len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and _return_value_of(node.value, name)
+            ):
+                instances.add(node.targets[0].id)
+    uses = []
+    for node in ast.walk(scope):
+        if not isinstance(node, ast.Attribute) or node.attr not in resources:
+            continue
+        base = node.value
+        if _return_value_of(base, name) or (isinstance(base, ast.Name) and base.id in instances):
+            outer = parents.get(node)
+            shown, lacks = node, f"usable {node.attr}"
+            if isinstance(outer, ast.Attribute) and outer.value is node:
+                shown, lacks = outer, f"{node.attr}.{outer.attr}"
+            uses.append((node.lineno, node.col_offset, ast.unparse(shown), lacks))
+    if not uses:
+        return None
+    line, _, text, lacks = min(uses)
+    return line, text, lacks
+
+
+def _client_class(
+    target: str, read_module: ReadModule, options: _Options, classes: Collection[str]
+) -> bool:
+    """Does `target` name one of the library's client classes: by its last name (any module
+    path), or through a repo module's import (`from openai import OpenAI as Client`)?"""
+    parts = target.split(".")
+    if len(parts) < 2:
+        return False
+    if parts[-1] in classes:
+        return True
+    found = _module_file(parts[:-1], read_module, options.roots)
+    if found is None:
+        return False
+    try:
+        tree = ast.parse(found[1])
+    except (SyntaxError, ValueError):
+        return False
+    imported = _ModuleIndex("", tree, options.library_modules).imports.get(parts[-1], "")
+    return imported.split(".")[0] in options.library_modules and imported.split(".")[-1] in classes
+
+
+def _autospec_uses(
+    source: str,
+    read_module: ReadModule,
+    options: _Options,
+    classes: Collection[str],
+    resources: Collection[str],
+) -> dict[str, list[tuple[str, int, str, str]]]:
+    """target -> (scope name, line, expression, what the client lacks) for each scope that uses
+    a client resource on the instance of a client class patched with autospec=True."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return {}
+    parents: dict[ast.AST, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    found: dict[str, list[tuple[str, int, str, str]]] = {}
+    calls = sorted(
+        (n for n in ast.walk(tree) if isinstance(n, ast.Call) and _string_target(n)),
+        key=lambda n: (n.lineno, n.col_offset),
+    )
+    for call in calls:
+        autospec = _keyword(call, "autospec")
+        if not (isinstance(autospec, ast.Constant) and autospec.value is True):
+            continue
+        target = _string_target(call) or ""
+        if _keyword(call, "return_value") is not None or not _client_class(
+            target, read_module, options, classes
+        ):
+            continue
+        for scope, name in _mock_names(call, tree, parents):
+            use = _resource_use(scope, name, resources, parents)
+            if use is not None:
+                where = scope.name if not isinstance(scope, ast.Module) else "the module"
+                found.setdefault(target, []).append((where, *use))
+    return found
+
+
+def autospec_client_problems(
+    original: str,
+    candidate: str,
+    read_module: ReadModule,
+    *,
+    client_classes: Collection[str],
+    client_resources: Collection[str],
+    library_modules: frozenset[str] = frozenset(),
+    roots: Sequence[str] = MODULE_ROOTS,
+) -> list[str]:
+    """A client class patched with autospec=True (`patch("app.OpenAI", autospec=True)`, as a
+    decorator, a context manager or mocker.patch) whose instance the test then uses for a
+    resource (`OpenAI.return_value.chat.completions`): autospec builds the instance from the
+    class, where the resources are cached properties, so the mock has no `chat.completions`.
+    Only uses the original did not already have (same target and scope) are reported."""
+    options = _Options(library_modules, {}, (), tuple(roots))
+    before = _autospec_uses(original, read_module, options, client_classes, client_resources)
+    after = _autospec_uses(candidate, read_module, options, client_classes, client_resources)
+    problems = []
+    for target, uses in after.items():
+        old = {where for where, *_ in before.get(target, [])}
+        new = [u for u in uses if u[0] not in old]
+        if not new:
+            continue
+        where, line, text, lacks = new[0]
+        others = list(dict.fromkeys(w for w, *_ in new[1:] if w != where))
+        also = f" (and likewise in: {', '.join(others)})" if others else ""
+        problems.append(
+            f"mock target {target!r} is patched with autospec=True, and {where} uses {text} "
+            f"(line {line}){also}: an autospecced 1.x client has no {lacks} (resources are "
+            "cached properties), so drop autospec=True when patching the client class "
+            f'(patch("{target}")), or autospec the method instead'
+        )
+    return problems
+
+
 def mock_target_problems(
     original: str,
     candidate: str,
@@ -971,6 +1197,8 @@ def mock_target_problems(
     test_files: Sequence[str] = (),
     path: str | None = None,
     unmigrated_modules: Collection[str] = (),
+    client_classes: Collection[str] = (),
+    client_resources: Collection[str] = (),
 ) -> list[str]:
     """Mock targets new in the candidate that are wrong for a repo module (`read_module(relpath)`
     gives its current text, or None if there is no such file): a name the module does not
@@ -986,7 +1214,11 @@ def mock_target_problems(
     When the patched module's own code gives no target, the message lists where a patch would
     reach the library instead: modules that call it (the patched one first, then those the
     test file at `path` reaches through imports, else all), each with the target that fits how
-    it binds the library, except `unmigrated_modules` (still on the old API)."""
+    it binds the library, except `unmigrated_modules` (still on the old API).
+
+    With `client_classes` and `client_resources` (the library's client classes and the
+    resource attributes of their instances), a client class newly patched with autospec=True
+    whose instance the test uses for a resource is reported too (autospec_client_problems)."""
     try:
         tree = ast.parse(candidate)
     except (SyntaxError, ValueError):
@@ -1019,4 +1251,14 @@ def mock_target_problems(
         if problem:
             seen.add(site.target)
             problems.append(problem)
+    if client_classes and client_resources:
+        problems += autospec_client_problems(
+            original,
+            candidate,
+            read_module,
+            client_classes=client_classes,
+            client_resources=client_resources,
+            library_modules=library_modules,
+            roots=roots,
+        )
     return problems

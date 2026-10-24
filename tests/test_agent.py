@@ -1416,6 +1416,31 @@ def test_live_run_test_file_bugs_go_back_through_the_check_retry(tmp_path):
     assert '+@mock.patch("app.openai.OpenAI")' in result.diff
 
 
+def test_autospec_on_the_client_class_goes_back_through_the_check_retry(tmp_path):
+    # genai-gptoss-4 attempt 1: autospec=True kept when the patch moved to the client class
+    tiny = write_tree(tmp_path / "tiny", TINY)
+    right = "from types import SimpleNamespace\n" + LIVE_TESTS.replace(
+        "app.client.chat.completions.create", "app.openai.OpenAI"
+    ).replace(
+        "def test_ask(create):\n    create.return_value",
+        ("def test_ask(OpenAI):\n    OpenAI.return_value.chat.completions.create.return_value"),
+    )
+    autospec = right.replace('"app.openai.OpenAI")', '"app.openai.OpenAI", autospec=True)')
+    assert autospec != right
+    llm = FakeLLM([block(LIVE_APP), block(autospec), block(right)])
+    passing = run(("tests.test_app::test_ask", "passed"))
+    result = wf(tiny, llm, JudgingSandbox(judge=lambda tree: passing), max_retries=0)
+    (attempt,) = result.trajectory["attempts"]
+    (nudge,) = attempt["nudges"]
+    assert (nudge["kind"], nudge["file"]) == ("check_retry", "tests/test_app.py")
+    assert nudge["error"].startswith(
+        "mock target 'app.openai.OpenAI' is patched with autospec=True, and test_ask uses "
+        "OpenAI.return_value.chat.completions (line "
+    )
+    assert "an autospecced 1.x client has no chat.completions" in nudge["error"]
+    assert attempt["files"][1]["accepted"] and attempt["verification"] is not None
+
+
 def test_a_second_failure_of_the_new_checks_fails_the_attempt(tmp_path):
     tiny = write_tree(tmp_path / "tiny", TINY)
     llm = FakeLLM([block(LIVE_APP), block(LIVE_TESTS), block(LIVE_TESTS)])

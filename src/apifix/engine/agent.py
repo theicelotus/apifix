@@ -1134,6 +1134,8 @@ class _Job:
             findings=[f for f in self.findings if f.file == path],
             rewrite_checks=self.rewrite_checks,
             unmigrated_modules={f.file for f in self.open_findings} - self.wf_accepted - {path},
+            client_classes=self.migration.client_classes,
+            client_resources=self.migration.client_resources,
         )
 
     def _updated_context(self, path: str) -> list[tuple[str, str]]:

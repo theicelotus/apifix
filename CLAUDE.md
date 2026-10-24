@@ -129,7 +129,8 @@ src/apifix/
                       library targets (`openai.OpenAI`) that modules importing the name with
                       `from openai import` never see; when the patched module gives no target,
                       the repo modules that call the library (those the test reaches first),
-                      each with the target that fits how it binds the library
+                      each with the target that fits how it binds the library; a client class
+                      patched with autospec=True whose instance's resources the test uses
 benchmark/            real repos + scoring
 docs/plans/           approved plans, one file per step (request, plan, amendments)
 tests/                pytest; fixtures/ holds realistic sample code
@@ -434,6 +435,11 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   original's, skipping pytest's bare "collection failure" line, at most 160 characters. With
   the unittest runner (only from a caller's plan) that line is "Traceback (most recent call
   last):", not the error.
+- Regressions (newly failing / erroring tests, new tests that fail included) keep the first 5
+  non-blank lines of the fixed run's message (`tests.regression_messages`, after the 500
+  character clip; a test that passes the flaky rerun drops it); the report lists them under
+  "Tests that now fail" with the first line, as for no-signal tests. With pytest the first
+  line is JUnit's `message` (the exception line), then the traceback's start.
 - Flakiness: newly failing tests are rerun once (whole test phase); a regression that fails
   intermittently can pass the rerun and be reported as flaky.
 - When the fixed code's tests never ran (install failed, test phase did not start), there is
@@ -757,6 +763,22 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   with no dotted name (a dir with a dash). False positive: a test exercising only modules
   that use `openai.OpenAI` through `import openai`, in a repo where another module imports
   it with `from`, is rejected. Whole-file mode only.
+- Autospec on a client class (`code_checks.autospec_client_problems`, check `mock_targets`,
+  test files): a string-target patch with `autospec=True` (constant True) of one of the
+  migration's `client_classes` (openai-v1: OpenAI, AsyncOpenAI, AzureOpenAI,
+  AsyncAzureOpenAI), by the target's last name under any module path or through a repo
+  module's import (`from openai import OpenAI as Client` -> `app.Client`), whose mock the
+  test uses for one of `client_resources` (the client's cached properties, from openai
+  1.109.1): `<mock>.return_value.chat...`, or a name assigned from `<mock>.return_value`.
+  The mock: the parameter a decorator fills (lowest first, after `self`; a class decorator's
+  in each `test*` method, after the method's own patch decorators; patches given `new` pass
+  none), `with patch(...) as m`, `m = mocker.patch(...)` / `m = patch(...).start()` in the
+  enclosing function. Not flagged: a `return_value=` keyword, or a scope that assigns
+  `<mock>.return_value` itself; uses the original already had (same target and function).
+  One error per target, "(and likewise in: ...)" for other tests. Not detected:
+  `patch.object(module, "OpenAI", autospec=True)`, `create_autospec(OpenAI)`, mocks passed
+  on through fixtures or helpers, `autospec=<class>`. Whole-file mode only; agent mode and
+  `apifix verify` see it as a regression (`Mock object has no attribute 'completions'`).
 - A failing candidate gets its error back once (`check_retry`) as a fresh request: the file's
   request again, with the rejected candidate as a diff against the original and the error (not
   the conversation, which would carry the whole rejected file). A second failure (or a parse

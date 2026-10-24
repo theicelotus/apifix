@@ -197,6 +197,7 @@ def test_answer(create):
 
 
 # 1.x, client created inside the function (def answer(): client = openai.OpenAI() ...)
+# (no autospec=True on a client class: an autospecced client has no chat.completions)
 @mock.patch("app.openai.OpenAI")
 def test_answer(OpenAI):
     OpenAI.return_value.chat.completions.create.return_value = SimpleNamespace(
@@ -225,6 +226,10 @@ def test_answer(get_client):
   `app.openai.OpenAI`.
 - With any client, patching the class method also works:
   `mock.patch("openai.resources.chat.completions.Completions.create")`.
+- Drop `autospec=True` when patching a client class (`patch("app.OpenAI", autospec=True)`): an
+  autospecced 1.x client has no `chat.completions` (resources are cached properties), so
+  `OpenAI.return_value.chat.completions.create` fails. Autospec the method instead
+  (`mock.patch("openai.resources.chat.completions.Completions.create", autospec=True)`).
 - Mock return values must support attribute access now that the code uses it; keep the same
   values. `SimpleNamespace` (`from types import SimpleNamespace`) or the real types
   (`openai.types.chat.ChatCompletion`) both work.

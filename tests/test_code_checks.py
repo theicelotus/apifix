@@ -1390,3 +1390,350 @@ def test_the_suggested_target_passes_the_tests_and_the_wrong_one_fails(tmp_path)
     right = indirect_test("notebook.generate.OpenAI")
     fixed = _indirect_pytest(tmp_path / "right", {**indirect_files(), INDIRECT_TEST: right})
     assert fixed.returncode == 0, fixed.stdout
+
+
+# --- autospec on a patched client class (autospec_client fixture) ----------------------------
+
+AUTOSPEC = Path(__file__).parent / "fixtures" / "autospec_client"
+AUTOSPEC_TEST = "tests/test_generate.py"
+# assist/generate.py migrated as in genai-gptoss-4: the client class bound with a from-import
+AUTOSPEC_GENERATE = '''\
+"""Suggestions for a notebook cell's error."""
+
+from openai import OpenAI
+
+
+def suggest(error: str) -> str:
+    client = OpenAI()
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": f"Explain this error: {error}"}],
+    )
+    return response.choices[0].message.content
+'''
+REPLY = 'SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="Define b"))])'
+# genai-gptoss-4 attempt 1's shape: the patch moved to the client class, autospec=True kept
+AUTOSPEC_KEPT = f"""\
+from types import SimpleNamespace
+from unittest import mock
+
+from assist.generate import suggest
+
+
+@mock.patch(
+    "assist.generate.OpenAI",
+    autospec=True,
+)
+def test_suggest(OpenAI):
+    OpenAI.return_value.chat.completions.create.return_value = {REPLY}
+    assert suggest("NameError: b") == "Define b"
+    create = OpenAI.return_value.chat.completions.create
+    create.assert_called_once()
+    assert create.call_args.kwargs["model"] == "gpt-3.5-turbo"
+
+
+@mock.patch("assist.generate.OpenAI", autospec=True)
+def test_suggest_passes_the_error(OpenAI):
+    client = OpenAI.return_value
+    client.chat.completions.create.return_value = {REPLY}
+    suggest("ZeroDivisionError")
+    (message,) = client.chat.completions.create.call_args.kwargs["messages"]
+    assert "ZeroDivisionError" in message["content"]
+"""
+AUTOSPEC_PROBLEM = (
+    "mock target 'assist.generate.OpenAI' is patched with autospec=True, and test_suggest uses "
+    "OpenAI.return_value.chat.completions (line 12) (and likewise in: "
+    "test_suggest_passes_the_error): an autospecced 1.x client has no chat.completions "
+    "(resources are cached properties), so drop autospec=True when patching the client class "
+    '(patch("assist.generate.OpenAI")), or autospec the method instead'
+)
+
+
+def autospec_problems(
+    candidate: str,
+    original: str | None = None,
+    generate: str = AUTOSPEC_GENERATE,
+    **kwargs,
+) -> list[str]:
+    original = (AUTOSPEC / AUTOSPEC_TEST).read_text() if original is None else original
+    files = {"assist/__init__.py": "", "assist/generate.py": generate, AUTOSPEC_TEST: candidate}
+    return mock_target_problems(
+        original,
+        candidate,
+        reader(files),
+        library_modules=OPENAI,
+        mock_responses=MIGRATION.mock_responses,
+        roots=module_roots(AUTOSPEC_TEST),
+        modules=("assist/__init__.py", "assist/generate.py"),
+        test_files=(AUTOSPEC_TEST,),
+        path=AUTOSPEC_TEST,
+        **{
+            "client_classes": MIGRATION.client_classes,
+            "client_resources": MIGRATION.client_resources,
+            **kwargs,
+        },
+    )
+
+
+def test_autospec_kept_on_the_client_class_is_rejected():
+    assert autospec_problems(AUTOSPEC_KEPT) == [AUTOSPEC_PROBLEM]
+    # the regions' error attribution finds the target in the message
+    assert AUTOSPEC_PROBLEM.startswith("mock target 'assist.generate.OpenAI'")
+
+
+def test_autospec_needs_the_migrations_client_tables():
+    assert autospec_problems(AUTOSPEC_KEPT, client_classes=(), client_resources=()) == []
+
+
+def _one_test(decorators: str, params: str, body: str) -> str:
+    head = "from types import SimpleNamespace\nfrom unittest import mock\n\n"
+    head += "from assist.generate import suggest\n\n\n"
+    return f"{head}{decorators}def test_suggest({params}):\n{body}"
+
+
+SET_REPLY = f"    OpenAI.return_value.chat.completions.create.return_value = {REPLY}\n"
+
+
+@pytest.mark.parametrize(
+    ("test", "used"),
+    [
+        # decorator below another patch: the mock is the first parameter
+        (
+            _one_test(
+                '@mock.patch("builtins.print")\n'
+                '@mock.patch("assist.generate.OpenAI", autospec=True)\n',
+                "OpenAI, print_",
+                SET_REPLY,
+            ),
+            "OpenAI.return_value.chat.completions",
+        ),
+        # decorator above another patch: the second parameter
+        (
+            _one_test(
+                '@mock.patch("assist.generate.OpenAI", autospec=True)\n'
+                '@mock.patch("builtins.print")\n',
+                "print_, OpenAI",
+                SET_REPLY,
+            ),
+            "OpenAI.return_value.chat.completions",
+        ),
+        # context manager
+        (
+            _one_test(
+                "",
+                "",
+                '    with mock.patch("assist.generate.OpenAI", autospec=True) as OpenAI:\n'
+                f"    {SET_REPLY}        suggest('x')\n",
+            ),
+            "OpenAI.return_value.chat.completions",
+        ),
+        # mocker.patch, and the instance through a name
+        (
+            _one_test(
+                "",
+                "mocker",
+                '    OpenAI = mocker.patch("assist.generate.OpenAI", autospec=True)\n'
+                "    client = OpenAI.return_value\n"
+                "    client.embeddings.create.return_value = None\n",
+            ),
+            "client.embeddings.create",
+        ),
+        # patch(...).start()
+        (
+            _one_test(
+                "",
+                "",
+                '    OpenAI = mock.patch("assist.generate.OpenAI", autospec=True).start()\n'
+                + SET_REPLY,
+            ),
+            "OpenAI.return_value.chat.completions",
+        ),
+        # the library's own path, the async client, a resource used on its own
+        (
+            _one_test(
+                '@mock.patch("openai.AsyncOpenAI", autospec=True)\n',
+                "OpenAI",
+                "    run(OpenAI.return_value.chat)\n",
+            ),
+            "OpenAI.return_value.chat",
+        ),
+    ],
+)
+def test_autospec_forms_that_give_the_mock_a_name(test, used):
+    (problem,) = [p for p in autospec_problems(test) if "autospec" in p]
+    assert f"test_suggest uses {used} (line " in problem
+
+
+def test_autospec_on_a_class_decorator_reaches_each_test_method():
+    test = (
+        "from unittest import mock\n\n\n"
+        '@mock.patch("assist.generate.OpenAI", autospec=True)\n'
+        "class TestSuggest:\n"
+        '    @mock.patch("builtins.print")\n'
+        "    def test_a(self, print_, OpenAI):\n"
+        "        OpenAI.return_value.chat.completions.create.return_value = None\n\n"
+        "    def test_b(self, OpenAI):\n"
+        "        OpenAI.return_value.chat.completions.create.return_value = None\n\n"
+        "    def helper(self, OpenAI):\n"
+        "        OpenAI.return_value.chat.completions.create.return_value = None\n"
+    )
+    (problem,) = autospec_problems(test)
+    assert (
+        "test_a uses OpenAI.return_value.chat.completions (line 8) (and likewise in: test_b)"
+        in (problem)
+    )
+
+
+def test_a_client_class_bound_under_another_name_is_recognised():
+    generate = AUTOSPEC_GENERATE.replace("import OpenAI", "import OpenAI as Client").replace(
+        "OpenAI()", "Client()"
+    )
+    test = AUTOSPEC_KEPT.replace("assist.generate.OpenAI", "assist.generate.Client")
+    (problem,) = autospec_problems(test, generate=generate)
+    assert problem.startswith("mock target 'assist.generate.Client' is patched with autospec=True")
+
+
+@pytest.mark.parametrize(
+    "test",
+    [
+        # no autospec, or not True
+        AUTOSPEC_KEPT.replace(",\n    autospec=True,\n", ",\n").replace(", autospec=True", ""),
+        AUTOSPEC_KEPT.replace("autospec=True", "autospec=False"),
+        # the test gives the instance itself
+        _one_test(
+            '@mock.patch("assist.generate.OpenAI", autospec=True)\n',
+            "OpenAI",
+            "    OpenAI.return_value = mock.Mock()\n" + SET_REPLY,
+        ),
+        _one_test(
+            '@mock.patch("assist.generate.OpenAI", autospec=True, return_value=mock.Mock())\n',
+            "OpenAI",
+            SET_REPLY,
+        ),
+        # no resource used: autospec only checks the constructor's arguments
+        _one_test(
+            '@mock.patch("assist.generate.OpenAI", autospec=True)\n',
+            "OpenAI",
+            "    suggest('x')\n    OpenAI.assert_called_once_with()\n",
+        ),
+        # not a client class
+        _one_test(
+            '@mock.patch("builtins.print", autospec=True)\n',
+            "print_",
+            "    print_.return_value.chat.completions\n",
+        ),
+        # new= given: the decorator passes no mock, so OpenAI is another parameter
+        _one_test(
+            '@mock.patch("assist.generate.OpenAI", mock.Mock(), autospec=True)\n',
+            "OpenAI",
+            SET_REPLY,
+        ),
+    ],
+)
+def test_autospec_cases_that_are_not_flagged(test):
+    assert [p for p in autospec_problems(test) if "autospec" in p] == []
+
+
+def test_autospec_already_in_the_original_is_not_flagged():
+    assert autospec_problems(AUTOSPEC_KEPT, original=AUTOSPEC_KEPT) == []
+    # a new test with the same problem is
+    more = AUTOSPEC_KEPT.replace("def test_suggest_passes_the_error", "def test_other")
+    (problem,) = autospec_problems(more, original=AUTOSPEC_KEPT)
+    assert "and test_other uses client.chat.completions (line 22)" in problem
+
+
+def test_autospec_is_a_mock_targets_error_in_whole_file_checks():
+    from apifix.engine.whole_file import check_candidate
+
+    original = (AUTOSPEC / AUTOSPEC_TEST).read_text()
+    files = {"assist/__init__.py": "", "assist/generate.py": AUTOSPEC_GENERATE}
+    result = check_candidate(
+        AUTOSPEC_TEST,
+        original,
+        AUTOSPEC_KEPT,
+        required=True,
+        read_module=reader(files),
+        library_modules=OPENAI,
+        module_roots=module_roots(AUTOSPEC_TEST),
+        python_modules=tuple(files),
+        test_files=(AUTOSPEC_TEST,),
+        client_classes=MIGRATION.client_classes,
+        client_resources=MIGRATION.client_resources,
+    )
+    assert result.errors == [AUTOSPEC_PROBLEM]
+    assert result.error_checks == ["mock_targets"]
+
+
+# An openai stub whose client, like 1.x's, has its resources as cached properties.
+STUB_CLIENT = """\
+from functools import cached_property
+
+
+class Completions:
+    def create(self, **kwargs):
+        raise RuntimeError("no network in tests")
+
+
+class Chat:
+    @cached_property
+    def completions(self):
+        return Completions()
+
+
+class OpenAI:
+    def __init__(self, **kwargs):
+        pass
+
+    @cached_property
+    def chat(self):
+        return Chat()
+"""
+
+
+def _autospec_pytest(root: Path, test: str) -> subprocess.CompletedProcess:
+    files = {
+        "openai.py": STUB_CLIENT,
+        "assist/__init__.py": "",
+        "assist/generate.py": AUTOSPEC_GENERATE,
+        AUTOSPEC_TEST: test,
+    }
+    for rel, text in files.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(text)
+    return subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests"],
+        cwd=root,
+        env={**os.environ, "PYTHONPATH": str(root)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+# The other fix the message offers: autospec the method (the stub's Completions.create).
+AUTOSPEC_METHOD = f"""\
+from types import SimpleNamespace
+from unittest import mock
+
+from assist.generate import suggest
+
+
+@mock.patch("openai.Completions.create", autospec=True)
+def test_suggest(create):
+    create.return_value = {REPLY}
+    assert suggest("NameError: b") == "Define b"
+    create.assert_called_once()
+    assert create.call_args.kwargs["model"] == "gpt-3.5-turbo"
+"""
+
+
+def test_autospec_on_the_client_fails_and_the_suggested_fixes_pass(tmp_path):
+    kept = _autospec_pytest(tmp_path / "kept", AUTOSPEC_KEPT)
+    assert kept.returncode == 1
+    assert "Mock object has no attribute 'completions'" in kept.stdout
+    dropped = AUTOSPEC_KEPT.replace(",\n    autospec=True,\n", ",\n").replace(", autospec=True", "")
+    assert autospec_problems(dropped) == []
+    assert _autospec_pytest(tmp_path / "dropped", dropped).returncode == 0
+    assert autospec_problems(AUTOSPEC_METHOD) == []
+    result = _autospec_pytest(tmp_path / "method", AUTOSPEC_METHOD)
+    assert result.returncode == 0, result.stdout
