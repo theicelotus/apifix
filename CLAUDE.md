@@ -285,8 +285,9 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   and build `OpenAI(api_key=<dummy>)`. A failure rejects as `smoke_check_failed`, a dependency
   problem (whole-file mode resends dependency files), with the installed version, the
   library's requirements as installed, and the repo's exact pins on any of them (pins that
-  *can* hold it back; pip's actual resolution is not analysed). A smoke run that cannot start
-  is recorded, not a rejection. When the library is not installed at all: declared by neither
+  *can* hold it back; pip's actual resolution is not analysed); pins only a lockfile sets are
+  named as the lockfile's (`pin_sources`), and none are listed when the install dropped it.
+  A smoke run that cannot start is recorded, not a rejection. When the library is not installed at all: declared by neither
   the original's nor the fix's install plan -> `library_not_declared` (unverified, names the
   files read and any declaration left out; never sent to the model); declared by the
   original's only -> `library_removed` (reject); declared for the fix but not installed
@@ -342,7 +343,12 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   constraints, not exact environments: only pins of packages that get installed apply. Pins that
   contradict a declared requirement (e.g. after a fix bumped a version) are dropped, and if pip
   still cannot resolve, the install is retried once without the lockfile (`lockfile_applied`).
-  `uv.lock` is not read yet.
+  `uv.lock` is not read yet. A poetry.lock package locked at several versions without package
+  markers (numpy 1.24.4 for `>=3.8`, 1.25.1 for `>=3.9`) gets the newest whose
+  `python-versions` allows the sandbox's Python (dependents' markers are not evaluated); none
+  -> not applied. In the fixed run (`LibraryTarget.companions`), lock pins of the library's
+  companion packages that allow none of the needed range (`excludes_range`, as pin edits) are
+  not applied, with a note to regenerate the lock; the baseline keeps them.
 - Build-error detection (to retry on the full `python:<ver>` image) is string matching on pip
   output; the full image also has more system libraries but not all of them.
 - Python version: CPython 3.8-3.14 only; CI detection is GitHub Actions only (regex, no YAML parser).
@@ -399,6 +405,13 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   original file's content (an edit that removes a file's tests or its unittest import does not
   stop it counting as a test file).
 - Tests needing a network service or credentials are recognised by failure-message markers.
+- pytest stopping without a report keeps its error (`runner_error`, in the reason and run
+  summaries, plus `runner_output`, the last 2,000 characters): a conftest that failed to load
+  with its last `E` line, an argparse usage error, else the last `ERROR:` / `E` / any line. An
+  original-code run that exited 4 (usage error) with the fix's run also not running is
+  `pytest_usage_error` (unverified, an environment reason: not sent to the model, the job not
+  retried) instead of `sandbox_unavailable`; exit 4 on the fix alone stays `fixed_run_error`
+  (reject), with pytest's error.
 - Missing modules: a failing/erroring baseline test whose full failure text has "No module
   named 'x'" (the last one) for a module that is neither stdlib nor a repo module (any `.py`
   stem or directory holding Python files) is blocked. `environment_incomplete` (unverified)
@@ -485,8 +498,9 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   sandbox could not run at all, or tests fail while the original code's run failed
   (`unjudged_failures`); nothing the agent edits could change those. The report then suggests
   `apifix verify` on the diff for a later re-check (the baseline is not rerun in the job).
-  Nothing is retried, not even a rejection, when the verification has `environment_incomplete`
-  or `sandbox_requirements_pin` (the report gives the `apifix verify` command for the latter);
+  Nothing is retried, not even a rejection, when the verification has `environment_incomplete`,
+  `sandbox_requirements_pin` or `pytest_usage_error` (the report gives the `apifix verify`
+  command for each);
   the report suggests `apifix verify ... --sandbox-requirements FILE`.
 - Reply budget: `max_tokens` is `--max-output-tokens` in agent mode; in whole-file mode
   `min(--max-output-tokens, 2 * est + 2,048)`, `est` = chars / 3 of the longer of the original
@@ -524,8 +538,9 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
 
 - `pin_edits.py` runs once per `fix` job, before attempt 1, on the working copy (the baseline
   uses the original). It edits the entries the migration's `check_dependency` flags, writing
-  `Migration.pin_spec` (openai-v1: `>=1.0,<2`). Only the version spec changes; spacing inside
-  the old spec is not kept (`>= 0.27, < 0.28` becomes `>=1.0,<2`).
+  `Migration.pin_spec` (openai-v1: `>=1.55.3,<2`: releases before 1.55.3 break with httpx
+  0.28). Only the version spec changes; spacing inside the old spec is not kept (`>= 0.27,
+  < 0.28` becomes `>=1.55.3,<2`).
 - Each format has its own locator (never the parser's first-occurrence `_locate`): requirements
   and environment.yml lines, TOML string literals found by trial edit (the decoded document may
   change at exactly the entry's path), setup.py AST constants (plain one-line literals only),

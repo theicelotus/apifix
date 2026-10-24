@@ -23,10 +23,12 @@ from apifix.engine.dependencies import (
     allows,
     build_system_requires,
     entirely_at_or_above,
+    excludes_range,
     has_pixi_manifest,
     install_requirements,
     is_dependency_file,
     normalize_name,
+    parse_version,
     pep440_clauses,
     platform_only,
     poetry_clauses,
@@ -530,7 +532,7 @@ class InstallPlan:
     override: str | None = None  # SandboxRequirements.label when a user's file replaced detection
     replaced: tuple[str, ...] = ()  # its lines the fix's declarations replaced ("name: a -> b")
     # its lines for the migrated library that allow the old version, replaced by the target spec
-    # because no edit of the fix changed the library ("openai==0.28.1 -> openai>=1.0,<2")
+    # because no edit of the fix changed the library ("openai==0.28.1 -> openai>=1.55.3,<2")
     upgraded: tuple[str, ...] = ()
 
 
@@ -628,8 +630,11 @@ def _requirement_files(repo: Path) -> list[str]:
     return files
 
 
-def _lock_pins(repo: Path, requirement_files: list[str]) -> tuple[str | None, list[str], list[str]]:
-    """(lockfile, pins as 'name==version[; marker]', notes)."""
+def _lock_pins(
+    repo: Path, requirement_files: list[str], python: str | None = None
+) -> tuple[str | None, list[str], list[str]]:
+    """(lockfile, pins as 'name==version[; marker]', notes). `python`: the sandbox's Python
+    version, which picks among a poetry.lock's versions of one package (see _poetry_pins)."""
     notes: list[str] = []
     text = _read(repo / "poetry.lock")
     if text is not None:
@@ -637,16 +642,7 @@ def _lock_pins(repo: Path, requirement_files: list[str]) -> tuple[str | None, li
             packages = tomllib.loads(text).get("package", [])
         except tomllib.TOMLDecodeError as exc:
             return None, [], [f"poetry.lock unreadable ({exc}); not used"]
-        pins = []
-        for pkg in packages:
-            source = pkg.get("source", {}).get("type")
-            if source not in (None, "legacy"):
-                continue  # directory / file / git / url: not an index release
-            pin = f"{pkg['name']}=={pkg['version']}"
-            if isinstance(pkg.get("markers"), str):
-                pin += f"; {pkg['markers']}"
-            pins.append(pin)
-        return "poetry.lock", pins, notes
+        return "poetry.lock", _poetry_pins(packages, python, notes), notes
 
     text = _read(repo / "Pipfile.lock")
     if text is not None:
@@ -679,11 +675,61 @@ def _lock_pins(repo: Path, requirement_files: list[str]) -> tuple[str | None, li
     return None, [], notes
 
 
+def _poetry_pins(packages: list[dict], python: str | None, notes: list[str]) -> list[str]:
+    """Pins from poetry.lock's packages. Poetry locks one package at several versions when the
+    supported Pythons need different ones (numpy 1.24.4 for ">=3.8", 1.25.1 for ">=3.9"), and
+    puts the split in its dependents' markers, not on the package. For such a name (no
+    package markers), the newest version whose `python-versions` allows `python` is applied:
+    what Poetry's resolver picks for that interpreter. Without `python`, or when no version
+    allows it, every version is kept and _filter_pins leaves the name out."""
+    by_name: dict[str, list[dict]] = {}
+    for pkg in packages:
+        source = pkg.get("source", {}).get("type")
+        if source not in (None, "legacy"):
+            continue  # directory / file / git / url: not an index release
+        by_name.setdefault(normalize_name(pkg["name"]), []).append(pkg)
+    pins = []
+    for group in by_name.values():
+        versions = {pkg["version"] for pkg in group}
+        if python and len(versions) > 1 and not any("markers" in pkg for pkg in group):
+            fits = [pkg for pkg in group if _allows_python(pkg.get("python-versions"), python)]
+            best = max(fits, key=lambda pkg: parse_version(pkg["version"]) or (), default=None)
+            if best is not None:
+                shown = ", ".join(sorted(versions, key=lambda v: parse_version(v) or ()))
+                notes.append(
+                    f"poetry.lock: {best['name']} locked at several versions ({shown}); "
+                    f"applied {best['version']}, the newest whose python-versions allows "
+                    f"Python {python}"
+                )
+                group = [best]
+        for pkg in group:
+            pin = f"{pkg['name']}=={pkg['version']}"
+            if isinstance(pkg.get("markers"), str):
+                pin += f"; {pkg['markers']}"
+            pins.append(pin)
+    return pins
+
+
+def _allows_python(spec: object, python: str) -> bool:
+    """Whether a Poetry `python-versions` string ("*", ">=3.8", "^3.8", ">=3.7,<4.0",
+    ">=2.7, !=3.0.*") allows `python` (major.minor). Unparsable values allow it."""
+    if not isinstance(spec, str):
+        return True
+    return allows(poetry_clauses(spec), python)
+
+
 def _filter_pins(
-    pins: list[str], requirements: list[str], notes: list[str], lockfile: str
+    pins: list[str],
+    requirements: list[str],
+    notes: list[str],
+    lockfile: str,
+    target: LibraryTarget | None = None,
 ) -> list[str]:
     """Drop lock pins that contradict a declared requirement (e.g. after a fix bumped it),
-    and names pinned to several versions without markers to tell them apart."""
+    names pinned to several versions without markers to tell them apart, and (with `target`,
+    the fixed run) pins of the library's companions that allow none of what it needs: a lock
+    written for the old library would otherwise hold it back to an old release (openai 1.39
+    for a locked typing-extensions 4.7.1)."""
     declared: dict[str, list[tuple[tuple[str, str], ...]]] = {}
     for req in requirements:
         if name := _req_name(req):
@@ -692,17 +738,30 @@ def _filter_pins(
     for pin in pins:
         if name := _req_name(pin):
             by_name.setdefault(name, []).append(pin)
+    companions = {normalize_name(n): c for n, c in (target.companions if target else {}).items()}
     kept = []
     for name, group in by_name.items():
         if len({p.split(";")[0] for p in group}) > 1 and not all(";" in p for p in group):
             notes.append(f"{lockfile}: {name} pinned to several versions; pin not applied")
             continue
+        companion = companions.get(name)
         for pin in group:
             version = pin.split("==", 1)[1].split(";")[0].strip()
             if any(not allows(c, version) for c in declared.get(name, [])):
                 notes.append(
                     f"{lockfile}: {name}=={version} conflicts with the declared requirement; "
                     "pin not applied"
+                )
+                continue
+            if (
+                target is not None
+                and companion is not None
+                and excludes_range((("==", version),), companion.minimum, companion.upper)
+            ):
+                notes.append(
+                    f"{lockfile}: {name}=={version} allows none of "
+                    f">={companion.minimum},<{companion.upper}, which current "
+                    f"{target.package} releases need; pin not applied (regenerate {lockfile})"
                 )
                 continue
             kept.append(pin)
@@ -741,12 +800,15 @@ def build_install_plan(
     override: SandboxRequirements | None = None,
     original: Path | None = None,
     target: LibraryTarget | None = None,
+    python: str | None = None,
 ) -> InstallPlan:
     """What to install for `repo`. With `override` (a user's requirements file), that file
     replaces the repo's declared dependencies; when `repo` is a fix of `original`, every name
     whose declaration the fix changed takes the fix's declaration instead, and (with `target`)
     the file's lines that hold the migrated library at its old version get the target spec
-    when the fix did not change the library."""
+    when the fix did not change the library. Without `override`, `target` drops lockfile pins
+    that hold the library back (see _filter_pins), and `python` (the sandbox's version) picks
+    among a poetry.lock's versions of one package."""
     if override is not None:
         return _override_plan(repo, runner, override, original, target)
     notes: list[str] = []
@@ -802,10 +864,10 @@ def build_install_plan(
         left_out += skipped
 
     reqs = _with_tooling(repo, runner, reqs, notes)
-    lockfile, pins, lock_notes = _lock_pins(repo, req_files)
+    lockfile, pins, lock_notes = _lock_pins(repo, req_files, python)
     notes += lock_notes
     if lockfile:
-        pins = _filter_pins(pins, reqs, notes, lockfile)
+        pins = _filter_pins(pins, reqs, notes, lockfile, target)
     return InstallPlan(
         requirements=tuple(dict.fromkeys(reqs)),
         constraints=tuple(dict.fromkeys(pins)),

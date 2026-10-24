@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from apifix.engine.migrations.openai_v1 import rules as openai_rules
 from apifix.engine.models import LibraryTarget
 from apifix.engine.project import NotInstalled
 from apifix.engine.sandbox import PhaseResult, SandboxResult, SmokeResult
@@ -186,7 +187,7 @@ ORIGINAL = {
 }
 GOOD_FIX = {
     "app.py": APP_NEW,
-    "requirements.txt": "openai>=1.0,<2\npytest\n",
+    "requirements.txt": "openai>=1.55.3,<2\npytest\n",
     "tests/test_app.py": TESTS_NEW,
 }
 
@@ -586,6 +587,54 @@ def test_both_runs_failing_to_start_is_unverified(trees):
     assert v.verdict == "unverified"
 
 
+CONFTEST_ERROR = (
+    "ImportError while loading conftest 'tests/conftest.py': ValueError: numpy.dtype size "
+    "changed, may indicate binary incompatibility"
+)
+
+
+def usage_error(message: str = CONFTEST_ERROR) -> SandboxResult:
+    result = run(
+        status="error", reason=f"pytest exited 4 (usage error) without a report: {message}"
+    )
+    result.test = PhaseResult("test", "failed", "python:3.11-slim", "none", [], exit_code=4)
+    result.runner_error = message
+    result.runner_output = f"...\nE   {message.split(': ', 1)[1]}"
+    return result
+
+
+def test_pytest_exit_4_on_both_versions_is_an_environment_problem(trees):
+    original, fixed = trees({})
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(usage_error(), [usage_error()]))
+    assert v.verdict == "unverified"
+    assert "pytest_usage_error" in codes(v) and "sandbox_unavailable" not in codes(v)
+    reason = next(r for r in v.reasons if r.code == "pytest_usage_error")
+    assert CONFTEST_ERROR in reason.message
+    assert "stopped the same way" in reason.message
+    assert "pytest_usage_error" in v.report_markdown()
+    assert "pytest_usage_error" not in "\n".join(feedback_lines(v))  # environment: not sent
+    summary = run_summary(v.baseline)
+    assert summary["runner_error"] == CONFTEST_ERROR
+    assert "numpy.dtype" in summary["runner_output"]
+
+
+def test_pytest_exit_4_with_a_different_error_on_the_fix_names_both(trees):
+    original, fixed = trees({})
+    other = usage_error("pytest: error: unrecognized arguments: --cov=app")
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(usage_error(), [other]))
+    reason = next(r for r in v.reasons if r.code == "pytest_usage_error")
+    assert CONFTEST_ERROR in reason.message and "--cov=app" in reason.message
+
+
+def test_pytest_exit_4_on_the_fix_alone_is_a_rejection_with_its_error(trees):
+    original, fixed = trees({})
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(PASSING, [usage_error()]))
+    assert v.verdict == "rejected"
+    reason = next(r for r in v.reasons if r.code == "fixed_run_error")
+    assert CONFTEST_ERROR in reason.message
+    assert "pytest_usage_error" not in codes(v)
+
+
 def test_missing_baseline_is_weak(trees):
     original, fixed = trees({})
     down = run(status="error", reason="dependency install failed")
@@ -935,7 +984,9 @@ def test_verify_passes_the_migrations_library_target_to_the_fixed_run(trees):
     original, fixed = trees({})
     sandbox = FakeSandbox(baseline=PASSING, fixed=[PASSING])
     verify(original, fixed, "openai-v1", sandbox=sandbox)
-    assert sandbox.targets == [LibraryTarget("openai", "1.0", ">=1.0,<2")]
+    assert sandbox.targets == [
+        LibraryTarget("openai", "1.0", ">=1.55.3,<2", dict(openai_rules.COMPANION_PINS))
+    ]
 
 
 def test_smoke_failure_from_sandbox_requirements_pins_only_is_not_the_fixs_problem(trees):
@@ -988,19 +1039,39 @@ def test_smoke_failure_with_repo_pins_or_none_stays_a_dependency_problem(trees, 
     assert v.verdict == "rejected"
 
 
+def test_smoke_failure_names_lockfile_pins_as_the_lockfiles(trees):
+    original, fixed = trees({})
+    fixed_run = held_back_run(
+        {"tqdm==4.65.0": ["poetry.lock"], "typing-extensions==4.7.1": ["pyproject.toml"]}
+    )
+    fixed_run.requirements_override = None
+    fixed_run.lockfile = "poetry.lock"
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(PASSING, [fixed_run]))
+    message = reason(v, "smoke_check_failed").message
+    assert (
+        "dependency files on openai or its dependencies, which can hold openai back to an "
+        "old release: typing-extensions==4.7.1." in message
+    )
+    assert (
+        "Exact pins from poetry.lock (apifix applies them as constraints and never edits "
+        "it; regenerate it after the upgrade) on openai or its dependencies: tqdm==4.65.0."
+        in message
+    )
+
+
 def test_report_says_when_the_fixed_run_got_the_target_for_the_users_pin(trees):
     original, fixed = trees({})
     fixed_run = run((T_ASK, "passed"), (T_STRIP, "passed"), coverage=FULL_COVERAGE)
     fixed_run.requirements_override = "--sandbox-requirements suspense-sandbox-reqs.txt"
-    fixed_run.override_upgraded = ["openai==0.28.1 -> openai>=1.0,<2"]
+    fixed_run.override_upgraded = ["openai==0.28.1 -> openai>=1.55.3,<2"]
     v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(PASSING, [fixed_run]))
     assert (
         "Fixed run: `openai==0.28.1` from --sandbox-requirements suspense-sandbox-reqs.txt "
-        "replaced by `openai>=1.0,<2` (the migration's target; no edit of the fix changed this "
+        "replaced by `openai>=1.55.3,<2` (the migration's target; no edit of the fix changed this "
         "library)." in v.report_markdown()
     )
     summary = v.to_dict()["runs"]["fixed"]
-    assert summary["override_upgraded"] == ["openai==0.28.1 -> openai>=1.0,<2"]
+    assert summary["override_upgraded"] == ["openai==0.28.1 -> openai>=1.55.3,<2"]
 
 
 def test_import_paths_are_in_the_report(trees):

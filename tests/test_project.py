@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from apifix.engine.models import LibraryTarget
+from apifix.engine.models import CompanionPin, LibraryTarget
 from apifix.engine.project import (
     CONTINUE_ON_COLLECTION_ERRORS,
     PYTEST_COMMAND,
@@ -499,6 +499,15 @@ def test_install_plan_unreadable_manifest_is_noted(tmp_path):
 # --- lockfiles ------------------------------------------------------------------------------
 
 
+PANDAS_PROJECT = """
+[tool.poetry.dependencies]
+python = "^3.8"
+
+[tool.poetry.group.dev.dependencies]
+pandas = "^1.5.3"
+"""
+
+
 def test_poetry_lock_pins(tmp_path):
     write(
         tmp_path,
@@ -584,6 +593,94 @@ def test_stale_lock_pin_is_dropped_after_a_bump(tmp_path):
     plan = build_install_plan(tmp_path, None)
     assert plan.constraints == ("tqdm==4.66.1",)
     assert any("openai==0.28.1 conflicts" in n for n in plan.notes)
+
+
+NUMPY_LOCK = """
+[[package]]
+name = "numpy"
+version = "1.24.4"
+python-versions = ">=3.8"
+
+[[package]]
+name = "numpy"
+version = "1.25.1"
+python-versions = ">=3.9"
+
+[[package]]
+name = "pandas"
+version = "1.5.3"
+python-versions = ">=3.8"
+"""
+
+
+@pytest.mark.parametrize(("python", "numpy"), [("3.11", "numpy==1.25.1"), ("3.8", "numpy==1.24.4")])
+def test_poetry_lock_with_several_versions_applies_the_one_for_the_sandbox_python(
+    tmp_path, python, numpy
+):
+    # Poetry locks numpy twice for a project supporting 3.8+ and puts the split in pandas'
+    # dependency markers; leaving numpy out let pip install 2.x under the locked pandas 1.5.3
+    write(tmp_path, {"pyproject.toml": PANDAS_PROJECT, "poetry.lock": NUMPY_LOCK})
+    plan = build_install_plan(tmp_path, "pytest", python=python)
+    assert plan.constraints == (numpy, "pandas==1.5.3")
+    assert (
+        f"poetry.lock: numpy locked at several versions (1.24.4, 1.25.1); applied "
+        f"{numpy.split('==')[1]}, the newest whose python-versions allows Python {python}"
+    ) in plan.notes
+
+
+def test_poetry_lock_with_several_versions_none_for_the_python_is_left_out(tmp_path):
+    lock = NUMPY_LOCK.replace('">=3.8"', '"~3.8"', 1).replace('">=3.9"', '">=3.9,<3.11"')
+    write(tmp_path, {"pyproject.toml": PANDAS_PROJECT, "poetry.lock": lock})
+    for python in ("3.12", None):
+        plan = build_install_plan(tmp_path, "pytest", python=python)
+        assert plan.constraints == ("pandas==1.5.3",)
+        assert "poetry.lock: numpy pinned to several versions; pin not applied" in plan.notes
+
+
+OPENAI_TARGET = LibraryTarget(
+    "openai", "1.0", ">=1.55.3,<2", {"typing-extensions": CompanionPin("4.11", "5")}
+)
+
+
+@pytest.mark.parametrize(("typing_extensions", "dropped"), [("4.7.1", True), ("4.12.2", False)])
+def test_lock_pins_that_hold_the_library_back_are_dropped_in_the_fixed_run(
+    tmp_path, typing_extensions, dropped
+):
+    # a lock written for openai 0.27 pins typing-extensions 4.7.1: pip then settles on openai
+    # 1.39, the newest that accepts it, which breaks with httpx 0.28
+    write(
+        tmp_path,
+        {
+            "pyproject.toml": '[tool.poetry.dependencies]\nopenai = ">=1.55.3,<2"\n',
+            "poetry.lock": f"""
+            [[package]]
+            name = "openai"
+            version = "0.27.8"
+
+            [[package]]
+            name = "typing-extensions"
+            version = "{typing_extensions}"
+
+            [[package]]
+            name = "tqdm"
+            version = "4.65.0"
+            """,
+        },
+    )
+    fixed = build_install_plan(tmp_path, None, target=OPENAI_TARGET)
+    note = (
+        f"poetry.lock: typing-extensions=={typing_extensions} allows none of >=4.11,<5, which "
+        "current openai releases need; pin not applied (regenerate poetry.lock)"
+    )
+    if dropped:
+        assert fixed.constraints == ("tqdm==4.65.0",)
+        assert note in fixed.notes
+    else:
+        assert fixed.constraints == (f"typing-extensions=={typing_extensions}", "tqdm==4.65.0")
+        assert note not in fixed.notes
+    # without a target (the original code's run) every lock pin that fits stays
+    plain = build_install_plan(tmp_path, None)
+    assert f"typing-extensions=={typing_extensions}" in plain.constraints
 
 
 def test_corrupt_lock_is_noted(tmp_path):
@@ -762,7 +859,7 @@ def test_override_takes_the_fixs_declaration_for_every_name_the_fix_changed(tmp_
     assert "openai==0.28" in base.requirements and base.replaced == ()
 
 
-TARGET = LibraryTarget("openai", "1.0", ">=1.0,<2")
+TARGET = LibraryTarget("openai", "1.0", ">=1.55.3,<2")
 
 
 def test_override_old_library_pin_gets_the_target_when_the_fix_did_not_change_it(tmp_path):
@@ -771,8 +868,8 @@ def test_override_old_library_pin_gets_the_target_when_the_fix_did_not_change_it
     original = write(tmp_path / "original", files)
     fixed = write(tmp_path / "fixed", {**files, "app.py": "import openai\n"})
     plan = build_install_plan(fixed, "pytest", override=OVERRIDE, original=original, target=TARGET)
-    assert "openai>=1.0,<2" in plan.requirements and "openai==0.28" not in plan.requirements
-    assert plan.upgraded == ("openai==0.28 -> openai>=1.0,<2",) and plan.replaced == ()
+    assert "openai>=1.55.3,<2" in plan.requirements and "openai==0.28" not in plan.requirements
+    assert plan.upgraded == ("openai==0.28 -> openai>=1.55.3,<2",) and plan.replaced == ()
     assert plan.declared["openai"] == ("--sandbox-requirements reqs.txt",)
     # the original code gets the user's line unchanged, target or not
     base = build_install_plan(original, "pytest", override=OVERRIDE, target=TARGET)
@@ -782,20 +879,20 @@ def test_override_old_library_pin_gets_the_target_when_the_fix_did_not_change_it
 def test_override_library_pin_the_fix_changed_takes_the_fixs_line(tmp_path):
     files = {**PIXI_LIKE, "requirements.txt": "openai\n"}
     original = write(tmp_path / "original", files)
-    fixed = write(tmp_path / "fixed", {**files, "requirements.txt": "openai>=1.0,<2\n"})
+    fixed = write(tmp_path / "fixed", {**files, "requirements.txt": "openai>=1.55.3,<2\n"})
     plan = build_install_plan(fixed, "pytest", override=OVERRIDE, original=original, target=TARGET)
-    assert plan.replaced == ("openai: openai==0.28 -> openai>=1.0,<2",)
+    assert plan.replaced == ("openai: openai==0.28 -> openai>=1.55.3,<2",)
     assert plan.upgraded == ()
 
 
 @pytest.mark.parametrize(
     ("line", "upgraded"),
     [
-        ("openai==0.28.1", "openai>=1.0,<2"),
-        ("openai", "openai>=1.0,<2"),
+        ("openai==0.28.1", "openai>=1.55.3,<2"),
+        ("openai", "openai>=1.55.3,<2"),
         (
             "OpenAI[datalib]>=0.27 ; python_version < '3.12'",
-            "OpenAI[datalib]>=1.0,<2; python_version < '3.12'",
+            "OpenAI[datalib]>=1.55.3,<2; python_version < '3.12'",
         ),
         ("openai>=1.3", None),
         ("openai @ https://example.invalid/openai-0.28.1-py3-none-any.whl", None),

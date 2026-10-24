@@ -231,7 +231,12 @@ JSON_DUMP = "Responses are not JSON-serialisable as-is: use resp.model_dump_json
 
 PACKAGE = "openai"
 FIRST_V1 = "1.0"
-PIN_SPEC = ">=1.0,<2"  # what apifix writes for a 0.x pin
+# What apifix writes for a 0.x pin. The lower bound is 1.55.3, not 1.0: every earlier 1.x
+# passes `proxies=` to httpx, which httpx 0.28 (2024-11-28) removed, and openai never capped
+# httpx below 0.28, so a resolution held back below 1.55.3 (by a lockfile, a companion pin, an
+# old environment) installs a client whose OpenAI() raises TypeError. 1.55.3 has every 1.x API
+# the migration writes and needs Python >= 3.8. FIRST_V1 stays the first release of the API.
+PIN_SPEC = ">=1.55.3,<2"
 DEPENDENCY = f"Pin openai>=1.0 (e.g. openai{PIN_SPEC}) and migrate call sites"
 # a declaration that allows 0.x and 1.x alike: pip alone picks a new release, but a lockfile,
 # constraints file or existing environment can hold 0.x

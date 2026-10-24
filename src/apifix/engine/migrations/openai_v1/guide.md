@@ -234,7 +234,7 @@ def test_answer(get_client):
 <!-- part: dependencies -->
 ## Dependencies
 
-Pin `openai>=1.0,<2` wherever openai is declared (requirements files, pyproject.toml, setup.py,
+Pin `openai>=1.55.3,<2` wherever openai is declared (requirements files, pyproject.toml, setup.py,
 setup.cfg, Pipfile). Leave other dependencies alone, except exact pins that hold openai back:
 current openai releases need `typing_extensions>=4.11`, and releases before 1.55.3 do not work
 with `httpx>=0.28`. In a fully pinned file, raise such pins (e.g. `typing_extensions==4.5.0`)

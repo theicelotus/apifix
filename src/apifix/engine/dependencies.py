@@ -267,6 +267,28 @@ def entirely_below(clauses: Iterable[tuple[str, str]], bound: str) -> bool:
     return False
 
 
+def excludes_range(clauses: Iterable[tuple[str, str]], minimum: str, upper: str) -> bool:
+    """True if ``clauses`` allow no version in [minimum, upper): every allowed version is
+    below ``minimum``, or a lower bound or exact pin is at or above ``upper``. No clauses (any
+    version) never excludes."""
+    clauses = tuple(clauses)
+    if not clauses:
+        return False
+    if entirely_below(clauses, minimum):
+        return True
+    limit = parse_version(upper)
+    for op, version in clauses:
+        v = parse_version(version)
+        if (
+            v is not None
+            and limit is not None
+            and op in (">=", ">", "==", "===", "~=")
+            and v >= limit
+        ):
+            return True
+    return False
+
+
 def _lower_bound(op: str, version: str) -> Version | None:
     """The lowest version one clause allows (inclusive for `>`: every allowed version is above
     it), or None if the clause has no lower bound."""

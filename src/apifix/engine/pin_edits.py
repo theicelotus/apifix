@@ -32,7 +32,7 @@ from apifix.engine.dependencies import (
     DeclaredDependency,
     conda_package_name,
     dependency_file_problem,
-    entirely_below,
+    excludes_range,
     normalize_name,
     parse_conda_environment,
     parse_dependency_file,
@@ -60,7 +60,7 @@ class PinEdit:
     file: str
     line: int
     old: str  # the entry's source text before the edit, e.g. `openai==0.27.6`
-    new: str  # ... and after, e.g. `openai>=1.0,<2`
+    new: str  # ... and after, e.g. `openai>=1.55.3,<2`
     kind: EditKind
     why: str = ""  # companion edits: what the migrated library needs
 
@@ -150,7 +150,7 @@ def plan_pin_edits(root: Path, findings: list[Finding], migration: Migration) ->
 
 
 def pin_line(edit: PinEdit) -> str:
-    """`environment.yml:158 openai==0.27.6 -> openai>=1.0,<2` (plus why, for companions)."""
+    """`environment.yml:158 openai==0.27.6 -> openai>=1.55.3,<2` (plus why, for companions)."""
     why = f" ({edit.why})" if edit.why else ""
     return f"{edit.file}:{edit.line} {edit.old} -> {edit.new}{why}"
 
@@ -310,21 +310,7 @@ def _splice(text: str, targets: list[_Target]) -> str:
 
 def _excludes(clauses: Clauses, pin: CompanionPin) -> bool:
     """True if the clauses allow no version in [pin.minimum, pin.upper)."""
-    if not clauses:
-        return False
-    if entirely_below(clauses, pin.minimum):
-        return True
-    upper = parse_version(pin.upper)
-    for op, version in clauses:
-        v = parse_version(version)
-        if (
-            v is not None
-            and upper is not None
-            and op in (">=", ">", "==", "===", "~=")
-            and v >= upper
-        ):
-            return True
-    return False
+    return excludes_range(clauses, pin.minimum, pin.upper)
 
 
 def _companion_spec(clauses: Clauses, pin: CompanionPin) -> str:

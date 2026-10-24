@@ -243,7 +243,7 @@ def test_openai_declarations_that_allow_0x_are_flagged(tmp_path, line, confidenc
     (tmp_path / "requirements.txt").write_text(f"{line}\n")
     (finding,) = scan(tmp_path, "openai-v1").findings
     assert (finding.category, finding.confidence) == ("dependency", confidence)
-    assert says in finding.suggestion and "openai>=1.0,<2" in finding.suggestion
+    assert says in finding.suggestion and "openai>=1.55.3,<2" in finding.suggestion
 
 
 @pytest.mark.parametrize(
@@ -335,7 +335,7 @@ def test_build_system_requires():
 @pytest.mark.parametrize(
     "text",
     [
-        "openai>=1.0,<2\npytest\n",
+        "openai>=1.55.3,<2\npytest\n",
         "# pinned\nopenai==1.3.0  # comment\n\n-r base.txt\n-e .\n",
         "openai[datalib]>=1 ; python_version >= '3.8'\n",
         "pkg @ https://example.com/pkg.whl\n",
@@ -547,7 +547,7 @@ name = "x"
 @pytest.mark.parametrize(
     ("line", "problem"),
     [
-        ('openai = ">=1.0,<2"', None),
+        ('openai = ">=1.55.3,<2"', None),
         ('openai = "*"', None),
         ('openai = { version = ">=1.0", extras = ["datalib"] }', None),
         ('app = { path = ".", editable = true }', None),
@@ -664,7 +664,7 @@ def test_exported_conda_environments_are_recognised():
 @pytest.mark.parametrize(
     ("text", "problem"),
     [
-        ("dependencies:\n  - numpy>=1.24\n  - pip:\n    - openai>=1.0,<2\n", None),
+        ("dependencies:\n  - numpy>=1.24\n  - pip:\n    - openai>=1.55.3,<2\n", None),
         ("dependencies:\n  - pip:\n    - openai>=1.0,\n", "line 3 is not a valid pip requirement"),
         ("dependencies:\n  - numpy;x\n", "line 2 is not a valid conda package spec"),
         ("dependencies: [numpy]\n", "ValueError: dependencies must be a block list (line 1)"),

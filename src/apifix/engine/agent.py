@@ -1931,9 +1931,10 @@ class _Job:
         it: the repo has no tests, the sandbox could not run at all, or tests fail on the fix
         while the original code's run failed (no edit produces the missing baseline). Nothing
         is retried when the sandbox's environment lacks modules the original code's tests
-        need, or when only pins in the user's --sandbox-requirements file hold the library
-        back: the next attempt could not be judged either."""
-        if environment_incomplete(v) or sandbox_requirements_pin(v):
+        need, when only pins in the user's --sandbox-requirements file hold the library back,
+        or when pytest could not start on the original code (exit 4): the next attempt could
+        not be judged either."""
+        if environment_incomplete(v) or sandbox_requirements_pin(v) or pytest_usage_error(v):
             return False
         if any(r.code == "incomplete_migration" and r.file in self.manual_files for r in v.reasons):
             return False  # a hash-pinned file nobody in the job may edit
@@ -2217,6 +2218,10 @@ def sandbox_requirements_pin(v: Verification) -> bool:
     return any(r.code == "sandbox_requirements_pin" for r in v.reasons)
 
 
+def pytest_usage_error(v: Verification) -> bool:
+    return any(r.code == "pytest_usage_error" for r in v.reasons)
+
+
 def _upgraded_lines(job: _Job) -> list[str]:
     """Report lines for the --sandbox-requirements lines of the migrated library that the fixed
     runs got the target spec for (one per distinct line)."""
@@ -2406,6 +2411,14 @@ def report_markdown(
             "retried. Raise or drop those pins in the file and check again: `apifix verify "
             f"{job.repo} --migration {job.migration.name} --diff fix.diff "
             "--sandbox-requirements FILE`"
+        )
+    elif chosen and chosen.verification and pytest_usage_error(chosen.verification):
+        lines.append(
+            "- pytest could not start on the original code (exit 4, a usage error; the "
+            "verification below has its message), so the fix could not be judged and was not "
+            "retried. Once the environment is fixed (e.g. packages the tests need, listed in a "
+            f"file): `apifix verify {job.repo} --migration {job.migration.name} --diff "
+            "fix.diff --sandbox-requirements FILE`"
         )
     elif chosen and chosen.verification and not chosen.verification.delta.baseline_available:
         lines.append(

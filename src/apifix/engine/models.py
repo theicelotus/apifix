@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
@@ -37,11 +38,14 @@ class SmokeCheck:
 @dataclass(frozen=True)
 class LibraryTarget:
     """The migrated library and the version a fix needs (from the migration): `package`, its
-    first version with the new API, and the spec apifix writes for it (`>=1.0,<2`)."""
+    first version with the new API, the spec apifix writes for it (`>=1.55.3,<2`), and what
+    it needs from its own requirements (`companions`: lockfile pins that allow none of a
+    companion's range are not applied in the fixed run)."""
 
     package: str
     first_version: str
     spec: str
+    companions: Mapping[str, CompanionPin] = field(default_factory=dict, hash=False)
 
 
 @dataclass(frozen=True)

@@ -24,7 +24,7 @@ from apifix.engine.diffing import FileChange, diff_trees, read_text
 from apifix.engine.migrations import Migration, get_migration
 from apifix.engine.models import Finding, LibraryTarget
 from apifix.engine.project import NotInstalled, SandboxRequirements, is_test_file
-from apifix.engine.sandbox import PhaseResult, Sandbox, SandboxResult
+from apifix.engine.sandbox import PYTEST_USAGE_ERROR, PhaseResult, Sandbox, SandboxResult
 from apifix.engine.scanner import scan
 from apifix.engine.scope import tooling_change
 from apifix.engine.suspicious import check_dependencies, check_python
@@ -79,6 +79,7 @@ ENVIRONMENT_REASONS = frozenset(
         "missing_modules",
         "library_not_declared",
         "sandbox_requirements_pin",
+        "pytest_usage_error",
     }
 )
 # Test outcomes a sandbox_requirements_pin explains (the fixed run got the wrong library
@@ -301,6 +302,11 @@ def run_summary(run: SandboxResult) -> dict:
         "env_placeholders": list(run.env_placeholders),
         "notes": list(run.notes),
         "import_paths": list(run.import_paths),
+        **(
+            {"runner_error": run.runner_error, "runner_output": run.runner_output}
+            if run.runner_error
+            else {}
+        ),
         **({"smoke": asdict(run.smoke)} if run.smoke else {}),
         **({"not_installed": [asdict(n) for n in run.not_installed]} if run.not_installed else {}),
         **(
@@ -665,6 +671,16 @@ def _ids(ids: list[str]) -> tuple[str, ...]:
     return tuple(sorted(ids))
 
 
+def pytest_usage_error(run: SandboxResult) -> bool:
+    """The run's pytest exited 4 without a report (see sandbox.PYTEST_USAGE_ERROR)."""
+    return (
+        run.status == "error"
+        and run.runner == "pytest"
+        and run.test is not None
+        and run.test.exit_code == PYTEST_USAGE_ERROR
+    )
+
+
 def _run_reasons(baseline: SandboxResult, fixed: SandboxResult, delta: TestDelta) -> list[Reason]:
     if fixed.status not in ("error", "timeout"):
         if baseline_usable(baseline):
@@ -691,6 +707,24 @@ def _run_reasons(baseline: SandboxResult, fixed: SandboxResult, delta: TestDelta
                 )
             )
         return reasons
+    if pytest_usage_error(baseline):
+        same = fixed.runner_error == baseline.runner_error
+        return [
+            Reason(
+                "pytest_usage_error",
+                "unverified",
+                "pytest stopped before collecting any test on the original code (exit 4: a "
+                "usage error, such as an unknown option, a missing plugin or a conftest that "
+                f"fails to import): {baseline.runner_error or '(no output)'}. "
+                + (
+                    "The fixed code's run stopped the same way. "
+                    if same
+                    else f"The fixed code's run failed too ({fixed.reason}). "
+                )
+                + "This is the sandbox's environment or the repo's pytest setup, not the fix, "
+                "so the fix could not be judged",
+            )
+        ]
     if baseline.status in ("error", "timeout"):
         return [
             Reason(
@@ -975,10 +1009,20 @@ def smoke_reasons(fixed: SandboxResult, baseline: SandboxResult | None = None) -
             "and check the diff again (`apifix verify ... --sandbox-requirements FILE`)."
         )
         return [Reason("sandbox_requirements_pin", "unverified", message)]
-    if smoke.pins:
+    lockfile = fixed.lockfile
+    locked = [p for p in smoke.pins if lockfile and smoke.pin_sources.get(p) == [lockfile]]
+    declared = [p for p in smoke.pins if p not in locked]
+    if declared:
         message += (
             f" Exact pins in the dependency files on {lib} or its dependencies, which can hold "
-            f"{lib} back to an old release: {', '.join(smoke.pins)}."
+            f"{lib} back to an old release: {', '.join(declared)}."
+        )
+    if locked:
+        message += (
+            f" Exact pins from {lockfile} (apifix applies them as constraints and never edits "
+            f"it; regenerate it after the upgrade) on {lib} or its dependencies: "
+            f"{', '.join(locked)}. A requirement declared in a dependency file overrides a "
+            "lockfile pin it conflicts with."
         )
     message += " Fix the dependency file(s): raise or drop the pins that conflict."
     return [Reason("smoke_check_failed", "reject", message)]
@@ -1210,7 +1254,9 @@ def verify(
         baseline = sandbox.run(original, env=env)
     rerun = None
     smoke = getattr(mig, "smoke_check", None)
-    target = LibraryTarget(mig.package, mig.first_version, mig.pin_spec)
+    target = LibraryTarget(
+        mig.package, mig.first_version, mig.pin_spec, dict(getattr(mig, "companion_pins", {}))
+    )
     with sandbox.session(
         fixed, coverage=True, env=env, smoke=smoke, original=original, target=target
     ) as session:

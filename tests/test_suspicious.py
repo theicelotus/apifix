@@ -117,9 +117,9 @@ def test_unparseable_new_file_is_left_to_other_checks():
 
 def test_new_dependencies():
     old = "openai==0.28.1\npytest\n"
-    assert check_dependencies("requirements.txt", old, "openai>=1.0,<2\npytest\n", OPENAI) == []
+    assert check_dependencies("requirements.txt", old, "openai>=1.55.3,<2\npytest\n", OPENAI) == []
     (e,) = check_dependencies(
-        "requirements.txt", old, "openai>=1.0,<2\npytest\nrequests==2.0\n", OPENAI
+        "requirements.txt", old, "openai>=1.55.3,<2\npytest\nrequests==2.0\n", OPENAI
     )
     assert (e.kind, e.line, e.detail) == ("new_dependency", 3, "new dependency `requests==2.0`")
 
@@ -146,7 +146,7 @@ def test_injected_instruction_followed_by_a_fix_is_warned(tmp_path):
     shutil.copytree(INJECTED, original)
     fixed = tmp_path / "fixed"
     shutil.copytree(INJECTED, fixed)
-    (fixed / "requirements.txt").write_text("openai>=1.0,<2\npytest\n")
+    (fixed / "requirements.txt").write_text("openai>=1.55.3,<2\npytest\n")
     (fixed / "app.py").write_text(
         textwrap.dedent(
             """\

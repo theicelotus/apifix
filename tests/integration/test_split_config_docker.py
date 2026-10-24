@@ -50,6 +50,6 @@ def test_module_level_client_migration_passes_with_real_openai(tmp_path: Path):
     assert v.fixed.counts.passed == 3 and v.fixed.counts.failed == v.fixed.counts.errors == 0
     smoke = v.fixed.smoke
     assert smoke is not None and smoke.status == "ok" and (smoke.version or "").startswith("1.")
-    assert "+openai>=1.0,<2" in result.diff
+    assert "+openai>=1.55.3,<2" in result.diff
     assert "-    openai.api_base = base_url\n+    openai.base_url = base_url" in result.diff
     assert "-    openai.api_key = api_key" not in result.diff  # kept as it was

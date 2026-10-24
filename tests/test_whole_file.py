@@ -272,7 +272,7 @@ def test_must_change_needs_a_certain_finding():
 @pytest.mark.parametrize(
     ("path", "original", "candidate", "problem"),
     [
-        ("requirements.txt", "openai==0.28.1\n", "openai>=1.0,<2\npytest\n", None),
+        ("requirements.txt", "openai==0.28.1\n", "openai>=1.55.3,<2\npytest\n", None),
         ("requirements.txt", "openai==0.28.1\n", "-r base.txt\nopenai>=1  # new\n", None),
         (
             "requirements.txt",

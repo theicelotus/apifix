@@ -26,6 +26,7 @@ from apifix.engine.sandbox import (
     default_pip_cache_dir,
     parse_install_stats,
     prepare_pip_cache,
+    pytest_error,
     run_sandbox,
 )
 from apifix.engine.test_results import TestCounts
@@ -422,7 +423,7 @@ def test_plain_install_failure_is_not_retried(repo):
         # pip's network failure ends in "No matching distribution found" as well
         "WARNING: Retrying (Retry(total=4)) after connection broken by "
         "'NewConnectionError(...)': /simple/openai/\n"
-        "ERROR: No matching distribution found for openai>=1.0,<2",
+        "ERROR: No matching distribution found for openai>=1.55.3,<2",
         "ERROR: HTTP error 503 while getting https://files.pythonhosted.org/...",
         "Killed",  # no recognised marker: the cause is unknown, so it may be transient
     ],
@@ -526,6 +527,69 @@ def test_pytest_crash_without_report_is_error(repo):
 
     result = run_sandbox(repo, docker=FakeDocker(test=behave))
     assert result.status == "error"
+
+
+CONFTEST_STDERR = """[apifix] repo install method: editable
+ImportError while loading conftest '/work/tests/conftest.py'.
+tests/conftest.py:3: in <module>
+    import pandas as pd
+/deps/venv/lib/python3.11/site-packages/pandas/_libs/__init__.py:13: in <module>
+    from pandas._libs.interval import Interval
+pandas/_libs/interval.pyx:1: in init pandas._libs.interval
+    ???
+E   ValueError: numpy.dtype size changed, may indicate binary incompatibility. Expected 96 \
+from C header, got 88 from PyObject
+"""
+CONFTEST_ERROR = (
+    "ImportError while loading conftest 'tests/conftest.py': ValueError: numpy.dtype size "
+    "changed, may indicate binary incompatibility. Expected 96 from C header, got 88 from "
+    "PyObject"
+)
+
+
+def test_pytest_usage_error_keeps_pytests_message(repo):
+    def behave(call):
+        write_driver_json(call)
+        return exited(4, stderr=CONFTEST_STDERR)
+
+    result = run_sandbox(repo, docker=FakeDocker(test=behave))
+    assert result.status == "error"
+    assert result.reason == f"pytest exited 4 (usage error) without a report: {CONFTEST_ERROR}"
+    assert result.runner_error == CONFTEST_ERROR
+    assert "[apifix]" not in result.runner_output
+    assert result.runner_output.endswith("got 88 from PyObject")
+
+
+@pytest.mark.parametrize(
+    ("output", "error"),
+    [
+        (CONFTEST_STDERR, CONFTEST_ERROR),
+        (
+            "ERROR: usage: pytest [options] [file_or_dir] [file_or_dir] [...]\n"
+            "pytest: error: unrecognized arguments: --cov=genai --cov-report=xml\n"
+            "  inifile: /work/pyproject.toml\n  rootdir: /work\n",
+            "pytest: error: unrecognized arguments: --cov=genai --cov-report=xml",
+        ),
+        (
+            "ERROR: file or directory not found: /work/tests/missing.py\n\n",
+            "ERROR: file or directory not found: tests/missing.py",
+        ),
+        (
+            "Traceback (most recent call last):\n  ...\n"
+            "E   ModuleNotFoundError: No module named 'xdist'\nsomething else\n",
+            "ModuleNotFoundError: No module named 'xdist'",
+        ),
+        ("INTERNALERROR> boom\n", "INTERNALERROR> boom"),
+        ("\n  \n", None),
+    ],
+)
+def test_pytest_error_picks_the_line_that_says_why(output, error):
+    assert pytest_error(output) == error
+
+
+def test_pytest_error_is_clipped():
+    error = pytest_error("ERROR: " + "x" * 2_000)
+    assert error is not None and len(error) == 500 and error.endswith("...")
 
 
 def test_oom_kill_is_error(repo):
@@ -749,6 +813,44 @@ def test_smoke_pins_record_where_they_are_declared(flat_service):
     }
 
 
+LOCKED_PROJECT = {
+    "pyproject.toml": '[tool.poetry.dependencies]\nopenai = ">=1.55.3,<2"\n',
+    "poetry.lock": '[[package]]\nname = "tqdm"\nversion = "4.65.0"\n',
+    "tests/test_a.py": "def test_x():\n    assert True\n",
+}
+HELD_BACK = smoke_output(
+    ok=False,
+    output="TypeError: Client.__init__() got an unexpected keyword argument 'proxies'\n",
+    version="1.39.0",
+    requires={"httpx": "0.28.1", "tqdm": "4.65.0"},
+)
+
+
+def _locked_project(tmp_path) -> Path:
+    root = tmp_path / "locked"
+    for rel, text in LOCKED_PROJECT.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(text)
+    return root
+
+
+def test_smoke_pins_from_the_lockfile_name_the_lockfile(tmp_path):
+    docker = FakeDocker(test=pytest_run(passed=1), smoke=lambda call: HELD_BACK)
+    smoke = Sandbox(docker=docker).run(_locked_project(tmp_path), smoke=SMOKE).smoke
+    assert smoke.pins == ["tqdm==4.65.0"]
+    assert smoke.pin_sources == {"tqdm==4.65.0": ["poetry.lock"]}
+
+
+def test_smoke_pins_leave_out_a_lockfile_the_install_dropped(tmp_path):
+    conflict = exited(1, stderr="ERROR: ResolutionImpossible: for help visit ...")
+    docker = FakeDocker(
+        install=[conflict, ok()], test=pytest_run(passed=1), smoke=lambda call: HELD_BACK
+    )
+    result = Sandbox(docker=docker).run(_locked_project(tmp_path), smoke=SMOKE)
+    assert result.lockfile_applied is False
+    assert result.smoke.pins == []
+
+
 def test_fixed_run_with_sandbox_requirements_gets_the_target_for_an_old_library_pin(
     flat_service, tmp_path
 ):
@@ -760,11 +862,11 @@ def test_fixed_run_with_sandbox_requirements_gets_the_target_for_an_old_library_
     (fixed / "svc" / "server.py").write_text("def reply():\n    return 2\n")
     docker = FakeDocker(test=pytest_run(passed=1))
     sandbox = Sandbox(SandboxConfig(requirements_override=override), docker=docker)
-    target = LibraryTarget("openai", "1.0", ">=1.0,<2")
+    target = LibraryTarget("openai", "1.0", ">=1.55.3,<2")
     result = sandbox.run(fixed, original=flat_service, target=target)
-    assert result.override_upgraded == ["openai==0.28.1 -> openai>=1.0,<2"]
+    assert result.override_upgraded == ["openai==0.28.1 -> openai>=1.55.3,<2"]
     (manifest,) = docker.requirements
-    assert "openai>=1.0,<2\n" in manifest and "openai==0.28.1" not in manifest
+    assert "openai>=1.55.3,<2\n" in manifest and "openai==0.28.1" not in manifest
     # without `original` (the baseline) the user's line stays
     docker = FakeDocker(test=pytest_run(passed=1))
     sandbox = Sandbox(SandboxConfig(requirements_override=override), docker=docker)

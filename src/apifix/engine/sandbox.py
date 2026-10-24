@@ -76,6 +76,11 @@ WORKSPACE_LOCK = ".apifix.lock"  # flock held by the owning process while the wo
 NOBODY = 65534
 DOCKER_RUN_FAILED = 125  # `docker run` itself failed (bad image, daemon error, ...)
 KILLED = 137  # SIGKILL, typically the OOM killer
+# pytest's exit code for a usage error: bad options, a conftest that fails to import, a missing
+# plugin. It stops before collecting, so no JUnit report is written.
+PYTEST_USAGE_ERROR = 4
+RUNNER_ERROR_CHARS = 500  # SandboxResult.runner_error
+RUNNER_OUTPUT_CHARS = 2_000  # SandboxResult.runner_output (trajectory only)
 
 # The complete container environment. Literal values only: nothing is read from os.environ.
 CONTAINER_ENV: dict[str, str] = {
@@ -283,6 +288,56 @@ class SandboxResult:
     override_replaced: list[str] = field(default_factory=list)
     # its lines for the migrated library that the target spec replaced (InstallPlan.upgraded)
     override_upgraded: list[str] = field(default_factory=list)
+    # pytest stopped without a report: the error it printed (see pytest_error) and the tail of
+    # its output
+    runner_error: str | None = None
+    runner_output: str = ""
+
+
+_ARGPARSE_ERROR_RE = re.compile(r"^\S+: error: .+")
+_CONFTEST_RE = re.compile(r"^(\w+(?:Error|Exception|Failure)?) while loading conftest '([^']+)'")
+
+
+def _without_driver_lines(output: str) -> str:
+    return "\n".join(ln for ln in output.splitlines() if not ln.startswith("[apifix]"))
+
+
+def pytest_error(output: str) -> str | None:
+    """The error pytest printed when it stopped before writing a report, in one line: a
+    conftest that failed to load ("ImportError while loading conftest 'tests/conftest.py':
+    ValueError: ..."), an argparse usage error ("pytest: error: unrecognized arguments:
+    --cov"), else its last `ERROR:` line, its last `E   ` line or the last line. Container
+    paths under /work/ are shown relative to the repo. None for empty output."""
+    lines = [ln.rstrip() for ln in output.replace("/work/", "").splitlines() if ln.strip()]
+    if not lines:
+        return None
+    errors = [ln[1:].strip() for ln in lines if ln.startswith("E ")]
+    found = None
+    for i, line in enumerate(lines):
+        if m := _CONFTEST_RE.match(line):
+            last = next(
+                (ln[1:].strip() for ln in reversed(lines[i + 1 :]) if ln.startswith("E ")), None
+            )
+            found = f"{m.group(1)} while loading conftest '{m.group(2)}'" + (
+                f": {last}" if last else ""
+            )
+            break
+    if found is None:
+        found = next((ln.strip() for ln in lines if _ARGPARSE_ERROR_RE.match(ln.strip())), None)
+    if found is None:
+        found = next(
+            (
+                ln.strip()
+                for ln in reversed(lines)
+                if ln.startswith("ERROR: ") and not ln.startswith("ERROR: usage:")
+            ),
+            None,
+        )
+    if found is None:
+        found = errors[-1] if errors else lines[-1].strip()
+    if len(found) > RUNNER_ERROR_CHARS:
+        found = found[: RUNNER_ERROR_CHARS - 3] + "..."
+    return found
 
 
 @dataclass(frozen=True)
@@ -599,11 +654,16 @@ class Sandbox:
         if tests.runner == "pytest":
             report = ws.results / "junit.xml"
             if not report.is_file():
-                result.status = "unverified" if phase.exit_code == 5 else "error"
-                result.reason = (
-                    "pytest collected no tests"
-                    if phase.exit_code == 5
-                    else f"pytest exited {phase.exit_code} without a report"
+                if phase.exit_code == 5:
+                    result.status, result.reason = "unverified", "pytest collected no tests"
+                    return
+                output = _without_driver_lines(phase.stderr + "\n" + phase.stdout)
+                result.runner_error = pytest_error(output)
+                result.runner_output = output.strip()[-RUNNER_OUTPUT_CHARS:]
+                usage = " (usage error)" if phase.exit_code == PYTEST_USAGE_ERROR else ""
+                result.status = "error"
+                result.reason = f"pytest exited {phase.exit_code}{usage} without a report" + (
+                    f": {result.runner_error}" if result.runner_error else ""
                 )
                 return
             try:
@@ -669,6 +729,14 @@ class Sandbox:
         }
         names = {normalize_name(check.distribution), *map(normalize_name, requires)}
         pins = {line: name for name, line in exact_pins(plan).items() if name in names}
+        required = {r.split(";", 1)[0].strip() for r in plan.requirements}
+
+        def sources(line: str, name: str) -> list[str]:
+            # a pin no requirement states is a lockfile constraint
+            if line in required or not plan.lockfile:
+                return list(plan.declared.get(name, ()))
+            return [plan.lockfile]
+
         return SmokeResult(
             "ok" if data.get("ok") else "failed",
             check.description,
@@ -677,7 +745,7 @@ class Sandbox:
             installed.get("version"),
             requires,
             sorted(pins),
-            {line: list(plan.declared.get(name, ())) for line, name in sorted(pins.items())},
+            {line: sources(line, name) for line, name in sorted(pins.items())},
         )
 
     def _phase(
@@ -820,6 +888,7 @@ class SandboxSession:
             override=self.sandbox.config.requirements_override,
             original=self.original,
             target=self.target,
+            python=base.python_version,
         )
         if self.coverage and "coverage" not in plan.requirements:
             plan = dataclasses.replace(plan, requirements=(*plan.requirements, "coverage"))
@@ -839,7 +908,9 @@ class SandboxSession:
         self._workspace = _Workspace(self.repo, plan)
         self._image = self.sandbox._install(self._workspace, plan, base)
         if self._image is not None and self.smoke is not None:
-            base.smoke = self.sandbox._smoke(self._workspace, self._image, self.smoke, plan)
+            # lockfile pins the install dropped (retried without them) held nothing back
+            used = plan if base.lockfile_applied else dataclasses.replace(plan, constraints=())
+            base.smoke = self.sandbox._smoke(self._workspace, self._image, self.smoke, used)
 
     def run_tests(self, *, coverage: bool | None = None) -> SandboxResult:
         """Run the test phase. `coverage` defaults to the session setting (it can only be

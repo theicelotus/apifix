@@ -57,15 +57,15 @@ instead (verdict "unverified"); if the fix removed its declaration, the fix is r
 
 ### Dependency pins
 
-apifix sets the migrated library's pin itself, with no LLM call (`openai>=1.0,<2` for
-openai-v1), in every format it reads: requirements files, `pyproject.toml` (`[project]`,
-dependency groups, Poetry, pixi), `pixi.toml`, `Pipfile`, `setup.py`/`setup.cfg` string
-literals and an `environment.yml` `pip:` list. Only the version is rewritten; names, extras,
-markers, comments, quoting and line endings stay as they were, and every edit is checked by
-parsing the file again. In the same files, pins of openai's own requirements that would hold it
+apifix sets the migrated library's pin itself, with no LLM call (`openai>=1.55.3,<2` for
+openai-v1: releases before 1.55.3 break with httpx 0.28), in every format it reads:
+requirements files, `pyproject.toml` (`[project]`, dependency groups, Poetry, pixi),
+`pixi.toml`, `Pipfile`, `setup.py`/`setup.cfg` string literals and an `environment.yml`
+`pip:` list. Only the version is rewritten; names, extras, markers, comments, quoting and line
+endings stay as they were, and every edit is checked by parsing the file again. In the same files, pins of openai's own requirements that would hold it
 back are raised to what openai needs (e.g. `typing_extensions==4.5.0` ->
 `typing_extensions>=4.11,<5`; pydantic stays on its major version). The report lists each pin
-apifix set ("apifix set: requirements.txt:3 openai==0.28.1 -> openai>=1.0,<2"). Entries it
+apifix set ("apifix set: requirements.txt:3 openai==0.28.1 -> openai>=1.55.3,<2"). Entries it
 cannot rewrite safely (continuation lines, escaped TOML strings, non-literal `setup.py` values)
 go to the model as before, and the report says why; hash-pinned requirements files are left
 for a manual update. Conda entries and lockfiles are never edited: the report names conda
@@ -114,7 +114,7 @@ dependency edits still apply: for every package whose declaration the fix change
 version replaces your line (e.g. your `openai==0.28` becomes the fix's `openai>=1.0`), and the
 report lists each replacement. When the fix leaves the library's declaration unchanged, your
 line for it still gets the migration's version in the fixed run if it allows the old one
-(`openai==0.28.1` becomes `openai>=1.0,<2`; the original code keeps your line), and the report
+(`openai==0.28.1` becomes `openai>=1.55.3,<2`; the original code keeps your line), and the report
 says so. If the fixed code's smoke check then fails and the only pins that can hold the library
 back are in your file (e.g. `typing_extensions==4.5.0`), the verdict is "unverified" with
 `sandbox_requirements_pin`: a problem with the file, not the fix. The model is not told about

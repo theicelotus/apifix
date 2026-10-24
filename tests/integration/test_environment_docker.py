@@ -89,7 +89,7 @@ ORIGINAL = {
 }
 
 FIXED = {
-    "pyproject.toml": PYPROJECT.replace('openai = "==0.28.1"', 'openai = ">=1.0,<2"'),
+    "pyproject.toml": PYPROJECT.replace('openai = "==0.28.1"', 'openai = ">=1.55.3,<2"'),
     "app.py": """\
         import openai
 
@@ -159,5 +159,5 @@ def test_sandbox_requirements_fill_the_gap_and_the_fixs_pin_still_applies(trees,
     config = SandboxConfig(**CONFIG, requirements_override=load_sandbox_requirements(reqs))
     v = verify(original, fixed, "openai-v1", sandbox=Sandbox(config))
     assert v.baseline.counts.passed == 2, v.baseline.reason
-    assert v.fixed.override_replaced == ["openai: openai==0.28.1 -> openai>=1.0,<2"]
+    assert v.fixed.override_replaced == ["openai: openai==0.28.1 -> openai>=1.55.3,<2"]
     assert v.verdict == "verified", v.reasons
