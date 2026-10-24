@@ -12,9 +12,11 @@ the job cleanly with a reason. Everything is recorded in a JSON-able trajectory.
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import json
 import math
+import re
 import shutil
 import tempfile
 import time
@@ -27,6 +29,7 @@ from typing import Any, Literal
 from apifix.engine.agent_tools import TOOLS, EditRecord, Workspace
 from apifix.engine.already_migrated import AlreadyMigrated, detect_already_migrated
 from apifix.engine.code_checks import STDLIB_IMPORTS, import_table, module_roots
+from apifix.engine.context import changed_statements, library_uses, reachable_modules
 from apifix.engine.dependencies import is_dependency_file
 from apifix.engine.diffing import diff_trees, read_text, unified_diff
 from apifix.engine.imports import (
@@ -62,6 +65,7 @@ from apifix.engine.regions import (
     coverage,
     find_regions,
     labels_nudge,
+    map_line,
     names_context,
     ordered_ids,
     outline,
@@ -90,6 +94,7 @@ from apifix.engine.whole_file import (
     DEFAULT_REGION_THRESHOLD,
     KEPT_DIFF_CHARS,
     REGION_COVERAGE_MAX,
+    REPLY_CHARS_PER_TOKEN,
     CheckResult,
     as_file,
     check_candidate,
@@ -140,6 +145,11 @@ AGENT_MIN_REPLY_TOKENS = 1_024
 TOKEN_LIMIT_MIN_MARGIN = 256
 TOKEN_LIMIT_MARGIN_RATIO = 0.03
 LOWERED_NOTE = "sent again with fewer reply tokens"
+# Request estimates against a known token limit: characters per prompt token before the job's
+# own responses calibrate it (3.0 is on the safe side for code and English), and the
+# characters a region request has besides its regions, context and feedback.
+DEFAULT_CHARS_PER_TOKEN = 3.0
+REGION_REQUEST_OVERHEAD_CHARS = 1_500
 
 
 def token_limit_margin(limit: int) -> int:
@@ -386,8 +396,7 @@ class _Job:
         self.wf_files: list[str] = []
         self.wf_skipped: list[dict[str, object]] = []
         self.wf_pending: list[str] = []
-        self.wf_feedback = ""
-        self.wf_dependency_feedback = ""
+        self.wf_verification: tuple[int, Verification] | None = None  # the last rejection
         self.wf_previous: dict[str, tuple[str | None, str]] = {}
         self.guide_sections: list[str] | None = None  # whole-file: the job guide's parts
         # whole-file: every check error of every reply so far, per file (error_key form), for
@@ -406,6 +415,10 @@ class _Job:
         self.sandbox_seconds = 0.0
         self.baseline_seconds = 0.0
         self.lowered_requests = 0  # requests retried with fewer reply tokens (RequestTooLarge)
+        # The smallest per-minute token limit a server stated in this job (kept for the rest of
+        # it), and the fewest characters per prompt token its responses showed.
+        self.token_limit: int | None = None
+        self.chars_per_token: float | None = None
         # Dependency pins apifix set itself (pin_edits): the files written into the working
         # copy, the entries it did not set, the files it never sends (hash-pinned), and the
         # findings the model still has to handle.
@@ -442,18 +455,24 @@ class _Job:
 
     # --- budget -----------------------------------------------------------------------------
 
-    def _estimate_input_tokens(self, messages: list[Message]) -> int:
-        chars = len(self.system) + sum(len(t.description) + 200 for t in self.tools)
+    def _input_chars(self, messages: list[Message], system: str | None = None) -> int:
+        chars = len(self.system if system is None else system)
+        chars += sum(len(t.description) + 200 for t in self.tools)
         for m in messages:
             chars += len(m.text) + sum(len(r.content) for r in m.tool_results)
             chars += sum(len(str(c.input)) for c in m.tool_calls)
             if m.provider_blocks:
                 chars += sum(len(str(b)) for b in m.provider_blocks)
-        return chars // CHARS_PER_TOKEN
+        return chars
 
-    def _check_budget_before_call(self, messages: list[Message], max_tokens: int) -> None:
+    def _estimate_input_tokens(self, messages: list[Message], system: str | None = None) -> int:
+        return self._input_chars(messages, system) // CHARS_PER_TOKEN
+
+    def _check_budget_before_call(
+        self, messages: list[Message], max_tokens: int, system: str | None = None
+    ) -> None:
         c = self.config
-        projected_tokens = self._estimate_input_tokens(messages) + max_tokens
+        projected_tokens = self._estimate_input_tokens(messages, system) + max_tokens
         if self.usage.total + projected_tokens > c.max_tokens_per_job:
             raise _Abort(
                 "token_limit",
@@ -462,7 +481,7 @@ class _Job:
             )
         if c.max_cost_usd is not None:
             worst = Usage(
-                input_tokens=self._estimate_input_tokens(messages),
+                input_tokens=self._estimate_input_tokens(messages, system),
                 output_tokens=max_tokens,
             )
             projected = self.llm.cost(worst) or 0.0
@@ -494,21 +513,24 @@ class _Job:
         *,
         max_tokens: int | None = None,
         need_tokens: int = AGENT_MIN_REPLY_TOKENS,
+        system: str | None = None,
     ) -> LLMResponse:
         """One request; the reply is appended to `messages` (default: the agent conversation).
-        `max_tokens` defaults to the configured maximum. A request over the server's per-minute
-        token limit is sent once more with max_tokens lowered to fit, if that leaves at least
-        `need_tokens` for the reply."""
+        `max_tokens` defaults to the configured maximum; `system` to the job's system prompt.
+        A request over the server's per-minute token limit is sent once more with max_tokens
+        lowered to fit, if that leaves at least `need_tokens` for the reply."""
         messages = self.messages if messages is None else messages
+        system = self.system if system is None else system
         max_tokens = max_tokens or self.config.max_output_tokens
-        self._check_budget_before_call(messages, max_tokens)
+        self._check_budget_before_call(messages, max_tokens, system)
+        prompt_chars = self._input_chars(messages, system)
         lowered_from: int | None = None
         start = time.monotonic()
         try:
             while True:
                 try:
                     response = self.llm.complete(
-                        system=self.system,
+                        system=system,
                         messages=messages,
                         tools=self.tools,
                         max_tokens=max_tokens,
@@ -532,6 +554,10 @@ class _Job:
                 self.llm.notes.append(note)
         self.usage += response.usage
         attempt.usage += response.usage
+        counted = response.usage.input_tokens + response.usage.cache_read_tokens
+        if counted > 0:
+            ratio = prompt_chars / counted
+            self.chars_per_token = min(ratio, self.chars_per_token or ratio)
         self.cost += cost or 0.0
         attempt.cost_usd += cost or 0.0
         attempt.responses.append(
@@ -563,7 +589,9 @@ class _Job:
         self, exc: RequestTooLarge, max_tokens: int, need: int, lowered_from: int | None
     ) -> int:
         """max_tokens that makes a refused request fit the server's per-minute limit (it counts
-        the prompt plus max_tokens), or raise LLMError when one retry cannot help."""
+        the prompt plus max_tokens), or raise LLMError when one retry cannot help. The limit is
+        kept for the rest of the job."""
+        self.token_limit = min(exc.limit, self.token_limit or exc.limit)
         if lowered_from is not None:
             raise _CannotFit(
                 f"{exc} (already sent again with max_tokens lowered from {lowered_from:,} to "
@@ -689,8 +717,7 @@ class _Job:
         """Whole-file: what the next attempt sends. Every file again, from the original with
         the previous version as a diff, except dependency files (accepted, or set by apifix)
         the verification did not implicate."""
-        self.wf_feedback = verification_feedback(number, v, hints=self.migration.failure_hints)
-        self.wf_dependency_feedback = verification_feedback(number, v, dependency_file=True)
+        self.wf_verification = (number, v)
         self.wf_pending = [
             p for p in self.wf_all if not is_dependency_file(p) or _dependency_problem(p, v)
         ]
@@ -698,6 +725,119 @@ class _Job:
         self.wf_region_previous = {
             p: self.wf_region_texts[p] for p in self.wf_pending if p in self.wf_region_texts
         }
+        for p in self.wf_pending:
+            if p in self.wf_plans and self._form(p)[0] == "regions":
+                self._add_feedback_regions(p, v)
+
+    def _add_feedback_regions(self, path: str, v: Verification) -> None:
+        """Regions the verifier's output points at in a region-edited file (its failing tests,
+        traceback lines, reasons with a line), added to its plan with new ids."""
+        original = self._read(self.repo, path)
+        lines = feedback_lines_in(path, original, self._read(self.work, path), v)
+        if not lines:
+            return
+        plan = self.wf_plans[path]
+        new = find_regions(original, self._finding_lines(path), lines, previous=plan)
+        if new is not None:
+            self.wf_plans[path] = new
+
+    def _finding_lines(self, path: str) -> list[int]:
+        return [
+            n
+            for f in self.open_findings
+            if f.file == path
+            for n in range(f.line, max(f.line, f.end_line) + 1)
+        ]
+
+    def _feedback(self, dependency: bool) -> str:
+        """The last rejection's feedback for a file's request (shorter test output once a
+        token limit is known)."""
+        if self.wf_verification is None:
+            return ""
+        number, v = self.wf_verification
+        if dependency:
+            return verification_feedback(number, v, dependency_file=True)
+        short = self._limit() is not None
+        return verification_feedback(number, v, hints=self.migration.failure_hints, short=short)
+
+    # --- known token limits -----------------------------------------------------------------
+
+    def _limit(self) -> int | None:
+        """The token limit requests must fit: the per-minute limit a server stated, or the
+        model's context window (Ollama), whichever is smaller; None when neither is known."""
+        window = getattr(self.llm, "context_window", None)
+        known = [n for n in (self.token_limit, window) if isinstance(n, int) and n > 0]
+        return min(known) if known else None
+
+    def _tokens(self, chars: int) -> int:
+        return math.ceil(chars / (self.chars_per_token or DEFAULT_CHARS_PER_TOKEN))
+
+    def _fits(self, chars: int, reply: int) -> bool:
+        """Does a request of `chars` prompt characters plus `reply` tokens fit the limit?"""
+        limit = self._limit()
+        return limit is None or self._tokens(chars) + reply + token_limit_margin(limit) <= limit
+
+    def _system_for(self, path: str) -> tuple[str, str, list[str] | None]:
+        """(system prompt, its guide, guide part ids) of a request for `path`: the job's, or
+        once a token limit is known, one with only the guide parts this file needs (its ids
+        are returned then)."""
+        if self._limit() is None or self.guide_sections is None:
+            return self.system, self.wf_guide, None
+        own = [f for f in self.findings if f.file == path]
+        guide, ids = self.migration.job_guide(own, self.repo)
+        system = whole_file_system_prompt(self.migration, guide, self._pins_note())
+        return system, guide, list(ids)
+
+    def _context_options(self, path: str, own_bytes: int, compact: bool) -> list[_Context]:
+        """Read-only context for a request for `path`, fullest first. Not `compact`: the full
+        working copies that fit the byte budget (as before region edits). `compact`: changed
+        statements, the modules the test imports first; then the others, and then all, as
+        their library uses only; then dropped, last first. Each within the byte budget."""
+        updated = self._updated_context(path)
+        budget = self.config.whole_file_max_bytes
+        if not compact or not updated:
+            context, left_out = select_context(updated, own_bytes, budget)
+            return [_Context(context, left_out, {p: "full" for p, _ in context})]
+        library = self.migration.api_modules
+        texts = dict(updated)
+        reader = self._working_copy_reader(path, self._read(self.work, path))
+        roots = module_roots(path, self.baseline.import_paths if self.baseline else ())
+        imported = reachable_modules(path, reader, roots, set(texts))
+        order = imported + [p for p in texts if p not in imported]
+        shown = {
+            "changed": {
+                p: changed_statements(self._read(self.repo, p), texts[p], library) for p in order
+            },
+            "library_uses": {p: library_uses(texts[p], library) for p in order},
+        }
+        others = [p for p in order if p not in imported]
+        ladder = [
+            {p: "changed" for p in order},
+            {p: "library_uses" if p in others else "changed" for p in order},
+            {p: "library_uses" for p in order},
+        ]
+        for n in range(len(order) - 1, -1, -1):
+            ladder.append({p: "library_uses" for p in order[:n]})
+        options = []
+        for forms in ladder:
+            entries = [(p, shown[f][p]) for p, f in forms.items() if shown[f][p]]
+            chosen, used = [], own_bytes
+            for p, text in entries:
+                size = len(text.encode("utf-8"))
+                if used + size <= budget:
+                    chosen.append((p, text))
+                    used += size
+            labels = {"changed": "changed statements only", "library_uses": "library uses only"}
+            context = [(f"{p} ({labels[forms[p]]})", text) for p, text in chosen]
+            kept = {p for p, _ in chosen}
+            options.append(
+                _Context(
+                    context,
+                    [p for p in order if p not in kept],
+                    {p: forms[p] for p in order if p in kept},
+                )
+            )
+        return options
 
     def _read(self, root: Path, path: str) -> str:
         return (root / path).read_bytes().decode("utf-8")
@@ -712,9 +852,6 @@ class _Job:
         original = self._read(self.repo, path)
         required = must_change(path, self.findings)
         own_bytes = len(original.encode("utf-8"))
-        context, left_out = select_context(
-            self._updated_context(path), own_bytes, self.config.whole_file_max_bytes
-        )
         previous = ""
         if path in self.wf_previous:
             text, reason = self.wf_previous[path]
@@ -722,10 +859,14 @@ class _Job:
         tokens = file_tokens(original, self._read(self.work, path))
         max_tokens = reply_budget(tokens, self.config.max_output_tokens)
         guide = self._extra_guide(path)
+        system, system_guide, sections = self._system_for(path)
+        compact = self._limit() is not None and is_test_file(path, root=self.repo)
+        options = self._context_options(path, own_bytes, compact)
+        chosen = options[-1]
+        context: Sequence[tuple[str, str]] = chosen.context
 
         def request(previous: str) -> tuple[Message, dict[str, int]]:
-            dependency = is_dependency_file(path)
-            feedback = self.wf_dependency_feedback if dependency else self.wf_feedback
+            feedback = self._feedback(is_dependency_file(path))
             prompt = file_prompt(
                 path,
                 original,
@@ -738,8 +879,8 @@ class _Job:
                 guide=guide,
             )
             parts = {
-                "rules": len(self.system) - len(self.wf_guide),
-                "guide": len(self.wf_guide),
+                "rules": len(system) - len(system_guide),
+                "guide": len(system_guide),
                 "file_guide": len(guide),
                 "feedback": len(feedback),
                 "file": len(original),
@@ -750,6 +891,16 @@ class _Job:
             parts["findings_and_instructions"] = len(prompt) - sum(parts[k] for k in in_prompt)
             return Message("user", text=prompt), parts
 
+        for option in options:  # the fullest context that fits a known limit
+            context = option.context
+            first, parts = request(previous)
+            if self._fits(len(system) + len(first.text), tokens):
+                chosen = option
+                break
+        else:
+            if self._switch(path, "limit"):
+                return self._region_request(attempt, path)
+        context = chosen.context
         first, parts = request(previous)
         messages = [first]
         sent = [first]  # every message of the file's requests, in order
@@ -758,8 +909,9 @@ class _Job:
             "form": "whole",
             "form_reason": self._form(path)[1],
             "bytes_sent": own_bytes,
-            "context_files": [p for p, _ in context],
-            "context_left_out": left_out,
+            "context_files": [p.split(" ", 1)[0] for p, _ in context],
+            "context_forms": chosen.forms,
+            "context_left_out": chosen.left_out,
             "previous_version_sent": bool(previous),
             "change_required": required,
             "max_tokens": max_tokens,
@@ -768,6 +920,8 @@ class _Job:
             "accepted": False,
             "error": "",
         }
+        if sections is not None:
+            entry["guide_sections"] = sections
         attempt.files.append(entry)
         retries = 0
         candidate: str | None = None
@@ -775,7 +929,7 @@ class _Job:
         try:
             while True:
                 response = self._call_llm(
-                    attempt, messages, max_tokens=max_tokens, need_tokens=tokens
+                    attempt, messages, max_tokens=max_tokens, need_tokens=tokens, system=system
                 )
                 sent.append(messages[-1])
                 if response.stop_reason == "refusal":
@@ -900,13 +1054,7 @@ class _Job:
         for path in self.wf_files:
             original = self._read(self.repo, path)
             if path.endswith(".py") and not is_dependency_file(path):
-                lines = [
-                    n
-                    for f in self.open_findings
-                    if f.file == path
-                    for n in range(f.line, max(f.line, f.end_line) + 1)
-                ]
-                plan = find_regions(original, lines)
+                plan = find_regions(original, self._finding_lines(path))
                 if plan is not None and plan.regions:
                     self.wf_plans[path] = plan
             size = len(original.encode("utf-8"))
@@ -957,19 +1105,35 @@ class _Job:
     def _switch_to_regions(self, path: str, abort: _Abort) -> bool:
         """A whole file the server refused for its per-minute limit, which fewer reply tokens
         could not fix, is sent as regions instead (auto only, once)."""
-        if abort.limit is None or self.config.file_edits != "auto" or path not in self.wf_plans:
+        return abort.limit is not None and self._switch(path, "refused")
+
+    def _switch(self, path: str, reason: str) -> bool:
+        """Send a whole file as regions from now on (auto only; it must have regions)."""
+        if self.config.file_edits != "auto" or path not in self.wf_plans:
             return False
         if self._form(path)[0] != "whole":
             return False
-        self.wf_form[path] = ("regions", "refused")
+        self.wf_form[path] = ("regions", reason)
         return True
 
-    def _batches(self, original: str, plan: RegionPlan) -> list[list[str]]:
+    def _batches(self, path: str, original: str, plan: RegionPlan) -> list[list[str]]:
         """The regions in requests of at most the size limit (with the import block), in
-        file order."""
-        budget = self.config.whole_file_max_bytes - len(
-            region_text(original, plan.imports).encode("utf-8")
-        )
+        file order; with a known token limit, also small enough that each request (prompt and
+        the reply estimate) fits it, by estimate."""
+        imports = region_text(original, plan.imports)
+        budget = self.config.whole_file_max_bytes - len(imports.encode("utf-8"))
+        limit = self._limit()
+        if limit is not None:
+            system, _, _ = self._system_for(path)
+            fixed = len(system) + len(self._feedback(False)) + REGION_REQUEST_OVERHEAD_CHARS
+            fixed += (
+                len(imports) + len(outline(original, plan)) + len(names_context(original, plan))
+            )
+            room = limit - token_limit_margin(limit) - self._tokens(fixed)
+            room -= -(-len(imports) // REPLY_CHARS_PER_TOKEN)
+            per_char = 1 / (self.chars_per_token or DEFAULT_CHARS_PER_TOKEN)
+            per_char += 1 / REPLY_CHARS_PER_TOKEN
+            budget = min(budget, max(int(room / per_char), 1))
         batches: list[list[str]] = []
         current: list[str] = []
         used = 0
@@ -1015,7 +1179,7 @@ class _Job:
         attempt.files.append(entry)
         sent: list[Message] = []
         texts: dict[str, str] = {}
-        batches = self._batches(original, plan)
+        batches = self._batches(path, original, plan)
         try:
             for number, ids in enumerate(batches, 1):
                 outcome = self._region_batch(
@@ -1073,13 +1237,13 @@ class _Job:
         names = names_context(original, plan, ids)
         outline_text = outline(original, plan)
         guide = self._extra_guide(path)
+        system, system_guide, sections = self._system_for(path)
         imports_bytes = len(region_text(original, plan.imports).encode("utf-8"))
         own_bytes = imports_bytes + sum(
             len(region_text(original, plan.get(i)).encode("utf-8")) for i in ids
         )
-        context, left_out = select_context(
-            self._updated_context(path), own_bytes, self.config.whole_file_max_bytes
-        )
+        options = self._context_options(path, own_bytes, is_test_file(path, root=self.repo))
+        context: Sequence[tuple[str, str]] = options[-1].context
 
         def budget(send: Sequence[str]) -> tuple[int, int]:
             shown = [texts.get(IMPORTS, region_text(original, plan.imports))]
@@ -1102,14 +1266,14 @@ class _Job:
                 outline_text=outline_text,
                 context=context,
                 required=required,
-                feedback=self.wf_feedback,
+                feedback=self._feedback(False),
                 previous=previous,
                 kept=kept,
                 guide=guide,
             )
             parts = {
-                "rules": len(self.system) - len(self.wf_guide),
-                "guide": len(self.wf_guide),
+                "rules": len(system) - len(system_guide),
+                "guide": len(system_guide),
                 **built.parts,
             }
             return Message("user", text=built.text), parts
@@ -1118,17 +1282,29 @@ class _Job:
         kept = regions_diff(path, original, plan, texts, earlier, limit=KEPT_DIFF_CHARS)
         send: list[str] = list(ids)
         tokens, max_tokens = budget(send)
-        first, parts = request(
-            send, self._first_note(path, original, plan, ids), kept, texts.get(IMPORTS)
-        )
+        note = self._first_note(path, original, plan, ids)
+        chosen = options[-1]
+        for option in options:  # the fullest context that fits a known limit
+            context = option.context
+            first, parts = request(send, note, kept, texts.get(IMPORTS))
+            if self._fits(len(system) + len(first.text), tokens):
+                chosen = option
+                break
+        context = chosen.context
+        first, parts = request(send, note, kept, texts.get(IMPORTS))
         entry["batches"].append(
             {"number": number, "ids": list(ids), "max_tokens": max_tokens, "prompt_parts": parts}
         )
         entry["bytes_sent"] += own_bytes
         entry["context_files"] = list(
-            dict.fromkeys([*entry["context_files"], *(p for p, _ in context)])
+            dict.fromkeys([*entry["context_files"], *(p.split(" ", 1)[0] for p, _ in context)])
         )
-        entry["context_left_out"] = list(dict.fromkeys([*entry["context_left_out"], *left_out]))
+        entry["context_forms"] = {**entry.get("context_forms", {}), **chosen.forms}
+        entry["context_left_out"] = list(
+            dict.fromkeys([*entry["context_left_out"], *chosen.left_out])
+        )
+        if sections is not None:
+            entry["guide_sections"] = sections
         if number == 1:
             entry["max_tokens"], entry["prompt_parts"] = max_tokens, parts
         messages = [first]
@@ -1136,7 +1312,9 @@ class _Job:
         retries = 0
         base = dict(texts)
         while True:
-            response = self._call_llm(attempt, messages, max_tokens=max_tokens, need_tokens=tokens)
+            response = self._call_llm(
+                attempt, messages, max_tokens=max_tokens, need_tokens=tokens, system=system
+            )
             sent.append(messages[-1])
             if response.stop_reason == "refusal":
                 raise _Abort("refusal", f"the model declined the request ({response.refusal})")
@@ -1244,8 +1422,9 @@ class _Job:
 
     def _extra_guide(self, path: str) -> str:
         """Guide parts a file's request needs that the job's system prompt left out (a
-        dependency file apifix set, resent after a verification implicated it)."""
-        if self.guide_sections is None:
+        dependency file apifix set, resent after a verification implicated it). None once a
+        token limit is known: the request's own system prompt then has the file's parts."""
+        if self.guide_sections is None or self._limit() is not None:
             return ""
         own = [f for f in self.findings if f.file == path]
         _, ids = self.migration.job_guide(own, self.repo)
@@ -1507,6 +1686,13 @@ class _Job:
                 "endpoint": getattr(self.llm, "endpoint", None),
                 "edit_mode": self.config.edit_mode,
                 "skipped_files": self.wf_skipped if self.whole_file else None,
+                "limits": {
+                    "per_minute": self.token_limit,
+                    "context_window": getattr(self.llm, "context_window", None),
+                    "chars_per_token": (
+                        round(self.chars_per_token, 2) if self.chars_per_token else None
+                    ),
+                },
                 "guide_sections": self.guide_sections,
                 "sandbox_env_placeholders": self.ci_env,
                 "already_migrated": (
@@ -1579,6 +1765,61 @@ def _install_reads(path: str, run: SandboxResult) -> bool:
     if not sources:
         return True
     return any(s == path or s.startswith(f"{path} ") for s in sources)
+
+
+@dataclass(frozen=True)
+class _Context:
+    """One choice of read-only context for a request: (label, text) entries, the changed
+    files left out, and the form of each file shown (full, changed, library_uses)."""
+
+    context: list[tuple[str, str]]
+    left_out: list[str]
+    forms: dict[str, str]
+
+
+_TRACEBACK_LINE = r'(?:^|[\s"\'/(]){path}(?:", line |:)(\d+)'
+
+
+def _def_line(tree: ast.Module, cls: str, name: str) -> int | None:
+    """The line of top-level `def name`, or of `name` in top-level class `cls`."""
+    body: list[ast.stmt] = tree.body
+    if cls:
+        found = next((n for n in body if isinstance(n, ast.ClassDef) and n.name == cls), None)
+        if found is None:
+            return None
+        body = found.body
+    for node in body:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == name:
+            return node.lineno
+    return None
+
+
+def feedback_lines_in(path: str, original: str, fixed: str, v: Verification) -> list[int]:
+    """Lines of the original `path` the verification points at: the definitions of its
+    newly failing or erroring tests, traceback lines in it, and reasons with a line (fixed-
+    file lines mapped back to the original)."""
+    try:
+        tree = ast.parse(original)
+    except (SyntaxError, ValueError):
+        return []
+    dotted = path[:-3].replace("/", ".")
+    failing = set(v.delta.newly_failing) | set(v.delta.newly_erroring)
+    pattern = re.compile(_TRACEBACK_LINE.format(path=re.escape(path)), re.MULTILINE)
+    lines: set[int] = set()
+    for test in v.fixed.tests:
+        if test.id not in failing:
+            continue
+        classname, _, name = test.id.partition("::")
+        if classname == dotted or classname.startswith(dotted + "."):
+            line = _def_line(tree, classname[len(dotted) + 1 :], name.split("[", 1)[0])
+            if line:
+                lines.add(line)
+        for m in pattern.finditer(test.message):
+            lines.add(map_line(original, fixed, int(m.group(1))))
+    for r in v.reasons:
+        if r.file == path and r.line:
+            lines.add(map_line(original, fixed, r.line))
+    return sorted(lines)
 
 
 @dataclass
@@ -1789,6 +2030,13 @@ def report_markdown(
                         f"attempt {a.number})"
                     )
         lines += region_edit_lines(job)
+        limit = job._limit()
+        if limit is not None:
+            lines.append(
+                f"- Token limit known ({limit:,}): requests from then on got only their own "
+                "file's guide parts, shorter test output, compact context, and regions or "
+                "batches where a whole file would not fit"
+            )
         if job.guide_sections is not None:
             lines.append(f"- Guide sections sent: {', '.join(job.guide_sections)}")
         lines += [f"- Not sent: `{f['path']}` ({f['reason']})" for f in job.wf_skipped]

@@ -492,6 +492,15 @@ def test_verification_feedback_is_truncated():
     assert len(text) < 8_000 + 2_000
 
 
+def test_short_verification_feedback_once_a_limit_is_known():
+    v = _verification(["E" * 5000, *[f"{i} " + "x" * 300 for i in range(6)]])
+    text = verification_feedback(2, v, short=True)
+    assert "- [reject] regression: tests fail (tests: t0)" in text  # reasons are kept
+    assert "E" * 800 + "\n... (output truncated)" in text and "E" * 801 not in text
+    assert text.count("\n--- t") == 3
+    assert "--- t3" not in text
+
+
 def test_feedback_lines_unbounded_by_default():
     v = _verification(["E" * 5000])
     lines = feedback_lines(v)

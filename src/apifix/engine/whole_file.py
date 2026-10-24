@@ -56,6 +56,10 @@ FEEDBACK_TESTS = 10
 FEEDBACK_MESSAGE_CHARS = 2_000
 FEEDBACK_TOTAL_CHARS = 8_000
 FEEDBACK_PIP_CHARS = 1_500  # dependency files: the tail of pip's output when the install failed
+# ... and once a per-minute or context limit is known (`short`): less test output
+SHORT_FEEDBACK_TESTS = 3
+SHORT_FEEDBACK_MESSAGE_CHARS = 800
+SHORT_FEEDBACK_TOTAL_CHARS = 2_400
 # A later attempt's request shows the model's previous version of the file as a diff against
 # the original, at most this long, with this many lines of context.
 PREVIOUS_DIFF_CHARS = 3_000
@@ -186,6 +190,7 @@ Migration guide:
 
 
 def _language(path: str) -> str:
+    path = path.split(" ", 1)[0]  # a context label: "app.py (changed statements only)"
     if path.endswith(".py"):
         return "python"
     name = path.lower().rsplit("/", 1)[-1]
@@ -409,19 +414,21 @@ def verification_feedback(
     *,
     dependency_file: bool = False,
     hints: Sequence[tuple[str, str]] = (),
+    short: bool = False,
 ) -> str:
     """For the next attempt's files: why the verifier rejected the last one. Python files get
-    the failing tests' output (repeated errors shown once) and the migration's hints;
-    dependency files only the problems, plus pip's output when the install failed."""
+    the failing tests' output (repeated errors shown once; `short`: of fewer tests, cut
+    shorter) and the migration's hints; dependency files only the problems, plus pip's output
+    when the install failed. Every reason line and hint is kept either way."""
     head = (
         f"The verifier did not accept attempt {attempt_number} (verdict: {v.verdict}). Fix the "
         "problems below in this file if they concern it; do not weaken, skip or delete tests."
     )
     body = feedback_lines(
         v,
-        max_tests=FEEDBACK_TESTS,
-        message_chars=FEEDBACK_MESSAGE_CHARS,
-        total_chars=FEEDBACK_TOTAL_CHARS,
+        max_tests=SHORT_FEEDBACK_TESTS if short else FEEDBACK_TESTS,
+        message_chars=SHORT_FEEDBACK_MESSAGE_CHARS if short else FEEDBACK_MESSAGE_CHARS,
+        total_chars=SHORT_FEEDBACK_TOTAL_CHARS if short else FEEDBACK_TOTAL_CHARS,
         failure_output=not dependency_file,
         dedupe=True,
         hints=() if dependency_file else hints,

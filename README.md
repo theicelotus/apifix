@@ -206,6 +206,18 @@ All files are then verified together exactly as in agent mode,
 and a failed verification starts the next attempt from the original files, with the failing
 test output and each file's previous version as a diff.
 
+**Large files: region edits.** Sending a whole file and getting it back costs its size twice,
+which a free tier's per-minute token limit cannot always take. In whole-file mode a Python file
+over 8 KB (`--region-threshold`) is sent as regions instead: only the top-level functions,
+methods and statements that hold a finding, plus the import block, each in a labelled code
+block, with the names they use and an outline of the rest as read-only context. The model
+returns each region in its own labelled block, apifix splices them back by position, and the
+complete file goes through all the checks above. A failing check resends only the regions it
+concerns; regions too large for one request go in several; a later attempt also sends the
+regions of tests that failed. `--file-edits whole|regions` forces either form. The model can
+only change those regions (and add imports, assignments and helper functions at the top), so
+a fix that needs other code outside them is out of reach until a test failure points there.
+
 ```
 apifix fix path/to/repo --migration openai-v1 --provider openai-compat \
     --model qwen2.5-coder:7b --edit-mode whole-file [--max-file-bytes 24000]
@@ -278,8 +290,12 @@ per-minute token limit. In whole-file mode apifix sizes that allowance from the 
 rewritten (about twice its size / 3 tokens, plus 2,048 for models that reason first; at most
 `--max-output-tokens`). When a request is still refused as larger than the per-minute limit
 ("Limit 8000, Requested 9265"), it is sent once more with the allowance lowered to fit, as long
-as that leaves room for the file; otherwise the job stops and says why. Lower
-`--max-file-bytes` or use a model with a higher limit then.
+as that leaves room for the file; otherwise the file is sent again as regions. From then on
+apifix keeps the limit and trims requests to fit it: each file gets only its own guide
+sections, less failing-test output, and test files see the other changed files as their changed
+statements or just the lines that use the library; a file that would not fit whole goes as
+regions. If even that is refused, the job stops and says why; use a model with a higher limit
+then.
 
 `apifix cleanup` removes sandbox containers and temp dirs that an interrupted run (crash,
 kill, power loss) left behind. Runs that are still in progress are not touched: each one holds

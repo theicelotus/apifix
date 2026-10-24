@@ -32,7 +32,8 @@ src/apifix/
                       (openai-compat: `--base-url`, `--strict-tool-calls`,
                       `--request-timeout`, `--api-key-env`;
                       `--edit-mode agent|whole-file`, `--max-file-bytes`,
-                      `--max-output-tokens`),
+                      `--max-output-tokens`; whole-file: `--file-edits auto|whole|regions`,
+                      `--region-threshold BYTES`),
                       `apifix verify <path> --migration openai-v1 --diff FILE [--out]`,
                       (`fix`/`verify`: `--no-pip-cache`, `--sandbox-requirements FILE`),
                       `apifix cleanup [--dry-run]`
@@ -105,9 +106,15 @@ src/apifix/
     pin_edits.py      dependency pins apifix sets itself (no LLM): the migration's pin_spec and
                       raised companion pins, every format, byte-for-byte, checked by re-parsing;
                       fallbacks with reasons; report lines; conda/lockfile notes
-    whole_file.py     whole-file mode (no tools, one file per request): file selection, prompts,
-                      code-block parsing, pre-apply checks (syntax, dependency file, changed,
-                      abbreviation, undefined names, mock targets)
+    whole_file.py     whole-file mode (no tools, one file per request): file selection, prompts
+                      (whole file or regions), code-block parsing, pre-apply checks (syntax,
+                      dependency file, changed, abbreviation, undefined names, mock targets)
+    regions.py        region edits for large files: regions from AST spans (top-level statements,
+                      methods, the import block), read-only names and outline, labelled blocks
+                      in requests and replies, per-block checks, splicing by position, errors
+                      attributed to regions; fenced-block and placeholder primitives
+    context.py        compact read-only context for test files: modules the test reaches through
+                      imports, changed statements, library uses
     unrelated.py      unrelated-edit check of a rewritten Python file (whole-file mode): text-only
                       hunks away from the findings reverted, unrelated code hunks and missing
                       original strings as check errors
@@ -553,10 +560,12 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   marker appears in failing output (openai: the missing-API-key error). Dependency files get
   the problem list without test output, plus the tail of pip's output when the install failed.
 - The file plus its read-only context (the other files already changed in the working copy)
-  share one byte budget, `whole_file_max_bytes` (24,000 by default, `--max-file-bytes`). Files
-  over it are not sent (listed in the report and `job.skipped_files`), so their findings remain
-  and the verifier rejects the fix as incomplete. Context files that do not fit are left out
-  (recorded per request as `context_left_out`).
+  share one byte budget, `whole_file_max_bytes` (24,000 by default, `--max-file-bytes`). Python
+  files over it are sent as regions when every region fits (see Known limitations (region
+  edits)); other files over it, and every file with `--file-edits whole`, are not sent (listed
+  in the report and `job.skipped_files`), so their findings remain and the verifier rejects the
+  fix as incomplete. Context files that do not fit are left out (recorded per request as
+  `context_left_out`).
 - The reply must hold exactly one fenced code block (CommonMark fences: 3+ backticks or tildes;
   a file containing ``` lines is sent in a longer fence). Prose around it is ignored. Zero or
   several blocks get "Return the complete updated file in exactly one code block." (max 3 per
@@ -694,6 +703,106 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   file, previous version, context, findings and instructions); check retries record theirs in
   the nudge. A request that aborts the job is recorded too, and the abort reason names the file.
 - No new, renamed or deleted files; files must be UTF-8.
+
+## Known limitations (region edits)
+
+- Form per Python file (whole-file mode; `--file-edits auto|whole|regions`, `--region-threshold
+  BYTES`, default 8,000; per entry: `form`, `form_reason`). `auto`: regions when the
+  file is over the threshold (`size`; but whole, `coverage`, when the regions and IMPORTS are
+  80% of the file or more and it is within `--max-file-bytes`), over `--max-file-bytes`
+  (`size`), when a known token limit says the whole request would not fit (`limit`, checked
+  per request, later attempts too), or after a whole file was refused for a per-minute limit
+  that fewer reply tokens cannot fix (`refused`; the refused entry has `switched_to_regions`).
+  A file never goes back to whole. Dependency files and files without regions are always
+  whole. `--file-edits whole` keeps the earlier behaviour: a refused request stops the job, a
+  file over the size limit is skipped.
+- Regions (`find_regions`, on the original): the top-level statement holding each finding line
+  (decorators included); in a class its method, class-level statement, or header (decorators
+  to the line before the body; a one-line `class A: pass` is the whole class); a nested class
+  is one class-level statement; nested functions belong to their top-level function. Comments
+  above a def are in no region. IMPORTS: the leading imports after the docstring and
+  `__future__` imports (also `try:` imports with fallbacks and `if TYPE_CHECKING:`), empty at
+  that point when there are none; findings in it need no region; later imports are statement
+  regions. Ids `R1..Rn` in file order.
+- What may change: only the regions and IMPORTS. A def/class region must stay exactly that
+  definition (def and async def interchange); a statement region may become any statements, or
+  none; IMPORTS may hold imports, assignments and function definitions, plus its original
+  statements (no classes, calls or other statements). New module-level code therefore goes
+  before the rest of the file. Helpers, fixtures and mock data outside the regions cannot be
+  edited unless a later attempt adds their region (below).
+- Request (`region_prompt`): the regions' findings, IMPORTS (returned only if changed; required
+  in a check retry that concerns it), each region verbatim in a fenced block labelled with its
+  id, the names the regions use (`names_context`: def/class signatures with "body not shown",
+  assignments of up to 3 lines whole, else their first line; for method regions the class
+  header, class-level assignments and the methods called through `self.`/`cls.`; 2,000
+  characters, then signatures only, then names), the outline (1,000), then the previous
+  version, the file's other changes (read-only diff, 1,500) and context. Reply budget:
+  `reply_budget` of the regions plus IMPORTS. `prompt_parts` has `regions`, `imports`,
+  `names`, `outline`, `kept` instead of `file`.
+- Labels: from the info string (`python R1`, any case) or from the last non-blank line before
+  the block when it holds exactly one label (`### R1`; case-sensitive). Unlabelled blocks are
+  taken in order only when all are unlabelled and their number equals the regions (or one more,
+  the first import-shaped: IMPORTS); `labels: "by_order"`. Missing, unknown or duplicate labels
+  get a nudge in the same conversation (counted with code-block nudges). One unlabelled block
+  that defines every top-level name of the original and has at least half its lines is a whole
+  file: it gets the whole-file checks, and a nudge to return only the regions if it fails them.
+- Per block: outer blank lines dropped; a method or class-level block returned at column 0 is
+  re-indented (lines inside multi-line strings are not), a top-level block returned indented is
+  dedented, other indentation is an error; it must parse in its place (methods inside a dummy
+  class, a header with a dummy body) and keep its shape; placeholders and the half-length check
+  per region. Splicing starts from the original, regions in file order, with the original's
+  line endings; the spliced file must parse (an error only splicing reveals names the region).
+  Then every whole-file check runs on the spliced file unchanged (unrelated edits, mock and
+  library targets, undefined names with auto-imports, config checks).
+- Check retries (`attribute_errors`): `R1: ...` errors go to that region; `original line N` to
+  the region holding N (`after original line N`: or N+1), else the nearest above; `line N` of
+  the checked file through the auto-import shift (difflib) and the splice map, rewritten to
+  "R1, line K of your block"; mock and library target messages to the regions whose text quotes
+  the target; anything else to the batch's regions. The retry is a fresh request with the
+  affected regions (original text), their rejected versions as one diff, IMPORTS as last
+  returned, and the other regions' changes read-only; once per batch. An error caused by an
+  unchanged region's interplay with a changed one goes to whichever region it names.
+- Batches: regions in file order, packed greedily within `--max-file-bytes` minus IMPORTS and,
+  with a known token limit, an estimate (system prompt, feedback, 1,500 characters, IMPORTS,
+  names, outline; per region character 1/chars-per-token + 1/3 tokens). Each batch is checked
+  on the file spliced so far (the "changed" check only on the last); only the last batch's
+  checked file is written, so reverts and auto-imports are computed on the complete file. A
+  batch's check retry may resend regions of earlier batches.
+- Later attempts send every region from the original with per-region previous diffs (a file
+  last accepted as a whole file gets the whole-file diff), plus regions the verification points
+  at in that file: the definitions of its newly failing or erroring tests (`module[.Class]::name`,
+  parametrisation stripped), `path:N` or `"path", line N` in their output, and reasons with a
+  file and line (fixed-file lines mapped to the original by diff); `regions[].source:
+  "feedback"`. Ids stay stable and new ones continue the numbering. Edits there still pass the
+  unrelated-edit check: a fix that touches nothing library-related (a comment, a literal) is
+  reverted or rejected.
+
+## Known limitations (known token limits)
+
+- The limit: the smallest per-minute token limit a refusal stated in the job (kept from then
+  on; `job.limits.per_minute`) or Ollama's runtime context window, whichever is smaller. A
+  request's estimate: prompt characters / the job's lowest characters per prompt token
+  (`input + cache_read` tokens of each response; 3.0 before any, `job.limits.chars_per_token`)
+  plus the reply estimate (file or regions) plus `token_limit_margin`. Servers that report no
+  usage calibrate from apifix's own estimates.
+- Once a limit is known: each request's system prompt has only the guide parts its file needs
+  (`guide_sections` per entry; up to one system prompt variant per file, cached per variant);
+  Python files' feedback shows at most 3 failing tests, 800 characters each, 2,400 in total
+  (every reason and hint stays); test files' context is compact. Requests sent before are not
+  redone. The report says when a limit was known.
+- Compact context (test files: always when region-edited, otherwise once a limit is known;
+  `context_forms`): the changed non-test Python files the test reaches through imports (repo
+  modules, absolute under the module roots and relative, each package of a dotted path) first,
+  then the rest. Options, fullest first, each within the byte budget: changed statements of all
+  (the current text of every top-level statement or class member a diff touches, the class
+  header, the library imports); then library uses (imports and the first line of every simple
+  statement using a library-bound name or `self.x`, 600 characters per file) for the files the
+  test does not import; then for all; then files dropped from the end. The first option that
+  fits the limit is sent, else the smallest. Nothing is dropped for relevance alone: a test can
+  reach a module without importing it (genai's IPython magics). Library-bound names follow
+  assignments flow-insensitively, like the unrelated-edit check.
+- Deferred steps from docs/plans/deterministic-pins.md not built: context as diffs (replaced by
+  the above) and the smaller previous-diff cap.
 
 ## Local / OpenAI-compatible models
 

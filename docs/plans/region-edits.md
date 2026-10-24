@@ -518,3 +518,63 @@ Whole-file integration: automatic form choice, the flags, check retries per regi
 The context rework (item 6), steps 2 and 3, the remembered limit, and regions added from verifier output.
 
 Synthetic fixtures only. Don’t run live tests. After stage 3, record under “Built” what changed from the plan.
+
+## Built
+
+Three stages, as amended: regions.py (5917d69), whole-file integration (76b9773), then the
+context rework, steps 2 and 3, the remembered limit and regions from verifier output. Changes
+from the plan as written:
+
+- **Form rules (item 5):** taken literally, rule 3 (coverage) could never apply, because rule 1
+  already picked regions for every file over the threshold. Built: over the threshold → regions,
+  unless the regions and IMPORTS cover 80% or more and the file is within `--max-file-bytes`
+  (then whole, `coverage`). Rule 2 (`limit`) is checked whenever a whole-file request is built,
+  later attempts included, not only on the first send. It is the only way a file sent whole
+  goes to regions besides a refusal. `--file-edits whole` has no switch on refusal: the job stops
+  as before.
+- **IMPORTS (decision 4 as amended):** imports, assignments and function definitions anywhere
+  in the block, plus any statement the original block had. Their position is not enforced (the
+  plan said "after the last import"). Classes, calls and other statements are an error.
+- **Labels:** info-string labels are case-insensitive. A label on the line before a block must
+  be upper-case, so prose like "the updated imports:" does not label it.
+- **A whole file returned to a region request** that fails its checks gets a format nudge
+  ("return only the regions") in the same conversation, not a check retry.
+- **Batches:** a batch before the last is checked without the "changed" check. Only the last
+  batch's checked file is written, so reverts and auto-imports are computed once on the complete
+  file. A batch's check retry may resend regions of earlier batches when an error points at them.
+- **Compact context (item 6):** it also applies to whole-file test files once a limit is known.
+  It is chosen as a ladder (changed statements for all; library uses for the files the test
+  does not import; library uses for all; files dropped from the end). Each request takes the
+  first option that fits the known limit, all within the byte budget. Library uses show only the
+  first line of each statement ("# N more lines"). On genai the 600-character cap otherwise cut
+  `client.chat.completions.create(` off after `client = OpenAI()`.
+- **Known limit (item 7):** the ratio is prompt characters / (`input_tokens` +
+  `cache_read_tokens`), the lowest seen, defaulting to 3.0. Ollama's context window counts as a
+  limit. `job.limits` records all three, and the report has one line when a limit was known.
+- **Steps 2 and 3:** active only once a limit is known, as decided. Step 2 builds the request's
+  own system prompt from the file's findings (`guide_sections` per entry); `_extra_guide` then
+  adds nothing.
+- **Regions from verifier output (item 8):** also from verifier reasons with a file and line,
+  besides failing tests and traceback lines. Fixed-file lines are mapped to the original by diff.
+  Edits in such regions still pass the unrelated-edit check, so a fix there that touches nothing
+  library-related is reverted or rejected.
+- **Existing tests:** three now pin `--file-edits whole`. Two expect the old abort on a refused
+  request, and one expects a file over the size limit to be skipped.
+- **Measured offline on genai** (no model, built from the real files and the run's accepted
+  generate.py): the whole-file request for tests/test_context.py comes to 20,018 characters, or
+  5,268 tokens at 3.8 characters per token (the hosted provider counted 5,290). The region request comes to
+  12,906 characters (~3,400 tokens) with generate.py in full, 12,518 with its changed statements
+  and 10,341 (~2,720) with its library uses. The plan estimated ~3,430 and ~2,870.
+- **Found, not fixed:** the verifier's tampering check deep-copies the module once per test
+  function. A test file with 200 tests takes ~11 s to verify. The fixtures use 25 longer tests
+  instead.
+
+Tests: `tests/test_regions.py` (finding, context, labels, parsing, per-block checks, splicing,
+attribution, region diffs), `tests/test_context.py` (reachable modules, changed statements,
+library uses), new cases in `tests/test_whole_file.py` (region prompt and previous-version
+note, short feedback, error keys), and `tests/test_region_edits.py`. The last covers form
+choice, labelled and unlabelled replies, nudges, per-region check retries, auto-imports into
+IMPORTS, a whole file returned instead, batches by size and by a known limit, the switch on
+refusal and on a known limit, trimming once a limit is known, regions added from a failing test,
+and the CLI flags. `tests/integration/test_region_edits_docker.py` runs a region-edited test file
+against the real openai 1.x.

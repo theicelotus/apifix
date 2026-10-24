@@ -18,7 +18,7 @@ from tests.test_agent import (
     too_large,
     wf,
 )
-from tests.test_verifier import ORIGINAL, write_tree
+from tests.test_verifier import APP_OLD, ORIGINAL, TESTS_NEW, write_tree
 
 # A test file over the region threshold: the two tests with findings, plus many without.
 EXTRAS = "".join(
@@ -322,4 +322,106 @@ def test_apifix_adds_a_missing_import_into_the_import_block(big):
     assert "+from types import SimpleNamespace" in result.diff
     assert "- apifix added: from types import SimpleNamespace (tests/test_app.py, attempt 1)" in (
         result.report_markdown
+    )
+
+
+# --- stage 3: known limits, compact context, regions from verifier output ---------------------
+
+
+def lowered(limit: int, max_tokens: int) -> Exception:
+    """A refusal that fewer reply tokens fix (the request is then sent again with
+    max_tokens 100 below `max_tokens`, or with 244 tokens for a small limit)."""
+    margin = max(256, -(-3 * limit // 100))
+    prompt = max(limit - margin - max_tokens + 100, 100)
+    return too_large(limit, max_tokens + prompt)
+
+
+def test_a_known_limit_trims_later_requests(repo):
+    app_budget = 2 * -(-len(APP_OLD) // 3) + 2048
+    llm = FakeLLM([lowered(9_000, app_budget), block(APP_NEW), block(TESTS_NEW)])
+    result = wf(repo, llm)
+    assert result.outcome == "verified"
+    job = result.trajectory["job"]
+    assert job["limits"]["per_minute"] == 9_000 and job["limits"]["chars_per_token"] > 0
+    app_entry, tests_entry = files_of(result)
+    assert "guide_sections" not in app_entry  # sent before the limit was known
+    assert "tests" in tests_entry["guide_sections"]
+    assert tests_entry["context_forms"] == {"app.py": "changed"}
+    assert "--- app.py (changed statements only)" in llm.requests[2][0].text
+    assert "- Token limit known (9,000)" in result.report_markdown
+
+
+def test_non_test_files_get_no_tests_guide_part_once_a_limit_is_known(repo):
+    broken = APP_NEW + "# BREAK\n"
+    app_budget = 2 * -(-len(APP_OLD) // 3) + 2048
+    script = [lowered(9_000, app_budget), block(broken), block(TESTS_NEW), block(APP_NEW)]
+    llm = FakeLLM([*script, block(TESTS_NEW)])
+    result = wf(repo, llm)
+    assert result.outcome == "verified"
+    app_again = files_of(result, 1)[0]
+    assert app_again["path"] == "app.py" and "tests" not in app_again["guide_sections"]
+
+
+def test_a_whole_file_over_a_known_limit_is_sent_as_regions(big):
+    app_budget = 2 * -(-len(APP_OLD) // 3) + 2048
+    llm = FakeLLM([lowered(3_000, app_budget), block(APP_NEW), GOOD_REGIONS])
+    result = wf(big, llm, region_threshold_bytes=100_000)  # not by size
+    assert result.outcome == "verified"
+    entry = files_of(result)[1]
+    assert (entry["form"], entry["form_reason"]) == ("regions", "limit")
+    assert [f["form"] for f in files_of(result)] == ["whole", "regions"]
+
+
+def test_regions_are_batched_to_fit_a_known_limit(big):
+    app_budget = 2 * -(-len(APP_OLD) // 3) + 2048
+    batch1 = regions(("IMPORTS", IMPORTS_NEW), ("R1", R1_NEW))
+    llm = FakeLLM([lowered(600, app_budget), block(APP_NEW), batch1, regions(("R2", R2_NEW))])
+    result = wf(big, llm)
+    entry = files_of(result)[1]
+    assert [b["ids"] for b in entry["batches"]] == [["R1"], ["R2"]]
+    assert entry["context_files"] == []  # nothing fits beside the regions
+    assert result.outcome == "verified"
+
+
+def extra_judge(tree):
+    """test_extra_3 (no findings) fails on the fix until its region is changed."""
+    from tests.test_agent import judge
+    from tests.test_verifier import T_ASK, T_STRIP, run
+
+    tests = (tree / "tests" / "test_app.py").read_text()
+    extra = "tests.test_app::test_extra_3"
+    cov = judge(tree).coverage
+    if '"openai.ChatCompletion.create"' in tests or 'openai.OpenAI(api_key="x")' in tests:
+        return run((T_ASK, "passed"), (T_STRIP, "passed"), (extra, "passed"), coverage=cov)
+    message = "tests/test_app.py:40: in test_extra_3\n    assert len(text) == 320\nAssertionError"
+    return run((T_ASK, "passed"), (T_STRIP, "passed"), (extra, "failed", message), coverage=cov)
+
+
+def test_a_later_attempt_adds_regions_the_verifier_points_at(big):
+    line = next(n for n, t in enumerate(TESTS_BIG.splitlines(), 1) if "def test_extra_3" in t)
+    extra_new = (  # an edit that uses the library: not unrelated (apifix adds the import)
+        'def test_extra_3():\n    client = openai.OpenAI(api_key="x")\n'
+        f'    text = "{"abc " * 80}"\n    assert len(text) == 320\n'
+    )
+    second = regions(("R1", R1_NEW), ("R2", R2_NEW), ("R3", extra_new), ("IMPORTS", IMPORTS_NEW))
+    llm = FakeLLM([block(APP_NEW), GOOD_REGIONS, block(APP_NEW), second])
+    result = wf(big, llm, JudgingSandbox(judge=extra_judge))
+    assert result.outcome == "verified"
+    entry = files_of(result, 1)[1]
+    assert entry["regions"][-1] == {
+        "id": "R3",
+        "kind": "function",
+        "name": "test_extra_3",
+        "lines": [line, line + 2],
+        "source": "feedback",
+        "bytes": len(TESTS_BIG.splitlines(keepends=True)[line - 1])
+        + len(TESTS_BIG.splitlines(keepends=True)[line])
+        + len(TESTS_BIG.splitlines(keepends=True)[line + 1]),
+        "returned": True,
+        "changed": True,
+    }
+    request = llm.requests[3][0].text
+    assert f"Region R3: def test_extra_3 (original lines {line}-{line + 2})" in request
+    assert "+import openai" in result.diff and '+    client = openai.OpenAI(api_key="x")' in (
+        result.diff
     )
