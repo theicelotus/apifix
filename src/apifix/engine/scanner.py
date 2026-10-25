@@ -11,13 +11,13 @@ import configparser
 import io
 import os
 import tokenize
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 
 from apifix.engine.already_migrated import detect_already_migrated
 from apifix.engine.dependencies import is_dependency_file, parse_dependency_file
 from apifix.engine.migrations import Migration, get_migration
-from apifix.engine.models import ParseError, ScanResult
+from apifix.engine.models import Finding, ParseError, ScanResult
 from apifix.engine.walk import iter_files
 
 
@@ -57,6 +57,34 @@ def scan(path: str | os.PathLike[str], migration: str | Migration) -> ScanResult
     if root.is_dir():
         result.already_migrated = detect_already_migrated(root, migration, result.findings)
     return result
+
+
+def scan_text(
+    rel: str,
+    text: str,
+    migration: Migration,
+    modules: frozenset[str] = frozenset(),
+    *,
+    others: Sequence[Finding] = (),
+    root: Path | None = None,
+) -> list[Finding]:
+    """The findings a scan of the repo at `root` reports for file `rel` if it holds `text`
+    (written as UTF-8): the same per-file pass, with `modules` (repo_modules of the repo's
+    files), then the migration's repo-level pass over these and `others` (the other files'
+    findings; that pass only rewrites suggestions), keeping `rel`'s. [] for a file that does
+    not parse."""
+    result = ScanResult(migration=migration.name, root=str(root or rel))
+    data = text.encode("utf-8")
+    if rel.endswith(".py"):
+        _scan_python(rel, data, migration, result, modules)
+    if is_dependency_file(rel):
+        _scan_dependencies(rel, data, migration, result)
+    findings = sorted(result.findings)
+    adjust = getattr(migration, "adjust_findings", None)
+    if callable(adjust) and findings:
+        everything = sorted([*(f for f in others if f.file != rel), *findings])
+        findings = sorted(f for f in adjust(everything, root) if f.file == rel)
+    return findings
 
 
 def repo_modules(paths: Iterable[str]) -> frozenset[str]:

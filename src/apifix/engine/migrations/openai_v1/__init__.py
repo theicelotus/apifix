@@ -104,6 +104,7 @@ class OpenAIV1Migration:
     companion_pins = rules.COMPANION_PINS
     first_version = rules.FIRST_V1
     target_name = "openai 1.x"
+    source_name = "openai 0.x"
 
     def job_guide(
         self, findings: list[Finding], root: Path | None = None, shared: bool = False

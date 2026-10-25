@@ -5,7 +5,9 @@ import textwrap
 
 import pytest
 
-from apifix.engine.scanner import scan
+from apifix.engine.migrations import get_migration
+from apifix.engine.scanner import repo_modules, scan, scan_text
+from apifix.engine.walk import iter_files
 from tests.conftest import FIXTURES, at, summary
 
 # --- realistic fixtures ---------------------------------------------------------------------
@@ -1140,3 +1142,35 @@ def test_wrapper_kwargs_positional_method_and_own_parameters(scan_code):
         (11, 'engine="b"'),
         (12, 'api_key="k"'),  # not this file's run(): its parameters are unknown
     ]
+
+
+# --- scan_text: one file's findings as a scan of the repo reports them ------------------------
+
+
+@pytest.mark.parametrize(
+    "repo", ["split_config", "wrapped_calls", "kwarg_assertions", "stale_tests", "openai_v0"]
+)
+def test_scan_text_agrees_with_a_scan_of_the_repo(repo):
+    root = FIXTURES.parent / repo
+    migration = get_migration("openai-v1")
+    result = scan(root, migration)
+    files = [p.relative_to(root).as_posix() for p in iter_files(root)]
+    modules = repo_modules(files)
+    checked = 0
+    for rel in files:
+        if not rel.endswith((".py", ".txt", ".toml", ".cfg")):
+            continue
+        text = (root / rel).read_text()
+        expected = [f for f in result.findings if f.file == rel]
+        others = [f for f in result.findings if f.file != rel]
+        got = scan_text(rel, text, migration, modules, others=others, root=root)
+        if rel in {e.file for e in result.parse_errors}:
+            expected = []
+        assert got == expected, rel  # suggestions included (the repo-level pass)
+        checked += bool(expected)
+    assert checked
+
+
+def test_scan_text_of_a_file_that_does_not_parse_has_no_findings():
+    source = "import openai\nopenai.Completion.create(\n"
+    assert scan_text("app.py", source, get_migration("openai-v1")) == []

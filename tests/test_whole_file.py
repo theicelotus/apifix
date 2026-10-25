@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -10,10 +11,13 @@ from apifix.engine.code_checks import STDLIB_IMPORTS, import_table
 from apifix.engine.migrations import get_migration
 from apifix.engine.models import Finding
 from apifix.engine.regions import IMPORTS, MIN_LINES_FOR_LENGTH_CHECK, find_regions
-from apifix.engine.verifier import feedback_lines
+from apifix.engine.scanner import repo_modules, scan, scan_text
+from apifix.engine.verifier import _scan_reasons, feedback_lines
+from apifix.engine.walk import iter_files
 from apifix.engine.whole_file import (
     PREVIOUS_DIFF_CHARS,
     REPLY_MARGIN_TOKENS,
+    CheckResult,
     as_file,
     check_candidate,
     context_candidates,
@@ -112,6 +116,7 @@ def test_valid_changed_python_passes():
         "call_assertions": "n/a",
         "unrelated_edits": "n/a",  # no findings given
         "config": "n/a",  # no migration checks given
+        "completeness": "n/a",  # no rescan given
     }
 
 
@@ -731,3 +736,123 @@ def test_region_previous_note_forms():
 def test_error_key_drops_region_prefixes():
     assert error_key("R1, line 3 of your block: 'x' is used") == "'x' is used"
     assert error_key("IMPORTS: only imports") == "only imports"
+
+
+# --- completeness: the verifier's incomplete_migration rule, per rewrite ---------------------
+
+MIGRATION = get_migration("openai-v1")
+LLMFLOWS = Path(__file__).parent / "fixtures" / "llmflows_attempt6"
+EMBEDDINGS = "llmflows/llms/openai_embeddings.py"
+
+
+def _rescan(path: str, text: str) -> list[Finding]:
+    return scan_text(path, text, MIGRATION)
+
+
+def test_completeness_names_each_remaining_certain_finding():
+    still_old = (
+        "import openai\n\nclient = openai.OpenAI()\nr = client.chat.completions.create(model='m')\n"
+        "e = openai.Embedding.create(input='x', engine='e')\nprint(r['choices'])\n"
+    )
+    r = check_candidate(
+        "app.py", APP, still_old, required=True, remaining=_rescan, old_api="openai 0.x"
+    )
+    assert r.error_checks == ["completeness"] * 2  # the dict access is only likely
+    assert r.errors[0].startswith(
+        "line 5: `openai.Embedding.create` is still the openai 0.x API: use "
+    )
+    assert r.errors[1].startswith("line 5: `engine='e'` is still the openai 0.x API: ")
+    assert r.checks["completeness"] == "; ".join(r.errors)
+    ok = check_candidate("app.py", APP, NEW, required=True, remaining=_rescan)
+    assert ok.ok and ok.checks["completeness"] == "ok"
+
+
+def test_completeness_sees_the_file_as_written_and_is_na_when_it_cannot_scan():
+    seen = []
+
+    def remaining(path, text):
+        seen.append(text)
+        return []
+
+    # an added import (apifix's) is part of the text that is rescanned
+    candidate = (
+        "import openai\n\nclient = OpenAI()\nr = client.chat.completions.create(model='m')\n"
+    )
+    r = check_candidate(
+        "app.py", APP, candidate, required=True, known_imports=KNOWN, remaining=remaining
+    )
+    assert r.auto_imports == ["from openai import OpenAI"] and seen == [r.text]
+    broken = check_candidate("app.py", APP, "def (", required=True, remaining=remaining)
+    assert broken.checks["completeness"] == "n/a" and len(seen) == 1
+    deps = check_candidate(
+        "requirements.txt", "openai==0.28\n", "openai>=1\n[\n", required=True, remaining=remaining
+    )
+    assert deps.checks["completeness"] == "n/a" and len(seen) == 1
+
+
+@pytest.mark.parametrize("repo", ["split_config", "wrapped_calls", "kwarg_assertions"])
+def test_completeness_agrees_with_the_verifiers_incomplete_migration(repo):
+    """Every file of a fixture repo still on 0.x: the check's errors are exactly the
+    verifier's incomplete_migration reasons for that file (same lines, same suggestions)."""
+    root = Path(__file__).parent / "fixtures" / repo
+    result = scan(root, MIGRATION)
+    reasons = [r for r in _scan_reasons(result.findings, []) if r.code == "incomplete_migration"]
+    files = [p.relative_to(root).as_posix() for p in iter_files(root)]
+    modules = repo_modules(files)
+    for rel in {f.file for f in result.findings}:
+        text = (root / rel).read_text()
+
+        def remaining(path, text, rel=rel):
+            others = [f for f in result.findings if f.file != rel]
+            return scan_text(path, text, MIGRATION, modules, others=others, root=root)
+
+        r = check_candidate(rel, text, text, required=False, remaining=remaining, old_api="0.x")
+        expected = [f"line {x.line}: `{x.message.split('`')[1]}`" for x in reasons if x.file == rel]
+        assert [e.split(" is still")[0] for e in r.errors] == expected, rel
+        assert r.ok == (not expected)
+
+
+def _embeddings_check(candidate: str, **kwargs) -> CheckResult:
+    original = (LLMFLOWS / "openai_embeddings_original.txt").read_text()
+    return check_candidate(
+        EMBEDDINGS,
+        original,
+        candidate,
+        required=True,
+        library_modules=MIGRATION.api_modules,
+        findings=scan_text(EMBEDDINGS, original, MIGRATION),
+        **kwargs,
+    )
+
+
+def test_llmflows_attempt_6_rewrite_back_to_0x_fails_the_check():
+    """llmflows-gptoss-3 attempt 6: the reply that put openai.Embedding.create(engine=...) and
+    .acreate back. Every check passed it in the run; the verifier then reported
+    incomplete_migration at lines 77, 85, 118 and 126 of the written file."""
+    reply = (LLMFLOWS / "openai_embeddings_attempt6_reply.txt").read_text()
+    parsed = parse_code_block(reply)
+    assert parsed.outcome == "ok"
+    original = (LLMFLOWS / "openai_embeddings_original.txt").read_text()
+    candidate = as_file(parsed.body, original)
+    before = _embeddings_check(candidate)
+    assert before.ok  # as in the run, without the completeness check
+    assert before.checks["completeness"] == "n/a"
+    r = _embeddings_check(candidate, remaining=_rescan, old_api=MIGRATION.source_name)
+    assert r.error_checks == ["completeness"] * 4
+    assert [e.split(":")[0] for e in r.errors] == ["line 77", "line 85", "line 118", "line 126"]
+    assert r.errors[0].startswith(
+        "line 77: `openai.Embedding.create` is still the openai 0.x API: use "
+    )
+    assert r.errors[1].startswith("line 85: `engine=self.model` is still the openai 0.x API: ")
+    assert "pass model=self.model" in r.errors[1]
+    assert r.errors[2].startswith("line 118: `openai.Embedding.acreate` is still the openai 0.x")
+    # the two comments the model added are reverted first, as in the run (hence 77, not 78)
+    assert [x["fixed_line"] for x in r.reverted] == [52, 91]
+
+
+def test_llmflows_attempt_5_version_passes_the_check():
+    """The version in attempt 5's tree (accepted in attempt 1; the verifier found only likely
+    findings in it): accepted, so attempt 6 would have fallen back to it."""
+    kept = (LLMFLOWS / "openai_embeddings_attempt5.txt").read_text()
+    r = _embeddings_check(kept, remaining=_rescan, old_api=MIGRATION.source_name)
+    assert r.checks["completeness"] == "ok"

@@ -42,7 +42,7 @@ from apifix.engine.regions import (
     too_short,
 )
 from apifix.engine.unrelated import Revert, relocate, revert_text_edits, unrelated_edits
-from apifix.engine.verifier import Verification, feedback_lines
+from apifix.engine.verifier import Verification, feedback_lines, incomplete_findings
 
 DEFAULT_MAX_BYTES = 24_000
 # Region edits (regions.py): Python files over this many bytes are sent as regions, unless the
@@ -622,6 +622,8 @@ def check_candidate(
     env_names: Collection[str] = (),
     keyword_renames: Mapping[str, str] | None = None,
     importable: Callable[[str], bool] | None = None,
+    remaining: Callable[[str, str], Sequence[Finding]] | None = None,
+    old_api: str = "old",
 ) -> CheckResult:
     """Syntax (Python files), well-formedness (dependency files), "differs from the original"
     (only when `required`), abbreviation (placeholders, or under half the original's lines
@@ -652,7 +654,14 @@ def check_candidate(
     `model=` in a call assertion on the migrated call). `rewrite_checks(path,
     original, candidate)`: the migration's own checks (Migration.rewrite_checker, e.g.
     `config`, `streaming`), run last on the completed file; without them, check `config` is
-    n/a."""
+    n/a.
+
+    `remaining(path, text)`: the migration's scanner findings for the file holding `text`
+    (scanner.scan_text). Check `completeness`, run on the completed file (what is written):
+    one error per finding the verifier would call incomplete_migration
+    (verifier.incomplete_findings), naming its line and suggestion; `old_api` names the old
+    API in the message ("openai 0.x"). n/a without `remaining`, or for a file that does not
+    parse or is not a valid dependency file (those checks fail already)."""
     checks: dict[str, str] = {}
     errors: list[str] = []
     error_checks: list[str] = []
@@ -754,4 +763,21 @@ def check_candidate(
     named = dict(rewrite_checks(path, original, candidate)) if own and rewrite_checks else {}
     for name, problems in (named or {"config": []}).items():
         record_all(name, list(problems), own)
+    scanned = (
+        remaining is not None
+        and not syntax
+        and not problem
+        and (path.endswith(".py") or is_dependency_file(path))
+    )
+    left = incomplete_findings(remaining(path, candidate)) if scanned and remaining else []
+    record_all("completeness", [_incomplete_error(f, old_api) for f in left], scanned)
     return CheckResult(errors, checks, error_checks, candidate, added, reverts)
+
+
+def _incomplete_error(finding: Finding, old_api: str) -> str:
+    """The completeness error for `finding`, e.g. "line 78: `openai.Embedding.create` is
+    still the openai 0.x API: use client.embeddings.create(...) ..."."""
+    text = finding.suggestion
+    if text[:1].isupper() and text[1:2].islower():
+        text = text[0].lower() + text[1:]
+    return f"line {finding.line}: `{finding.old_pattern}` is still the {old_api} API: {text}"

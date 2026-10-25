@@ -23,7 +23,7 @@ from apifix.engine.dependencies import (
 )
 from apifix.engine.diffing import FileChange, diff_trees, read_text
 from apifix.engine.migrations import Migration, get_migration
-from apifix.engine.models import Finding, LibraryTarget
+from apifix.engine.models import CERTAIN, Finding, LibraryTarget
 from apifix.engine.project import NotInstalled, SandboxRequirements, is_test_file
 from apifix.engine.sandbox import (
     PYTEST_USAGE_ERROR,
@@ -1064,10 +1064,17 @@ def _edit_reasons(edits: list[TestEdit], delta: TestDelta) -> list[Reason]:
     return reasons
 
 
+def incomplete_findings(findings: Iterable[Finding]) -> list[Finding]:
+    """The remaining findings that make a fix incomplete_migration (rejected): the certain
+    ones. Whole-file mode's completeness check applies the same rule to each rewrite."""
+    return [f for f in findings if f.confidence == CERTAIN]
+
+
 def _scan_reasons(remaining: list[Finding], new_parse_errors: list[str]) -> list[Reason]:
     reasons = []
+    incomplete = set(incomplete_findings(remaining))
     for f in remaining:
-        severity: ReasonSeverity = "reject" if f.confidence == "certain" else "info"
+        severity: ReasonSeverity = "reject" if f in incomplete else "info"
         code = "incomplete_migration" if severity == "reject" else "remaining_likely_finding"
         message = f"{f.category}: `{f.old_pattern}` -> {f.suggestion}"
         reasons.append(Reason(code, severity, message, (), f.file, f.line))

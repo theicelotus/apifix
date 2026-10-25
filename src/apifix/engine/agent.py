@@ -85,7 +85,7 @@ from apifix.engine.regions import (
     regions_diff,
 )
 from apifix.engine.sandbox import Sandbox, SandboxResult
-from apifix.engine.scanner import scan
+from apifix.engine.scanner import repo_modules, scan, scan_text
 from apifix.engine.verifier import (
     UNCALLED_MOCK_MARKERS,
     Verification,
@@ -506,6 +506,9 @@ class _Job:
         # the check of library patch targets against `from <library> import X` modules
         self.wf_python_modules: tuple[str, ...] = ()
         self.wf_test_files: tuple[str, ...] = ()
+        # whole-file: the repo's dotted module names, for rescanning a rewrite as the verifier's
+        # scan of the fixed tree sees it (whole-file mode adds and deletes no files)
+        self.wf_repo_modules: frozenset[str] = frozenset()
         # whole-file: top-level names a test run can import besides repo modules (read before
         # the baseline), for mock targets whose module does not exist
         self.wf_importable: ImportableModules | None = None
@@ -522,6 +525,7 @@ class _Job:
             python = [p.relative_to(repo).as_posix() for p in iter_files(repo) if p.suffix == ".py"]
             self.wf_test_files = tuple(r for r in python if is_test_file(r, root=repo))
             self.wf_python_modules = tuple(r for r in python if r not in self.wf_test_files)
+            self.wf_repo_modules = repo_modules(python)
 
     # --- budget -----------------------------------------------------------------------------
 
@@ -1316,8 +1320,11 @@ class _Job:
         entry["changed"] = result.text != original
         self.wf_accepted.add(path)
 
-    def _check(self, path: str, original: str, candidate: str, *, required: bool) -> CheckResult:
-        """check_candidate with the job's settings."""
+    def _check(
+        self, path: str, original: str, candidate: str, *, required: bool, complete: bool = True
+    ) -> CheckResult:
+        """check_candidate with the job's settings. `complete`: `candidate` is the whole
+        rewrite (not a region batch before the last), so it gets the completeness check."""
         return check_candidate(
             path,
             original,
@@ -1339,6 +1346,20 @@ class _Job:
             env_names=self._env_names(),
             keyword_renames=getattr(self.migration, "keyword_renames", None),
             importable=self.wf_importable,
+            remaining=self._rescan if complete else None,
+            old_api=getattr(self.migration, "source_name", "old"),
+        )
+
+    def _rescan(self, path: str, text: str) -> list[Finding]:
+        """The scanner's findings for `path` holding `text`, as the verifier's scan of the
+        fixed tree reports them (suggestions use the job's findings for the other files)."""
+        return scan_text(
+            path,
+            text,
+            self.migration,
+            self.wf_repo_modules,
+            others=self.findings,
+            root=self.work.resolve(),
         )
 
     def _failure_hints(self, v: Verification | None) -> tuple[tuple[str, str], ...]:
@@ -2019,7 +2040,9 @@ class _Job:
             errors = applied.errors
             checks = ["regions"] * len(errors)
             if not errors:
-                result = self._check(path, original, applied.text, required=required and final)
+                result = self._check(
+                    path, original, applied.text, required=required and final, complete=final
+                )
                 reply["checks"] = result.checks
                 reply["auto_imports"] = result.auto_imports
                 reply["reverted"] = result.reverted

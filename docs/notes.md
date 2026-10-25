@@ -82,7 +82,7 @@ src/apifix/
                       `rewrite_checker` (migration checks of a whole-file rewrite, errors by
                       check name); attributes
                       `first_version` / `target_name` and hook `new_api_uses` for
-                      already_migrated.py
+                      already_migrated.py; `source_name` names the old API in check messages
       openai_v1/      rules.py (pure data tables, incl. guide-part selectors) + migration-
                       specific heuristics; guide.md (old -> new reference used in the prompts);
                       guide_parts.py (which parts / Resources rows a job's findings need);
@@ -880,6 +880,19 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   genai-gptoss-7's `if isinstance(chunk, dict):` branch for the 0.x mocks). `if delta.content:`
   passes (it skips "" too). Whole-file mode only; agent mode
   and `apifix verify` rely on the verifier's completeness check (the scanner finding).
+- Completeness check (check `completeness`, run last, Python and dependency files; plan
+  llmflows-run-4-check.md): the completed rewrite (after reverts and added imports, what is
+  written) is rescanned (`scanner.scan_text`: the same per-file pass as `scan`, with the repo's
+  module names, then `adjust_findings` with the job's findings for the other files, for the
+  suggestions) and each finding `verifier.incomplete_findings` keeps (`certain`, the rule
+  behind `incomplete_migration`) is an error: "line 77: `openai.Embedding.create` is still the
+  openai 0.x API: use ..." (`Migration.source_name`). The per-file pass alone decides whether a
+  file has a finding and its confidence, so the check and the verifier agree on every rewrite
+  (tests compare both on fixture repos). Region edits: final batch only (earlier batches leave
+  the other regions on the old code). A file accepted earlier that fails it keeps its accepted
+  version. Still only the verifier sees: files never sent (too large, hash-pinned pins) and a
+  suggestion that depends on another file's rewrite in the same attempt (the message uses the
+  job's original findings for other files; the finding itself is the same).
 - Undefined names (`code_checks.py`, Python files): pyflakes `UndefinedName` messages only, and
   only names the original did not already use undefined (star imports and builtins never
   count). Before the checks, apifix adds the import itself for each such name with exactly
@@ -1082,11 +1095,10 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   file, previous version, context, findings and instructions); check retries record theirs in
   the nudge. A request that aborts the job is recorded too, and the abort reason names the file.
 - No new, renamed or deleted files; files must be UTF-8.
-- No whole-file check looks for 0.x calls left in (or put back into) a rewrite: in llmflows run 3,
-  attempt 6 rewrote `openai_embeddings.py` back to `openai.Embedding.create(engine=...)` to
-  satisfy a test that still asserted `engine=`, every check said ok, and only the verifier
-  (`incomplete_migration`, after a sandbox run) rejected it. Re-scanning the candidate for its
-  own findings would catch it before the sandbox (not built).
+- 0.x calls left in (or put back into) a rewrite are caught before the sandbox by the
+  completeness check (llmflows run 3, attempt 6: `openai_embeddings.py` rewritten back to
+  `openai.Embedding.create(engine=...)` used to reach the sandbox and fail as
+  `incomplete_migration`).
 
 ## Known limitations (region edits)
 

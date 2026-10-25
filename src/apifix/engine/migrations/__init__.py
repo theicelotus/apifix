@@ -71,6 +71,8 @@ class Migration(Protocol):
     # test files and the new API in its code, is already migrated (already_migrated.py).
     first_version: str
     target_name: str
+    # How check messages name the old API ("openai 0.x").
+    source_name: str
 
     def job_guide(
         self, findings: list[Finding], root: Path | None = None, shared: bool = False

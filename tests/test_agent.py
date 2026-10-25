@@ -1254,6 +1254,7 @@ def test_whole_file_migrates_each_file_in_its_own_request(repo):
                 "unrelated_edits": "ok",
                 "config": "ok",
                 "streaming": "ok",
+                "completeness": "ok",
             },
             "auto_imports": [],
             "reverted": [],
@@ -1889,25 +1890,27 @@ def test_dependency_files_are_resent_when_the_install_failed(repo):
     }
 
 
-def test_dependency_file_with_a_remaining_finding_is_resent(repo):
+def test_dependency_file_with_a_remaining_finding_fails_its_check(repo):
     # an escaped TOML string: apifix cannot set this pin, so the model gets the file
     pyproject = '[project]\nname = "app"\ndependencies = ["openai\\u003d=0.28.1"]\n'
     (repo / "pyproject.toml").write_text(pyproject)
     still_pinned = pyproject + "# migrated\n"
     fixed = '[project]\nname = "app"\ndependencies = ["openai>=1.55.3,<3"]\n'
-    llm = FakeLLM([block(still_pinned, "toml"), *GOOD] + [block(fixed, "toml")])
+    llm = FakeLLM([block(still_pinned, "toml"), block(fixed, "toml"), *GOOD])
     result = wf(repo, llm, max_retries=1)
-    first, second = result.trajectory["attempts"]
-    assert [f["path"] for f in first["files"]] == ["pyproject.toml", "app.py", "tests/test_app.py"]
-    assert first["kept_files"] == ["requirements.txt"]  # set by apifix
-    assert any(
-        r["code"] == "incomplete_migration" and r["file"] == "pyproject.toml"
-        for r in first["verification"]["reasons"]
-    )
-    # only the file with the remaining finding goes back
-    assert [f["path"] for f in second["files"]] == ["pyproject.toml"]
-    assert second["kept_files"] == ["requirements.txt", "app.py", "tests/test_app.py"]
-    assert first["resend"] == {"pyproject.toml": "verifier: incomplete_migration"}
+    (attempt,) = result.trajectory["attempts"]  # caught before the sandbox, not by the verifier
+    assert [f["path"] for f in attempt["files"]] == [
+        "pyproject.toml",
+        "app.py",
+        "tests/test_app.py",
+    ]
+    assert attempt["kept_files"] == ["requirements.txt"]  # set by apifix
+    (nudge,) = attempt["nudges"]
+    assert (nudge["kind"], nudge["file"]) == ("check_retry", "pyproject.toml")
+    assert nudge["error"].startswith("line 1: `openai==0.28.1` is still the openai 0.x API: pin ")
+    replies = attempt["files"][0]["replies"]
+    assert replies[0]["checks"]["completeness"] == nudge["error"]
+    assert replies[1]["checks"]["completeness"] == "ok"
     assert result.outcome == "verified"
     (fallback,) = result.trajectory["job"]["pin_fallbacks"]
     assert (fallback["file"], fallback["sent"]) == ("pyproject.toml", True)
@@ -2955,6 +2958,27 @@ def test_a_resend_that_fails_its_checks_keeps_the_last_accepted_version(repo):
         result.report_markdown
     )
     assert "(kept its attempt 1 version)" in result.report_markdown
+
+
+def test_a_resend_that_puts_the_old_api_back_fails_its_check_and_falls_back(repo):
+    # llmflows-gptoss-3 attempt 6: a resend rewrote app.py back to the 0.x call; it used to pass
+    # every check and was rejected only by the verifier (incomplete_migration) after a run
+    rolled_back = block(APP_OLD.replace('"gpt-4"', '"gpt-4o"'))
+    llm = FakeLLM([*GOOD, rolled_back, rolled_back, block(TESTS_ROLE)])
+    sandbox = failing_first_verification(llm, (T_ASK, "failed", APP_FAILURE))
+    result = wf(repo, llm, sandbox)
+    assert result.outcome == "verified", result.report_markdown
+    second = result.trajectory["attempts"][1]
+    app = second["files"][0]
+    assert not app["accepted"] and app["fell_back_to"] == 1
+    assert [check for check, _ in app["failed_checks"]] == ["completeness"]
+    assert app["error"].startswith(
+        "line 5: `openai.ChatCompletion.create` is still the openai 0.x API: use "
+    )
+    (nudge,) = second["nudges"]
+    assert nudge["kind"] == "check_retry" and nudge["error"] == app["error"]
+    assert not any(r["code"] == "incomplete_migration" for r in second["verification"]["reasons"])
+    assert "+    r = client.chat.completions.create(" in result.diff and "gpt-4o" not in result.diff
 
 
 def test_only_fallbacks_are_not_verified_again(repo):

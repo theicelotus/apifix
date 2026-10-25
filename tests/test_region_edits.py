@@ -259,6 +259,27 @@ def test_regions_are_batched_to_fit_the_size_limit(big):
     assert "b/tests/test_app.py R1" in second  # the first batch's changes, read-only
 
 
+def test_only_the_last_batch_gets_the_completeness_check(big):
+    # R2 refers to openai.ChatCompletion.create itself (a certain finding): after the first
+    # batch it is still on 0.x, which the verifier never sees; the last batch removes it
+    with_import = "from unittest import mock\n\nimport openai\n"
+    old = TESTS_BIG.replace("from unittest import mock\n", with_import).replace(
+        "def test_strips(create):\n",
+        "def test_strips(create):\n    old = openai.ChatCompletion.create\n",
+    )
+    (big / "tests" / "test_app.py").write_text(old)
+    imports_new = IMPORTS_NEW.replace("from unittest import mock\n", with_import)
+    batch1 = regions(("IMPORTS", imports_new), ("R1", R1_NEW))
+    llm = FakeLLM([block(APP_NEW), batch1, regions(("R2", R2_NEW))])
+    parts = old.split("\n\n\n")
+    result = wf(big, llm, whole_file_max_bytes=len(parts[0]) + len(parts[2]) + 31)  # R2 is longer
+    entry = files_of(result)[1]
+    assert [b["ids"] for b in entry["batches"]] == [["R1"], ["R2"]]
+    first, last = (reply["checks"]["completeness"] for reply in entry["replies"])
+    assert (first, last) == ("n/a", "ok")
+    assert result.outcome == "verified", result.report_markdown
+
+
 def test_a_refused_whole_file_is_sent_as_regions(repo):
     padded = TESTS_OLD + "".join(f"\n\ndef test_x{i}():\n    assert True\n" for i in range(30))
     (repo / "tests" / "test_app.py").write_text(padded)  # under the threshold: whole first
