@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from apifix import cli
+from apifix.engine.build_info import apifix_build, build_label
 from apifix.engine.diffing import unified_diff
 from apifix.engine.local_paths import redact_local_paths
 from apifix.engine.verify_diff import VerifyError, apply_diff, verify_diff
@@ -53,6 +54,8 @@ def test_a_good_diff_is_verified_without_touching_the_repo(saved):
     assert result.diff == diff.read_text()  # the changes as applied
     t = result.trajectory
     assert t["job"]["command"] == "verify"
+    assert t["job"]["apifix"] == apifix_build()
+    assert f"- apifix: {build_label()}" in result.report_markdown
     assert t["job"]["files_changed"] == ["app.py", "requirements.txt", "tests/test_app.py"]
     assert t["outcome"] == "verified" and t["timing"]["llm_s"] == 0.0
     assert t["verification"]["verdict"] == "verified"

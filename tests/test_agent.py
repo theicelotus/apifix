@@ -27,6 +27,7 @@ from apifix.engine.agent import (
     token_limit_margin,
     tool_call_example,
 )
+from apifix.engine.build_info import apifix_build, build_label
 from apifix.engine.llm import (
     LLMError,
     LLMResponse,
@@ -228,6 +229,8 @@ def test_success_on_first_try(repo):
     assert len(sandbox.runs) == 2
     assert result.usage == Usage(3000, 600) and result.cost_usd == pytest.approx(0.0042)
     assert "# apifix fix: Verified" in result.report_markdown
+    assert f"- apifix: {build_label()}" in result.report_markdown
+    assert result.trajectory["job"]["apifix"] == apifix_build()
     assert "## Verification: Verified" in result.report_markdown
 
 

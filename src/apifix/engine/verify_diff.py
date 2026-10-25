@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from apifix.engine.build_info import apifix_build, build_label
 from apifix.engine.diffing import diff_trees, unified_diff
 from apifix.engine.imports import (
     UndeclaredImport,
@@ -157,6 +158,7 @@ def verify_diff(
         "version": TRAJECTORY_VERSION,
         "job": {
             "command": "verify",
+            "apifix": apifix_build(),
             "repo": str(original),
             "migration": mig.name,
             "diff": str(Path(diff_path).resolve()),
@@ -214,6 +216,7 @@ def _report(
         f"# apifix verify: {_TITLES[v.verdict]}",
         "",
         f"- Migration: `{mig.name}` ({mig.summary})",
+        f"- apifix: {build_label()}",
         f"- Diff: `{diff_path}` ({files} file{'' if files == 1 else 's'} changed); applied to a "
         "copy of the repo, no LLM used",
         f"- Outcome: {reason}",

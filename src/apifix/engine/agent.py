@@ -30,6 +30,7 @@ from typing import Any, Literal
 
 from apifix.engine.agent_tools import TOOLS, EditRecord, Workspace
 from apifix.engine.already_migrated import AlreadyMigrated, detect_already_migrated
+from apifix.engine.build_info import apifix_build, build_label
 from apifix.engine.code_checks import (
     STDLIB_IMPORTS,
     import_table,
@@ -2346,6 +2347,7 @@ class _Job:
         return {
             "version": TRAJECTORY_VERSION,
             "job": {
+                "apifix": apifix_build(),
                 "repo": str(self.repo),
                 "migration": self.migration.name,
                 "provider": self.llm.provider,
@@ -2832,6 +2834,7 @@ def report_markdown(
         f"# apifix fix: {title}",
         "",
         f"- Migration: `{job.migration.name}` ({job.migration.summary})",
+        f"- apifix: {build_label()}",
         f"- Outcome: {reason}",
         f"- Attempts: {len(job.attempts)} ({_attempts_budget(job)})"
         + (f"; changes from attempt {chosen.number}" if chosen else ""),
