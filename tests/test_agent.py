@@ -3044,3 +3044,43 @@ def test_report_shows_dropped_sources_and_the_baselines_pip_conflict(repo):
     )
     assert "- `anthropic` is declared in `requirements.txt`" in md
     assert md.index("### Dependency install conflict") < md.index("were not verified")
+
+
+# --- llmflows run 3 ---------------------------------------------------------------------------
+
+
+def test_whole_file_checks_get_the_migrations_keyword_renames(repo, monkeypatch):
+    seen = []
+    real = agent_module.check_candidate
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs["keyword_renames"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(agent_module, "check_candidate", spy)
+    assert wf(repo, FakeLLM(list(GOOD))).outcome == "verified"
+    assert seen and all(r == get_migration("openai-v1").keyword_renames for r in seen)
+
+
+def test_cut_off_reply_says_what_capped_it(repo):
+    # attempt 6 of the run: the per-minute limit (known from a refusal) capped max_tokens below
+    # --max-output-tokens, and reasoning took most of the reply
+    first = budget(APP_OLD, 6000)
+    usage = Usage(input_tokens=1500, output_tokens=900, reasoning_tokens=700)
+    cut = LLMResponse("```python\nimport openai\n", [], "max_tokens", usage, "fake-model", "")
+    llm = FakeLLM([too_large(3000, 1500 + first), GOOD[0], cut, cut, cut, cut])
+    result = wf(repo, llm, max_retries=0, max_output_tokens=6000, file_edits="whole")
+    entry = result.trajectory["attempts"][0]["files"][1]
+    assert entry["path"] == "tests/test_app.py" and not entry["accepted"]
+    sent = result.trajectory["attempts"][0]["responses"][-1]["max_tokens"]
+    assert sent < 6000
+    assert entry["error"] == (
+        "the reply hit the output limit before the file was complete "
+        f"(at {sent:,} reply tokens, 700 of them reasoning; capped so the 1,500-token prompt "
+        "fits the server's 3,000 tokens-per-minute limit: --max-output-tokens 6,000 cannot "
+        "raise it)"
+    )
+    # no known limit, no reasoning reported: as before
+    assert agent_module._truncated_error("file", 16_000) == (
+        "the reply hit the output limit before the file was complete (at 16,000 reply tokens)"
+    )

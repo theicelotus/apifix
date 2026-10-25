@@ -53,6 +53,10 @@ class Migration(Protocol):
     # How clients get their API key: a test that patches a resource method while the code
     # under test builds a client without one fails (code_checks). None: not checked.
     client_key: ClientKey | None
+    # 0.x keyword-argument names and their 1.x names (engine -> model): in a test file, an edit
+    # that only makes one of these renames (a call assertion on the migrated call) is part of
+    # the migration (unrelated.py).
+    keyword_renames: Mapping[str, str]
     # Runs in the sandbox after the fixed code's dependencies are installed (no network, no repo
     # code); a failure is reported to the model as a dependency problem. None: no check.
     smoke_check: SmokeCheck | None

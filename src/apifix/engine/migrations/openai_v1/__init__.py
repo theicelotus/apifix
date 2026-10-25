@@ -98,6 +98,7 @@ class OpenAIV1Migration:
     client_classes = rules.CLIENT_CLASSES
     client_resources = rules.CLIENT_RESOURCES
     client_key = rules.CLIENT_KEY
+    keyword_renames = rules.KWARG_RENAMES
     package = rules.PACKAGE
     pin_spec = rules.PIN_SPEC
     companion_pins = rules.COMPANION_PINS

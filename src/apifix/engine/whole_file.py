@@ -620,6 +620,7 @@ def check_candidate(
     client_resources: Collection[str] = (),
     client_key: ClientKey | None = None,
     env_names: Collection[str] = (),
+    keyword_renames: Mapping[str, str] | None = None,
     importable: Callable[[str], bool] | None = None,
 ) -> CheckResult:
     """Syntax (Python files), well-formedness (dependency files), "differs from the original"
@@ -646,7 +647,9 @@ def check_candidate(
     check (unrelated.py): text-only hunks away from the migration are reverted before the
     imports are added (`reverted`), and code hunks unrelated to it, or original strings that
     are missing, are errors; hunks naming one of `env_names` (the library's environment
-    variables, e.g. a placeholder key a test sets) are related. `rewrite_checks(path,
+    variables, e.g. a placeholder key a test sets) are related, and so are, in test files,
+    hunks that only make one of `keyword_renames` (Migration.keyword_renames: `engine=` ->
+    `model=` in a call assertion on the migrated call). `rewrite_checks(path,
     original, candidate)`: the migration's own checks (Migration.rewrite_checker, e.g.
     `config`, `streaming`), run last on the completed file; without them, check `config` is
     n/a."""
@@ -679,8 +682,11 @@ def check_candidate(
     reverted: list[Revert] = []
     reverts: list[dict[str, object]] = []
     revert_errors: list[str] = []
+    renames = keyword_renames if unrelated and is_test_file(path, original) else None
     if unrelated:
-        result = revert_text_edits(original, candidate, findings or (), library_modules, env_names)
+        result = revert_text_edits(
+            original, candidate, findings or (), library_modules, env_names, renames
+        )
         candidate, reverted, revert_errors = result.text, result.reverted, result.errors
     added: list[str] = []
     if path.endswith(".py") and not syntax:
@@ -739,7 +745,7 @@ def check_candidate(
 
     unrelated_problems = (
         revert_errors
-        + unrelated_edits(original, candidate, findings or (), library_modules, env_names)
+        + unrelated_edits(original, candidate, findings or (), library_modules, env_names, renames)
         if unrelated
         else []
     )

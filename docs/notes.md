@@ -643,7 +643,14 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   when the regions and IMPORTS are under 80% of the file; `form_reason` `truncated`,
   `switched_to_regions`) and a region request in halves by bytes (IMPORTS with the first;
   `splits` reason `truncated`), down to one region. A single region (or a whole file with no
-  smaller form) cut off at the full allowance fails the file: "... (at N reply tokens)".
+  smaller form) cut off at the full allowance fails the file: "... (at N reply tokens)", plus
+  how many were reasoning (as the server reported) and, when a known per-minute limit set
+  max_tokens below `--max-output-tokens`, that the prompt plus reply had to fit that limit
+  (`_Job._cutoff_detail`). Known gap: under a per-minute limit the reply's room is the limit
+  minus the prompt, and nothing frees more of it (no resend without context files or the
+  previous version, no lower reasoning effort for that request); reasoning varies widely per
+  reply (858 to 2,351 tokens for the same file in llmflows run 3), so the failure can be bad
+  luck on one reply. Regions do not help when they cover 80% or more of the file.
   Recorded per entry as `truncations` (`response`, `max_tokens`, region `ids`, `then`:
   `more_reply_tokens` | `regions` | `smaller_groups` | `failed`); report "Replies cut off at
   the output limit", with a `--reasoning-effort low` suggestion for openai-compat when one
@@ -824,7 +831,13 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   `self.x` and the name `x` in methods of the same class (a threaded parameter). Then every non-exempt string constant of the original must still be
   in the candidate (multiset over the file); exempt: strings on a finding's lines, keys of
   dict-literal findings, and dict/subscript keys that became attribute or keyword names
-  (`d["choices"]` -> `d.choices`). A revert whose result does not parse is not made; each such
+  (`d["choices"]` -> `d.choices`). Test files only: a hunk whose only change is one of the
+  migration's keyword renames (`Migration.keyword_renames`, openai-v1: `engine`/`deployment_id`
+  -> `model`, `request_timeout` -> `timeout`), as a keyword argument or a plain string equal to
+  the old name (`assert_called_once_with(engine=...)`, `call_args.kwargs["engine"]`), is kept
+  wherever it is (kind `rename`; its renamed strings are not missing): a call assertion
+  follows the migrated call, and the hunk holds no bound name (the mock's name is on the line
+  above). Any other change in the same hunk makes it judged as before. A revert whose result does not parse is not made; each such
   hunk is an error instead. Known misses: a library-name shim (`try: from openai import OpenAI
   as _OpenAI ...` that stubs the library) counts as related; a removed string that also occurs
   elsewhere in the file is not missed (multiset); any edit within 3 lines of a finding is
@@ -1069,6 +1082,11 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   file, previous version, context, findings and instructions); check retries record theirs in
   the nudge. A request that aborts the job is recorded too, and the abort reason names the file.
 - No new, renamed or deleted files; files must be UTF-8.
+- No whole-file check looks for 0.x calls left in (or put back into) a rewrite: in llmflows run 3,
+  attempt 6 rewrote `openai_embeddings.py` back to `openai.Embedding.create(engine=...)` to
+  satisfy a test that still asserted `engine=`, every check said ok, and only the verifier
+  (`incomplete_migration`, after a sandbox run) rejected it. Re-scanning the candidate for its
+  own findings would catch it before the sandbox (not built).
 
 ## Known limitations (region edits)
 

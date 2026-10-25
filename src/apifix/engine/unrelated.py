@@ -14,12 +14,17 @@ The candidate is compared with the original line by line (the same diff as
   names one of the library's environment variables (`env_names`: a test setting a placeholder
   `OPENAI_API_KEY` for the real client); any other is an error
   (sent back through the check retry). Attribute names alone (`.chat`, `.choices`, which other
-  SDKs share) never make a hunk related.
+  SDKs share) never make a hunk related;
+- with `renames` (the migration's keyword renames, given for test files), a hunk whose only
+  change is one of them, as a keyword argument or as a string (`engine=` -> `model=` in
+  `create.assert_called_once_with(...)`, `call_args.kwargs["engine"]`), is kept wherever it is:
+  the test's expectation of the call follows the migrated call.
 
 After the reverts, every string constant of the original must still be in the candidate (as a
 multiset over the whole file), except strings on a finding's lines (mock targets, removed
-config values), the keys of a 0.x-shaped mock response dict, and keys that became attribute
-or keyword names. Pure and stdlib only; the rule and its limits are in docs/notes.md.
+config values), the keys of a 0.x-shaped mock response dict, keys that became attribute
+or keyword names, and the strings a kept rename hunk renamed. Pure and stdlib only; the rule
+and its limits are in docs/notes.md.
 """
 
 from __future__ import annotations
@@ -31,7 +36,7 @@ import io
 import keyword
 import tokenize
 from collections import Counter
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 
 from apifix.engine.diffing import opcodes
@@ -213,6 +218,38 @@ def _strings(tokens: Iterable[_Tok]) -> list[str]:
 
 def _comments(tokens: Iterable[_Tok]) -> list[str]:
     return [t.string for t in tokens if t.type == tokenize.COMMENT]
+
+
+def _string_value(t: _Tok) -> str | None:
+    """A plain string token's value (None for f-strings, bytes and the like)."""
+    try:
+        value = ast.literal_eval(t.string)
+    except (ValueError, SyntaxError):
+        return None
+    return value if isinstance(value, str) else None
+
+
+def _exact_keys(
+    tokens: Iterable[_Tok], renames: Mapping[str, str] | None = None, keywords: Collection = ()
+) -> list[tuple[int, str]]:
+    """_keys with string contents compared too; with `renames`, keyword-argument names at
+    `keywords` ((row, col) positions) and plain strings equal to a rename's old name become
+    the new name."""
+    out = []
+    for t in tokens:
+        key = _token_key(t)
+        if key is None:
+            continue
+        if t.type in _STRING_TOKENS:
+            value = _string_value(t)
+            if renames and value in renames:
+                key = (tokenize.STRING, repr(renames[value]))
+            else:
+                key = (tokenize.STRING, repr(value) if value is not None else t.string)
+        elif renames and t.type == tokenize.NAME and t.start in keywords:
+            key = (tokenize.NAME, renames[t.string])
+        out.append(key)
+    return out
 
 
 # --- regions and exempt strings ---------------------------------------------------------------
@@ -659,7 +696,7 @@ def _binds(node: ast.AST) -> bool:
 @dataclass(frozen=True)
 class _Judged:
     hunk: Hunk
-    kind: str  # "import", "text" (text-only) or "code"
+    kind: str  # "import", "rename" (keyword renames only), "text" (text-only) or "code"
     verdict: str  # "keep", "revert" or "reject"
 
 
@@ -671,9 +708,16 @@ class _Diff:
         findings: Sequence[Finding],
         library_modules: Collection[str],
         env_names: Collection[str] = (),
+        renames: Mapping[str, str] | None = None,
     ) -> None:
         self.old, self.new = _Version(original), _Version(candidate)
         self.env_names = frozenset(env_names)
+        self.renames = dict(renames or {})
+        self.rename_keywords = {
+            (n.lineno, _char_col(self.old.lines[n.lineno - 1], n.col_offset))
+            for n in ast.walk(self.old.tree)
+            if isinstance(n, ast.keyword) and n.arg in self.renames
+        }
         self.hunks = hunks(original, candidate)
         lines = {line for f in findings for line in range(f.line, f.end_line + 1)}
         self.regions = regions(self.old.tree, sorted({f.line for f in findings}))
@@ -684,6 +728,13 @@ class _Diff:
         self.old_bound = _Bound(self.old.tree, self.old_scopes, library_modules)
         self.new_bound = _Bound(self.new.tree, self.new_scopes, library_modules)
         self.judged = self._judge()
+        # original lines of the kept rename hunks: their renamed strings are not missing
+        self.renamed_lines = {
+            line
+            for j in self.judged
+            if j.kind == "rename"
+            for line in range(j.hunk.i1 + 1, j.hunk.i2 + 1)
+        }
 
     # one hunk's sides
 
@@ -732,6 +783,16 @@ class _Diff:
             for t in old
         )
 
+    def _rename_only(self, h: Hunk) -> bool:
+        """Is the hunk's only change one of the migration's keyword renames (as a keyword
+        argument or a string, `engine=` -> `model=`, `kwargs["engine"]` -> `kwargs["model"]`),
+        comments and layout aside?"""
+        if not self.renames or h.insertion or h.j1 == h.j2:
+            return False
+        old, new = self._tokens(h)
+        renamed = _exact_keys(old, self.renames, self.rename_keywords)
+        return renamed == _exact_keys(new) and renamed != _exact_keys(old)
+
     def _strings_equal(self, h: Hunk) -> bool:
         old, new = self._tokens(h)
         return _strings(old) == _strings(new)
@@ -748,6 +809,8 @@ class _Diff:
         for h in self.hunks:
             if self._import_hunk(h):
                 kinds.append((h, "import"))
+            elif self._rename_only(h):
+                kinds.append((h, "rename"))
             elif self._text_only(h):
                 kinds.append((h, "text"))
             else:
@@ -778,7 +841,7 @@ class _Diff:
                         scoped_attrs.add((scopes.class_of(scope), attr))
         judged = []
         for h, kind in kinds:
-            if kind == "import":
+            if kind in ("import", "rename"):
                 verdict = "keep"
             elif kind == "text":
                 keep = self._touches_exempt(h) or (self._strings_equal(h) and self._near(h))
@@ -943,12 +1006,14 @@ def revert_text_edits(
     findings: Sequence[Finding],
     library_modules: Collection[str] = (),
     env_names: Collection[str] = (),
+    renames: Mapping[str, str] | None = None,
 ) -> RevertResult:
     """Put back text-only hunks unrelated to the migration (strings, docstrings, comments away
     from the findings). If the result does not parse, nothing is reverted and each such hunk is
-    an error instead. Both versions must parse; a file that does not tokenize is left as is."""
+    an error instead. Both versions must parse; a file that does not tokenize is left as is.
+    `renames`: the migration's keyword renames, for test files (see the module docstring)."""
     try:
-        diff = _Diff(original, candidate, findings, library_modules, env_names)
+        diff = _Diff(original, candidate, findings, library_modules, env_names, renames)
     except (SyntaxError, tokenize.TokenError, ValueError):
         return RevertResult(candidate, [], [])
     targets = [j.hunk for j in diff.judged if j.verdict == "revert"]
@@ -998,12 +1063,13 @@ def unrelated_edits(
     findings: Sequence[Finding],
     library_modules: Collection[str] = (),
     env_names: Collection[str] = (),
+    renames: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Check errors for code hunks unrelated to the migration and for original strings that
     are missing (see the module docstring). Text-only hunks are revert_text_edits' job; any
     still left are not reported here."""
     try:
-        diff = _Diff(original, candidate, findings, library_modules, env_names)
+        diff = _Diff(original, candidate, findings, library_modules, env_names, renames)
     except (SyntaxError, tokenize.TokenError, ValueError):
         return []
     rejected = [j.hunk for j in diff.judged if j.verdict == "reject"]
@@ -1042,7 +1108,8 @@ def _attribute_names(tree: ast.Module) -> set[str]:
 
 def _missing_strings(diff: _Diff, skipped: Sequence[Hunk]) -> list[str]:
     """Non-exempt string constants of the original that the candidate lacks (multiset). Exempt
-    besides those on finding lines: keys that became attribute or keyword names. Strings in the
+    besides those on finding lines: keys that became attribute or keyword names, and strings a
+    kept rename hunk renamed (`kwargs["engine"]` -> `kwargs["model"]`). Strings in the
     `skipped` hunks (rejected or text-only) are reported by those hunks' own errors."""
     have = Counter(n.value for n in _string_constants(diff.new.tree))
     keys, attributes = _key_constants(diff.old.tree), _attribute_names(diff.new.tree)
@@ -1051,6 +1118,7 @@ def _missing_strings(diff: _Diff, skipped: Sequence[Hunk]) -> list[str]:
         for n in _string_constants(diff.old.tree)
         if not _exempt_node(n, diff.old, diff.exempt_lines, diff.exempt_keys)
         and not (id(n) in keys and n.value in attributes)
+        and not (n.value in diff.renames and not _lines_of(n).isdisjoint(diff.renamed_lines))
     ]
     need = Counter(n.value for n in nodes)
     changed = {line for h in diff.hunks for line in range(h.i1 + 1, h.i2 + 1)}

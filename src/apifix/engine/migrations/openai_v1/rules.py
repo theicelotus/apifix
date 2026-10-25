@@ -99,6 +99,13 @@ KWARG_CHANGES: dict[str, str] = {
         "openai.AzureOpenAI(api_version={value})"
     ),
 }
+# The KWARG_CHANGES that are plain renames: a test's call assertion follows them
+# (`create.assert_called_once_with(engine=...)` -> `model=`), wherever it is in the file.
+KWARG_RENAMES: dict[str, str] = {
+    "engine": "model",
+    "deployment_id": "model",
+    "request_timeout": "timeout",
+}
 # engine= / deployment_id= on a call that also passes model=
 KWARG_MODEL_TOO = "; this call also passes model={model}: keep one"
 # ... in a file that sets api_type = "azure": 0.x sent the request to the engine's deployment

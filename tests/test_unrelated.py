@@ -765,3 +765,108 @@ def test_attribute_mock_data_conversion_is_related_now():
     errors = _mixed_check(*args, new_rules=False)
     assert errors and errors[0].startswith("original line 22: changed code unrelated")
     assert [e for e in _mixed_check(*args) if "unrelated" in e] == []
+
+
+# --- llmflows run 3: 0.x kwargs renamed in call assertions -------------------------------------
+
+KWARGS = FIXTURE.parent / "kwarg_assertions"
+KWARG_TESTS = "tests/test_embeddings.py"
+KWARG_PATCHES = (('"openai.Embedding.create"', '"openai.embeddings.create"'),)
+
+
+def _kwarg_check(path: str, *edits: tuple[str, str], renames: bool = True):
+    """check_candidate on one kwarg_assertions file with `edits` applied (each must match)."""
+    from apifix.engine.whole_file import check_candidate
+
+    original = (KWARGS / path).read_text()
+    candidate = original
+    for old, new in edits:
+        assert old in candidate, old
+        candidate = candidate.replace(old, new)
+    findings = [f for f in scan(KWARGS, "openai-v1").findings if f.file == path]
+    return check_candidate(
+        path,
+        original,
+        candidate,
+        required=False,
+        library_modules=LIBRARY,
+        findings=findings,
+        keyword_renames=MIGRATION.keyword_renames if renames else None,
+    )
+
+
+def test_engine_assertion_follows_the_migrated_call():
+    edits = (*KWARG_PATCHES, ('engine="test_model",', 'model="test_model",'))
+    # the run: the assertion is 7 lines from the nearest finding and holds no bound name
+    (error,) = _kwarg_check(KWARG_TESTS, *edits, renames=False).errors
+    assert error.startswith(
+        'original line 21: changed code unrelated to the migration ("engine="test_model",")'
+    )
+    result = _kwarg_check(KWARG_TESTS, *edits)
+    assert result.errors == [] and result.checks["unrelated_edits"] == "ok"
+    assert 'model="test_model",' in result.text
+
+
+def test_deployment_id_assertion_follows_the_migrated_call():
+    edits = (*KWARG_PATCHES, ('deployment_id="test_deployment",', 'model="test_deployment",'))
+    assert _kwarg_check(KWARG_TESTS, *edits, renames=False).errors
+    assert _kwarg_check(KWARG_TESTS, *edits).errors == []
+
+
+def test_renamed_kwargs_key_is_kept_not_reverted():
+    edits = (*KWARG_PATCHES, ('kwargs["engine"]', 'kwargs["model"]'))
+    # a text-only hunk: without the renames apifix silently put the 0.x key back
+    before = _kwarg_check(KWARG_TESTS, *edits, renames=False)
+    assert [r["line"] for r in before.reverted] == [36] and 'kwargs["engine"]' in before.text
+    after = _kwarg_check(KWARG_TESTS, *edits)
+    assert after.errors == [] and after.reverted == []
+    assert 'kwargs["model"]' in after.text  # and "engine" is not reported missing
+
+
+def test_rename_with_another_change_is_still_unrelated():
+    edits = (*KWARG_PATCHES, ('engine="test_model",', 'model="other_model",'))
+    (error,) = _kwarg_check(KWARG_TESTS, *edits).errors
+    assert error.startswith("original line 21: changed code unrelated to the migration")
+    # the key changed to anything but the rename's new name: put back as before
+    edits = (*KWARG_PATCHES, ('kwargs["engine"]', 'kwargs["engine_name"]'))
+    result = _kwarg_check(KWARG_TESTS, *edits)
+    assert [r["line"] for r in result.reverted] == [36] and 'kwargs["engine"]' in result.text
+
+
+def test_renames_apply_only_to_test_files(tmp_path):
+    original = (
+        "import openai\n\n\ndef ask(q):\n"
+        '    return openai.Completion.create(engine="x", prompt=q)\n\n\n'
+        "def build(make):\n    a = 1\n    b = 2\n    c = 3\n    d = 4\n"
+        '    return make(engine="y")\n'
+    )
+    candidate = original.replace('make(engine="y")', 'make(model="y")')
+    (tmp_path / "app.py").write_text(original)
+    findings = scan(tmp_path, "openai-v1").findings
+    renames = MIGRATION.keyword_renames
+    assert unrelated_edits(original, candidate, findings, LIBRARY) != []
+    assert unrelated_edits(original, candidate, findings, LIBRARY, renames=renames) == []
+    from apifix.engine.whole_file import check_candidate
+
+    r = check_candidate(
+        "app.py",
+        original,
+        candidate,
+        required=False,
+        library_modules=LIBRARY,
+        findings=findings,
+        keyword_renames=renames,
+    )
+    assert any("changed code unrelated" in e for e in r.errors)
+
+
+def test_keyword_renames_are_kwarg_changes():
+    from apifix.engine.migrations.openai_v1 import rules
+
+    assert MIGRATION.keyword_renames == {
+        "engine": "model",
+        "deployment_id": "model",
+        "request_timeout": "timeout",
+    }
+    for old, new in MIGRATION.keyword_renames.items():
+        assert f"{new}=" in rules.KWARG_CHANGES[old]

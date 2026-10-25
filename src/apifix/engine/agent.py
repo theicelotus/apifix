@@ -683,6 +683,24 @@ class _Job:
         room -= self._tokens(prompt_chars)
         return room if need <= room < max_tokens else max_tokens
 
+    def _cutoff_detail(self, response: dict[str, Any]) -> str:
+        """For a reply cut off with no larger request left: how many of its tokens went to
+        reasoning (as the server reported), and whether a known per-minute limit, not
+        --max-output-tokens, set its max_tokens."""
+        usage = response.get("usage") or {}
+        parts = []
+        if usage.get("reasoning_tokens"):
+            parts.append(f"{usage['reasoning_tokens']:,} of them reasoning")
+        most = self.config.max_output_tokens
+        if self.token_limit is not None and response["max_tokens"] < most:
+            prompt = (usage.get("input_tokens") or 0) + (usage.get("cache_read_tokens") or 0)
+            parts.append(
+                f"capped so the {prompt:,}-token prompt fits the server's "
+                f"{self.token_limit:,} tokens-per-minute limit: --max-output-tokens "
+                f"{most:,} cannot raise it"
+            )
+        return "; ".join(parts)
+
     def _learn_server_count(
         self,
         exc: RequestTooLarge,
@@ -1217,7 +1235,8 @@ class _Job:
                         switched = True
                         break
                     record["then"] = "failed"
-                    entry["error"] = _truncated_error("file", sent_max)
+                    detail = self._cutoff_detail(attempt.responses[-1])
+                    entry["error"] = _truncated_error("file", sent_max, detail)
                     break
                 if parsed.outcome != "ok":
                     if self._nudges(attempt, "code_block") < self.config.max_code_block_nudges:
@@ -1318,6 +1337,7 @@ class _Job:
             client_resources=self.migration.client_resources,
             client_key=self._client_key(),
             env_names=self._env_names(),
+            keyword_renames=getattr(self.migration, "keyword_renames", None),
             importable=self.wf_importable,
         )
 
@@ -1843,7 +1863,8 @@ class _Job:
                     record["then"] = "smaller_groups"
                     continue
                 record["then"] = "failed"
-                return _BatchOutcome(error=_truncated_error("regions", sent_max))
+                detail = self._cutoff_detail(attempt.responses[-1])
+                return _BatchOutcome(error=_truncated_error("regions", sent_max, detail))
             if outcome.batch is not None:
                 return outcome.batch
             applied, result = outcome.applied, outcome.result
@@ -2640,11 +2661,11 @@ def _truncation_lines(job: _Job) -> list[str]:
     return [line]
 
 
-def _truncated_error(what: str, max_tokens: int) -> str:
+def _truncated_error(what: str, max_tokens: int, detail: str = "") -> str:
     """A file that failed because its reply was cut off, at the most reply tokens its request
-    could have (`what`: "file" or "regions")."""
+    could have (`what`: "file" or "regions"; `detail`: _Job._cutoff_detail)."""
     errors = _PARSE_ERRORS if what == "file" else _REGION_PARSE_ERRORS
-    return f"{errors['truncated']} (at {max_tokens:,} reply tokens)"
+    return f"{errors['truncated']} (at {max_tokens:,} reply tokens{', ' if detail else ''}{detail})"
 
 
 _REGION_PARSE_ERRORS = {
