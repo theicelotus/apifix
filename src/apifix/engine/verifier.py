@@ -174,6 +174,9 @@ class Verification:
     rerun: SandboxResult | None = None
     # verified_weak / unverified: hunks of source files no test executed (review_by_hand())
     review_by_hand: list[dict[str, Any]] = field(default_factory=list)
+    # ... and the findings still in the fixed tree, also on lines the fix left unchanged
+    # (review_findings())
+    review_findings: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Compact machine-readable form (no captured output)."""
@@ -191,6 +194,7 @@ class Verification:
             "findings_before": self.findings_before,
             "remaining_findings": [asdict(f) for f in self.remaining_findings],
             "review_by_hand": self.review_by_hand,
+            "review_findings": self.review_findings,
             "runs": {
                 name: run_summary(run)
                 for name, run in (("baseline", self.baseline), ("fixed", self.fixed))
@@ -724,6 +728,35 @@ def review_by_hand(
                 }
             )
     return out
+
+
+def review_findings(changes: list[FileChange], remaining: list[Finding]) -> list[dict[str, Any]]:
+    """Every finding left in the fixed tree, with whether the fix changed its line (a finding on
+    a line the fix never touched is the one the hunk list cannot show)."""
+    changed = {ch.path: set(ch.changed_lines) for ch in changes}
+    return [
+        {
+            "file": f.file,
+            "line": f.line,
+            "category": f.category,
+            "confidence": f.confidence,
+            "old_pattern": f.old_pattern,
+            "suggestion": f.suggestion,
+            "changed": bool(
+                changed.get(f.file, set()) & set(range(f.line, (f.end_line or f.line) + 1))
+            ),
+        }
+        for f in remaining
+    ]
+
+
+def review_finding_line(entry: Mapping[str, Any]) -> str:
+    """One remaining-finding bullet (without the leading "- ")."""
+    unchanged = "" if entry["changed"] else " (line not changed by the fix)"
+    return (
+        f"`{entry['file']}:{entry['line']}`{unchanged}: {entry['category']} "
+        f"[{entry['confidence']}] {_code(entry['old_pattern'])} -> {entry['suggestion']}"
+    )
 
 
 def _message_lines(message: str) -> str:
@@ -1403,6 +1436,7 @@ def verify(
     reasons = library_held_back(reasons, mig.package)
     verdict = decide(reasons)
     review = review_by_hand(changes, coverage) if verdict in REVIEW_VERDICTS else []
+    left = review_findings(changes, after_scan.findings) if verdict in REVIEW_VERDICTS else []
     return Verification(
         verdict=verdict,
         reasons=reasons,
@@ -1416,6 +1450,7 @@ def verify(
         fixed=fixed_run,
         rerun=rerun,
         review_by_hand=review,
+        review_findings=left,
     )
 
 
@@ -1577,11 +1612,20 @@ def _report(v: Verification) -> str:
         out += _bullets([f"`{t}`: {how}{_why_regressed(d, t)}" for t, how in regressed])
         out.append("")
 
+    if v.review_by_hand or v.review_findings:
+        out += ["### Review by hand", ""]
     if v.review_by_hand:
-        out += ["### Review by hand", "", "No test executed these changes:", ""]
+        out += ["No test executed these changes:", ""]
         out += [f"- {review_line(e)}" for e in v.review_by_hand[:MAX_LISTED]]
         if len(v.review_by_hand) > MAX_LISTED:
             out.append(f"- ... and {len(v.review_by_hand) - MAX_LISTED} more (see fix.diff)")
+        out.append("")
+    if v.review_findings:
+        out += ["Migration findings still in the code:", ""]
+        out += [f"- {review_finding_line(e)}" for e in v.review_findings[:MAX_LISTED]]
+        if len(v.review_findings) > MAX_LISTED:
+            more = len(v.review_findings) - MAX_LISTED
+            out.append(f"- ... and {more} more (see verification.json)")
         out.append("")
 
     out += install_conflict_section((("original code", v.baseline), ("fixed code", v.fixed)))

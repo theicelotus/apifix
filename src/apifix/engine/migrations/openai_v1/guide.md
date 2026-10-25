@@ -39,7 +39,10 @@ def ask(msgs):
 <!-- part: client.kwargs -->
 - Per-call `api_key=` / `organization=` / `api_base=` move to the client (or
   `client.with_options(...)`).
-- `request_timeout=` becomes `timeout=`. `engine=` / `deployment_id=` become `model=`.
+- `request_timeout=` becomes `timeout=`, `headers=` becomes `extra_headers=`, `request_id=` goes.
+  `engine=` / `deployment_id=` become `model=` (on Azure, the deployment name). 1.x methods
+  raise TypeError on any of these, also when they reach the method through a wrapper:
+  `call_with_retry(func=client.completions.create, engine=e)` needs `model=e`.
 <!-- part: client.config -->
 - **Never drop a configured value** (`openai.api_key = <value>`, `organization`, `api_base`).
   `OpenAI()` reads only its arguments and the environment (`OPENAI_API_KEY`, `OPENAI_ORG_ID`,

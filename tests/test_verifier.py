@@ -1603,6 +1603,91 @@ def test_review_by_hand_only_for_weak_and_unverified_results(trees):
     assert v.verdict == "unverified" and len(v.review_by_hand) == 5
 
 
+RETRY = """\
+def call_with_retry(func, retries, **kwargs):
+    return func(**kwargs)
+"""
+WRAPPED_OLD = """\
+import openai
+
+from retry import call_with_retry
+
+
+def ask(q):
+    r = call_with_retry(
+        func=openai.Completion.create,
+        retries=3,
+        engine="davinci",
+        prompt=q,
+    )
+    return r["choices"][0]["text"]
+"""
+# the call is migrated, the engine= line (10) is left as it was
+WRAPPED_NEW = """\
+import openai
+
+from retry import call_with_retry
+
+
+def ask(q):
+    r = call_with_retry(
+        func=openai.OpenAI(api_key="test").completions.create,
+        retries=3,
+        engine="davinci",
+        prompt=q,
+    )
+    return r.choices[0].text
+"""
+
+
+def test_kwarg_left_on_an_unchanged_line_is_incomplete(trees):
+    original_files = {**ORIGINAL, "retry.py": RETRY, "app.py": WRAPPED_OLD}
+    original, fixed = trees({"retry.py": RETRY, "app.py": WRAPPED_NEW}, original_files)
+    after = run((T_ASK, "passed"), (T_STRIP, "passed"), coverage=None)
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(PASSING, [after]))
+    r = reason(v, "incomplete_migration")
+    assert (r.file, r.line) == ("app.py", 10)
+    assert 'engine="davinci"' in r.message and "pass model=" in r.message
+    (change,) = [ch for ch in v.changes if ch.path == "app.py"]
+    assert 10 not in change.changed_lines
+    assert v.verdict == "rejected"
+
+
+def test_review_by_hand_lists_remaining_findings_on_unchanged_lines(trees):
+    settings = 'import openai\n\nopenai.api_type = "open_ai"\n'
+    original_files = {**ORIGINAL, "settings.py": settings}
+    original, fixed = trees({"settings.py": settings}, original_files)
+    after = run((T_ASK, "passed"), (T_STRIP, "passed"), coverage=None)
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(PASSING, [after]))
+    assert v.verdict == "verified_weak"
+    assert [(e["file"], e["line"], e["changed"]) for e in v.review_findings] == [
+        ("settings.py", 3, False)
+    ]
+    assert v.to_dict()["review_findings"] == v.review_findings
+    section = v.report_markdown().split("### Review by hand\n\n")[1]
+    unchanged = "Migration findings still in the code:\n\n- `settings.py:3` (line not changed by"
+    assert unchanged in section
+    assert "client_config [likely] `openai.api_type` -> " in section
+
+
+def test_review_findings_mark_changed_lines_and_only_weak_verdicts(trees):
+    settings_old = 'import openai\n\nopenai.api_type = "open_ai"\n'
+    settings_new = 'import openai\n\nopenai.api_type = "azure"\n'
+    original_files = {**ORIGINAL, "settings.py": settings_old}
+    original, fixed = trees({"settings.py": settings_new}, original_files)
+    after = run((T_ASK, "passed"), (T_STRIP, "passed"), coverage=None)
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(PASSING, [after]))
+    assert [(e["line"], e["changed"]) for e in v.review_findings] == [(3, True)]
+    assert "`settings.py:3`: client_config" in v.report_markdown()
+    full = {
+        "app.py": FileCoverage(frozenset({1, 3, 6, 7, 8}), frozenset()),
+        "settings.py": FileCoverage(frozenset({1, 3}), frozenset()),
+    }
+    covered = run((T_ASK, "passed"), (T_STRIP, "passed"), coverage=full)
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(PASSING, [covered]))
+    assert v.verdict == "verified" and v.review_findings == []
+
+
 def test_review_line_forms():
     from apifix.engine.verifier import review_line
 

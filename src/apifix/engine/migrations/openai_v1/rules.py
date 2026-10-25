@@ -58,18 +58,62 @@ REMOVED_RESOURCES: dict[str, str] = {
     "Deployment": "Removed in 1.x; manage Azure deployments outside the SDK",
 }
 
-# Per-call kwargs that 1.x renamed or moved onto the client.
+# Per-call kwargs 0.x's resource methods took (engine_api_resource.create and its params) that
+# 1.x methods do not: renamed, or moved onto the client. 1.x raises TypeError on each. {value}:
+# the call's own value. Checked on 0.x and 1.x method calls, and on wrapper calls that are passed
+# the method (python_checks._per_call_kwargs).
+KWARG_MARK = "1.x methods take no "  # every KWARG_CHANGES message has it
 KWARG_CHANGES: dict[str, str] = {
-    "engine": "Renamed: pass model=... instead of engine=...",
-    "deployment_id": "Azure: pass the deployment name as model=... on openai.AzureOpenAI",
-    "request_timeout": "Renamed: timeout=... (or client.with_options(timeout=...))",
-    "headers": "Renamed: extra_headers=...",
-    "api_key": "Per-call credentials removed: set api_key on the client (or client.with_options)",
-    "organization": "Per-call organization removed: set organization on the client",
-    "api_base": "Per-call api_base removed: set base_url on the client",
-    "api_type": "Per-call api_type removed: use openai.AzureOpenAI for Azure",
-    "api_version": "Per-call api_version removed: set api_version on openai.AzureOpenAI",
+    "engine": "1.x methods take no engine=: pass model={value} (on Azure, the deployment name)",
+    "deployment_id": (
+        "1.x methods take no deployment_id=: pass the Azure deployment name as model={value} "
+        "(client: openai.AzureOpenAI)"
+    ),
+    "request_timeout": (
+        "1.x methods take no request_timeout=: pass timeout={value} "
+        "(or client.with_options(timeout=...))"
+    ),
+    "headers": "1.x methods take no headers=: pass extra_headers={value}",
+    "request_id": (
+        "1.x methods take no request_id=: drop it (send it with extra_headers= if the server "
+        "needs it)"
+    ),
+    "api_key": (
+        "1.x methods take no api_key=: pass it to the client constructor, "
+        "openai.OpenAI(api_key={value}) (or client.with_options(api_key=...))"
+    ),
+    "organization": (
+        "1.x methods take no organization=: pass it to the client constructor, "
+        "openai.OpenAI(organization={value})"
+    ),
+    "api_base": (
+        "1.x methods take no api_base=: pass it to the client constructor as "
+        "base_url={value} (Azure: openai.AzureOpenAI(azure_endpoint=...))"
+    ),
+    "api_type": (
+        "1.x methods take no api_type=: pick the client class instead "
+        "(openai.AzureOpenAI for Azure)"
+    ),
+    "api_version": (
+        "1.x methods take no api_version=: pass it to the client constructor, "
+        "openai.AzureOpenAI(api_version={value})"
+    ),
 }
+# engine= / deployment_id= on a call that also passes model=
+KWARG_MODEL_TOO = "; this call also passes model={model}: keep one"
+# ... in a file that sets api_type = "azure": 0.x sent the request to the engine's deployment
+KWARG_MODEL_AZURE = (
+    "; this call also passes model={model}: on Azure model= takes the deployment, so "
+    "model={value} replaces it"
+)
+# the kwarg reaches the method through a wrapper (call_with_retry(func=..., engine=...))
+KWARG_VIA = "{kwarg}= goes through {wrapper}(...) to {method}: "
+# 1.x client constructors (Client / AsyncClient are 1.x's aliases of OpenAI / AsyncOpenAI) and
+# client methods that return another client
+CLIENT_CONSTRUCTORS = frozenset(
+    {"OpenAI", "AsyncOpenAI", "AzureOpenAI", "AsyncAzureOpenAI", "Client", "AsyncClient"}
+)
+CLIENT_COPIES = frozenset({"with_options", "copy"})
 
 # Module-level config attribute -> (suggestion, suggestion when the file targets Azure, confidence).
 # api_key / organization / api_type / api_version still exist on 1.x's module-level client, so

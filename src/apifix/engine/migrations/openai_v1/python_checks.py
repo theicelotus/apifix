@@ -332,6 +332,141 @@ def _namespace(node: ast.expr, source: str, depth: int = 0) -> str | None:
     return " ".join((ast.get_source_segment(source, node) or ast.unparse(node)).split())
 
 
+# --- 1.x clients ----------------------------------------------------------------------------
+
+_Scopes = tuple[int, ...]  # ids of the enclosing function scopes, innermost last (module first)
+
+
+class _Clients:
+    """Names and `self.x` attributes bound to a 1.x client (a constructor call such as
+    `AzureOpenAI(...)`, or `.with_options(...)` of a client), flow-insensitive: names per
+    function scope (module included), attributes per class (any method's `self.x = ...` / `cls.x`,
+    or `x = ...` in the class body)."""
+
+    def __init__(self, tree: ast.Module, aliases: dict[str, str]) -> None:
+        self.aliases = aliases
+        self.names: dict[int, set[str]] = {}
+        self.attrs: dict[int, set[str]] = {}
+        if not aliases:
+            return
+        for _ in range(3):  # a client copied from a client bound later: a few rounds suffice
+            before = sum(map(len, self.names.values())) + sum(map(len, self.attrs.values()))
+            self._collect(tree.body, (id(tree),), None, in_class=False)
+            after = sum(map(len, self.names.values())) + sum(map(len, self.attrs.values()))
+            if after == before:
+                break
+
+    def _collect(
+        self, body: list[ast.stmt], scopes: _Scopes, cls: int | None, *, in_class: bool
+    ) -> None:
+        for stmt in body:
+            for node in _scope_nodes(stmt):
+                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                    self._collect(node.body, (*scopes, id(node)), cls, in_class=False)
+                elif isinstance(node, ast.ClassDef):
+                    self._collect(node.body, scopes, id(node), in_class=True)
+                else:
+                    self._bind_node(node, scopes, cls, in_class)
+
+    def _bind_node(self, node: ast.AST, scopes: _Scopes, cls: int | None, in_class: bool) -> None:
+        pairs: list[tuple[ast.AST, ast.AST | None]] = []
+        if isinstance(node, ast.Assign):
+            pairs = [(t, node.value) for t in node.targets]
+        elif isinstance(node, ast.AnnAssign | ast.NamedExpr):
+            pairs = [(node.target, node.value)]
+        elif isinstance(node, ast.With | ast.AsyncWith):
+            pairs = [(i.optional_vars, i.context_expr) for i in node.items if i.optional_vars]
+        for target, value in pairs:
+            if value is None or not self.is_client(value, scopes, cls):
+                continue
+            if isinstance(target, ast.Name):
+                if in_class and cls is not None:
+                    self.attrs.setdefault(cls, set()).add(target.id)
+                else:
+                    self.names.setdefault(scopes[-1], set()).add(target.id)
+            elif (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id in ("self", "cls")
+                and cls is not None
+            ):
+                self.attrs.setdefault(cls, set()).add(target.attr)
+
+    def is_client(self, node: ast.AST, scopes: _Scopes, cls: int | None) -> bool:
+        if isinstance(node, ast.Await):
+            node = node.value
+        if isinstance(node, ast.Call):
+            func = node.func
+            canonical = _resolve(func, self.aliases)
+            if canonical:
+                parts = canonical.split(".")
+                return len(parts) == 2 and parts[1] in rules.CLIENT_CONSTRUCTORS
+            return (
+                isinstance(func, ast.Attribute)
+                and func.attr in rules.CLIENT_COPIES
+                and self.is_client(func.value, scopes, cls)
+            )
+        if isinstance(node, ast.Name):
+            return any(node.id in self.names.get(s, ()) for s in scopes)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            return (
+                node.value.id in ("self", "cls")
+                and cls is not None
+                and node.attr in self.attrs.get(cls, ())
+            )
+        return False
+
+    def method(self, node: ast.AST, scopes: _Scopes, cls: int | None) -> bool:
+        """`node` (not called) is an openai method: a 0.x resource method
+        (`openai.Completion.create`) or a 1.x one, `openai.<resource>...<method>` (the
+        module-level client) or `<client>.<resource>...<method>`."""
+        if not isinstance(node, ast.Attribute):
+            return False
+        canonical = _resolve(node, self.aliases)
+        if canonical:
+            parts = canonical.split(".")
+            if parts[0] != "openai":
+                return False
+            if len(parts) == 3 and parts[1] in rules.RESOURCES:
+                return True
+            return len(parts) >= 3 and parts[1] in rules.CLIENT_RESOURCES
+        names: list[str] = []
+        cur: ast.AST = node
+        while isinstance(cur, ast.Attribute):
+            names.append(cur.attr)
+            if (
+                len(names) >= 2
+                and cur.attr in rules.CLIENT_RESOURCES
+                and self.is_client(cur.value, scopes, cls)
+            ):
+                return True
+            cur = cur.value
+        return False
+
+
+def _scope_nodes(stmt: ast.stmt):
+    """The nodes of `stmt` in its own scope: nested function and class definitions are yielded
+    but not entered (lambdas and comprehensions are entered: `:=` binds in the enclosing
+    scope)."""
+    stack: list[ast.AST] = [stmt]
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            continue
+        stack.extend(reversed(list(ast.iter_child_nodes(node))))
+
+
+def _top_level_params(tree: ast.Module | None) -> dict[str, frozenset[str]]:
+    """Explicit parameter names of each top-level function of the file."""
+    out: dict[str, frozenset[str]] = {}
+    for node in tree.body if tree else ():
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            a = node.args
+            out[node.name] = frozenset(p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs))
+    return out
+
+
 # --- visitor --------------------------------------------------------------------------------
 
 
@@ -359,6 +494,10 @@ class _Visitor(ast.NodeVisitor):
         # One set per scope: names last assigned a plain dict (_dict_value).
         self.dict_names: list[set[str]] = [set()]
         self.streaming_calls: set[int] = set()  # ids of the func of resource calls with stream=
+        self.clients = _Clients(tree, aliases) if tree is not None else None
+        self.fn_scopes: list[int] = [id(tree)]  # _Scopes of the node being visited
+        self.classes: list[int | None] = [None]
+        self.local_params = _top_level_params(tree)
 
     # reporting
 
@@ -589,12 +728,9 @@ class _Visitor(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         call = self._resource_call(node)
-        if call is not None:
-            if self._may_stream(call):
-                self.streaming_calls.add(id(call.func))
-            for kw in call.keywords:
-                if kw.arg in rules.KWARG_CHANGES:
-                    self._report(kw, "api_call", rules.KWARG_CHANGES[kw.arg], CERTAIN)
+        if call is not None and self._may_stream(call):
+            self.streaming_calls.add(id(call.func))
+        self._per_call_kwargs(node)
         func = node.func
         if isinstance(func, ast.Attribute):
             # A string-keyed chain before .get() is already reported by visit_Subscript.
@@ -615,6 +751,49 @@ class _Visitor(ast.NodeVisitor):
         if self.test_file:
             self._mock_keyword_data(node)
         self.generic_visit(node)
+
+    def _is_method(self, node: ast.AST) -> bool:
+        if self.clients is None:
+            return False
+        return self.clients.method(node, tuple(self.fn_scopes), self.classes[-1])
+
+    def _per_call_kwargs(self, node: ast.Call) -> None:
+        """Keywords 0.x methods took per call (rules.KWARG_CHANGES) on a call of an openai method
+        (0.x or 1.x), or on a wrapper call passed one (`call_with_retry(func=client.completions.
+        create, engine=...)`, the kwargs go through), unless the wrapper is a top-level function
+        of this file with that parameter of its own."""
+        wrapper = method = None
+        if not self._is_method(node.func):
+            args = [*node.args, *(kw.value for kw in node.keywords)]
+            method = next((a for a in args if self._is_method(a)), None)
+            if method is None:
+                return
+            wrapper = " ".join(ast.unparse(node.func).split())
+        own = (
+            self.local_params.get(node.func.id, frozenset())
+            if wrapper and isinstance(node.func, ast.Name)
+            else frozenset()
+        )
+        model = next((kw.value for kw in node.keywords if kw.arg == "model"), None)
+        for kw in node.keywords:
+            if kw.arg not in rules.KWARG_CHANGES or kw.arg in own:
+                continue
+            message = rules.KWARG_CHANGES[kw.arg].format(value=self._value_text(kw.value))
+            if kw.arg in ("engine", "deployment_id") and model is not None:
+                both = rules.KWARG_MODEL_AZURE if self.azure else rules.KWARG_MODEL_TOO
+                message += both.format(
+                    model=self._value_text(model), value=self._value_text(kw.value)
+                )
+            if method is not None:
+                via = rules.KWARG_VIA.format(
+                    kwarg=kw.arg, wrapper=wrapper, method=" ".join(ast.unparse(method).split())
+                )
+                message = via + message
+            self._report(kw, "api_call", message, CERTAIN)
+
+    def _value_text(self, node: ast.AST) -> str:
+        text = " ".join((ast.get_source_segment(self.source, node) or ast.unparse(node)).split())
+        return text if len(text) <= _MAX_VALUE else "..."
 
     def visit_Subscript(self, node: ast.Subscript) -> None:
         cur, chain, has_key = _unwrap_chain(node)
@@ -794,7 +973,16 @@ class _Visitor(ast.NodeVisitor):
     def _visit_scope(self, node: ast.AST) -> None:
         self.scopes.append({})
         self.dict_names.append(set())
+        function = isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        if function:
+            self.fn_scopes.append(id(node))
+        if isinstance(node, ast.ClassDef):
+            self.classes.append(id(node))
         self.generic_visit(node)
+        if function:
+            self.fn_scopes.pop()
+        if isinstance(node, ast.ClassDef):
+            self.classes.pop()
         self.scopes.pop()
         self.dict_names.pop()
 

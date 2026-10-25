@@ -97,7 +97,8 @@ src/apifix/
     verifier.py       baseline vs fix: per-test deltas, flaky rerun, tampering, completeness,
                       changed-line coverage, environment (missing modules, library not
                       declared) -> verdict + reasons + PR report section (with a per-hunk
-                      "Review by hand" list for verified_weak / unverified)
+                      "Review by hand" list and the remaining findings for verified_weak /
+                      unverified)
     llm.py            provider-neutral LLM interface, model/price table (TOML-overridable),
                       waits for an endpoint unreachable mid-job (both providers)
     llm_anthropic.py  Claude via the official `anthropic` SDK (optional extra)
@@ -276,6 +277,23 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   genai's `Iterator[StreamCompletion]`), `dict(delta)`, `type(x) is dict`. Known miss: 0.x
   code whose only stream handling sits under `isinstance(chunk, dict)` (0.x chunks were dict
   subclasses; in 1.x the branch never runs) loses that finding; its call is still flagged.
+- openai-v1 per-call kwargs (`rules.KWARG_CHANGES`: engine, deployment_id, request_timeout,
+  headers, request_id, api_key, organization, api_base, api_type, api_version), [certain]
+  `api_call` on the keyword, with the call's value in the suggestion (`engine=X` -> `model=X`,
+  config -> the client constructor; "keep one" when the call also passes `model=`, Azure files:
+  `model=X` replaces it). On a call of an openai method: a 0.x resource method, or a 1.x one
+  (`openai.<resource>...` module-level client, or `<client>.<resource>...` with a resource of
+  `rules.CLIENT_RESOURCES`), so a fix that leaves one is `incomplete_migration`. A client: a
+  constructor call (`rules.CLIENT_CONSTRUCTORS`, through openai imports), its `.with_options()` /
+  `.copy()`, a name assigned one (`=`, annotated, `:=`, `with ... as`; in the function, an
+  enclosing one or the module), `self.x` / `cls.x` assigned one in any method of the class or
+  in its body; flow-insensitive. Also on a wrapper call that is passed such a method, positional
+  or keyword, not called (`call_with_retry(func=client.completions.create, engine=e)`,
+  `functools.partial(...)`, `asyncio.to_thread(...)`): the kwargs go through. Not flagged: a
+  parameter or other unresolved root (`def f(client)`: other SDKs share the method names), and
+  keywords that a top-level function of the same file names as its own parameters (wrappers
+  from other modules are not read, so a wrapper elsewhere that takes `api_key` itself is a false
+  positive). Mock call assertions (`create.assert_called_once_with(engine=...)`) are not checked.
 - No `getattr(openai, ...)` or other dynamic-attribute detection.
 - String references (e.g. `mock.patch` targets) are found with any module prefix
   (`app.openai.ChatCompletion.create`, `src.x.openai.error.RateLimitError`; [likely]), unless
@@ -528,6 +546,10 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   coverage/pytest-cov configuration can interfere with the `coverage run` wrapper.
 - Scope warnings use the scanner's findings per file, so legitimate edits in files without
   findings (e.g. mock data helpers) are still warned about.
+- Review by hand, remaining findings (`verified_weak`, `unverified` only; only [likely] ones can
+  remain there): every finding of the fixed tree (`verification.review_findings`, with
+  `changed`: whether the fix changed one of its lines), report "Migration findings still in
+  the code:", "(line not changed by the fix)" on the others, at most 15.
 - Review by hand (`verified_weak`, `unverified` only): hunks of changed non-test source files
   (the files changed-line coverage counts) none of whose fixed-side executable lines ran; hunks
   with no executable fixed-side line (removals, code turned into a comment, edits inside a

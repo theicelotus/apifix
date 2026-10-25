@@ -49,8 +49,14 @@ def adjust_findings(findings: list[Finding], root: Path | None = None) -> list[F
     where = ", ".join(f"{file}:{','.join(numbers)}" for file, numbers in lines.items())
     reads = " and ".join(f"openai.{a}" for a in attrs)
     kwargs = ", ".join(f"{a}=openai.{a}" for a in attrs)
-    call_files = sorted(
-        {f.file for f in findings if f.category == "api_call" and f.file not in tests}
+    call_files = sorted(  # per-call kwargs left on a call are no call site to point here
+        {
+            f.file
+            for f in findings
+            if f.category == "api_call"
+            and f.file not in tests
+            and rules.KWARG_MARK not in f.suggestion
+        }
     )
     out = []
     for f in findings:

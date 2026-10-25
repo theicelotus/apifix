@@ -973,3 +973,170 @@ def test_mixed_access_fixture():
             '{"data": [{"embedding": [0.1]}, {"embedding": [0.2]}]}',
         ),
     ]
+
+
+# --- per-call kwargs through wrappers and on 1.x calls ---------------------------------------
+
+
+def _kwargs(findings):
+    return [
+        (f.file, f.line, f.old_pattern)
+        for f in findings
+        if f.category == "api_call" and "1.x methods take no" in f.suggestion
+    ]
+
+
+def test_wrapped_calls_fixture():
+    findings = scan(FIXTURES.parent / "wrapped_calls", "openai-v1").findings
+    assert _kwargs(findings) == [
+        ("wrapkit/legacy.py", 23, "engine=self._deployment"),
+        ("wrapkit/legacy.py", 33, "deployment_id=self._deployment"),
+        ("wrapkit/legacy.py", 40, 'engine="text-embedding-ada-002"'),
+        ("wrapkit/legacy.py", 44, "request_timeout=30"),
+        ("wrapkit/migrated.py", 15, "engine=deployment"),
+        ("wrapkit/migrated.py", 21, 'engine="text-embedding-3-small"'),
+        ("wrapkit/migrated.py", 35, 'request_id="q1"'),
+        ("wrapkit/migrated.py", 41, "headers={}"),
+        ("wrapkit/migrated.py", 48, 'api_version="2024-02-01"'),
+    ]
+    assert all(f.confidence == "certain" for f in findings if "1.x methods" in f.suggestion)
+    by_line = {(f.file, f.line): f.suggestion for f in findings}
+    assert by_line[("wrapkit/legacy.py", 23)] == (
+        "engine= goes through call_with_retry(...) to openai.Completion.create: 1.x methods "
+        "take no engine=: pass model=self._deployment (on Azure, the deployment name); this call "
+        'also passes model="gpt-35-turbo": on Azure model= takes the deployment, so '
+        "model=self._deployment replaces it"
+    )
+    assert by_line[("wrapkit/migrated.py", 15)].startswith(
+        "engine= goes through call_with_retry(...) to client.completions.create: "
+    )
+    assert "openai.AzureOpenAI(api_version=" in by_line[("wrapkit/migrated.py", 48)]
+    assert "to self.client.chat.completions.create" in by_line[("wrapkit/migrated.py", 48)]
+    # the retry module itself never touches openai
+    assert not [f for f in findings if f.file == "wrapkit/retry.py"]
+
+
+def test_kwarg_suggestions_carry_the_value(scan_code):
+    findings = scan_code(
+        """
+        import openai
+        openai.ChatCompletion.create(engine=name, request_timeout=t, headers=h, api_key=k)
+        openai.Completion.create(api_base=b, api_type="azure", organization=o, api_version=v)
+        """
+    )
+    got = {f.old_pattern.split("=")[0]: f.suggestion for f in findings if "=" in f.old_pattern}
+    assert "pass model=name" in got["engine"]
+    assert "pass timeout=t" in got["request_timeout"]
+    assert "pass extra_headers=h" in got["headers"]
+    assert "openai.OpenAI(api_key=k)" in got["api_key"]
+    assert "base_url=b" in got["api_base"]
+    assert "AzureOpenAI" in got["api_type"]
+    assert "openai.OpenAI(organization=o)" in got["organization"]
+    assert "openai.AzureOpenAI(api_version=v)" in got["api_version"]
+    assert all(f.confidence == "certain" for f in findings if "=" in f.old_pattern)
+
+
+def test_engine_with_model_outside_azure_says_keep_one(scan_code):
+    (f,) = [
+        f
+        for f in scan_code("import openai\nopenai.Embedding.create(engine='e', model='m')\n")
+        if f.old_pattern.startswith("engine")
+    ]
+    assert f.suggestion.endswith("; this call also passes model='m': keep one")
+
+
+@pytest.mark.parametrize(
+    "setup, call",
+    [
+        ("client = openai.OpenAI()", "client.chat.completions.create"),
+        ("from openai import AsyncOpenAI as C\nclient = C()", "client.embeddings.create"),
+        ("client = openai.OpenAI().with_options(timeout=5)", "client.completions.create"),
+        ("", "openai.OpenAI().chat.completions.create"),
+        ("", "openai.chat.completions.create"),
+        ("", "openai.audio.transcriptions.create"),
+        ("with openai.OpenAI() as client:\n    pass", "client.models.list"),
+        ("client = openai.Client()", "client.completions.with_raw_response.create"),
+    ],
+)
+def test_1x_calls_with_0x_kwargs(scan_code, setup, call):
+    findings = scan_code(f"import openai\n{setup}\n\ndef f():\n    {call}(engine='e')\n")
+    assert _kwargs(findings) == [("snippet.py", findings[-1].line, "engine='e'")]
+
+
+def test_client_attributes_and_enclosing_scopes(scan_code):
+    findings = scan_code(
+        """
+        import openai
+
+        class A:
+            shared = openai.OpenAI()
+
+            def __init__(self):
+                self._c = openai.AzureOpenAI()
+
+            def f(self):
+                self._c.completions.create(deployment_id="d")
+                self.shared.completions.create(engine="e")
+
+                def inner():
+                    return self._c.completions.create(engine="e")
+
+        def outer():
+            c = openai.OpenAI()
+
+            def inner():
+                return c.chat.completions.create(api_key="k")
+
+            return inner
+
+        class B:
+            def f(self):
+                return self._c.completions.create(engine="not a client here")
+        """
+    )
+    assert [line for _, line, _ in _kwargs(findings)] == [11, 12, 15, 21]
+
+
+def test_unresolved_and_non_openai_methods_are_not_checked(scan_code):
+    findings = scan_code(
+        """
+        import openai
+        from hosted import the hosted provider
+
+        def f(client, other):
+            client.chat.completions.create(engine="x")  # a parameter: any SDK
+            the hosted provider().chat.completions.create(engine="x")
+            other.call(func=client.chat.completions.create, engine="x")
+            openai.OpenAI().with_options(api_key="k", timeout=1)  # with_options takes them
+            openai.OpenAI(api_key="k", organization="o")
+        """
+    )
+    assert _kwargs(findings) == []
+
+
+def test_files_without_an_openai_import_are_not_checked(scan_code):
+    code = "def f(client):\n    call(func=client.completions.create, engine='x')\n"
+    assert scan_code(code) == []
+
+
+def test_wrapper_kwargs_positional_method_and_own_parameters(scan_code):
+    findings = scan_code(
+        """
+        import asyncio
+        import openai
+
+        def run(func, api_key=None, *, headers=None, **kwargs):
+            return func(**kwargs)
+
+        async def g(client: openai.AsyncOpenAI):
+            c = openai.AsyncOpenAI()
+            await asyncio.to_thread(openai.Completion.create, engine="a")
+            run(c.completions.create, api_key="k", headers={}, engine="b")
+            helpers.run(c.completions.create, api_key="k")
+        """
+    )
+    assert [(line, p) for _, line, p in _kwargs(findings)] == [
+        (10, 'engine="a"'),
+        (11, 'engine="b"'),
+        (12, 'api_key="k"'),  # not this file's run(): its parameters are unknown
+    ]
