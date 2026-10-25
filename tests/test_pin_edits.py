@@ -57,36 +57,36 @@ def test_requirements_keeps_extras_markers_comments_and_spacing(tmp_path):
     assert changed_lines(f) == [
         (
             'openai[datalib] == 0.28.1 ; python_version >= "3.8"  # keep this comment',
-            'openai[datalib] >=1.55.3,<2 ; python_version >= "3.8"  # keep this comment',
+            'openai[datalib] >=1.55.3,<3 ; python_version >= "3.8"  # keep this comment',
         )
     ]
     (edit,) = f.edits
     assert (edit.line, edit.old, edit.new, edit.kind) == (
         2,
         "openai[datalib] == 0.28.1",
-        "openai[datalib] >=1.55.3,<2",
+        "openai[datalib] >=1.55.3,<3",
         "migration",
     )
     assert (
         pin_line(edit)
-        == "requirements.txt:2 openai[datalib] == 0.28.1 -> openai[datalib] >=1.55.3,<2"
+        == "requirements.txt:2 openai[datalib] == 0.28.1 -> openai[datalib] >=1.55.3,<3"
     )
 
 
 def test_crlf_bom_free_bytes_and_missing_final_newline_survive(tmp_path):
     f = one(tmp_path, "requirements.txt", b"pytest\r\nopenai~=0.27\r\nrich")
-    assert f.text.encode() == b"pytest\r\nopenai>=1.55.3,<2\r\nrich"
+    assert f.text.encode() == b"pytest\r\nopenai>=1.55.3,<3\r\nrich"
 
 
 def test_comment_with_the_same_text_is_not_touched(tmp_path):
     f = one(tmp_path, "requirements.txt", "# openai==0.28 was the old pin\nopenai==0.28\n")
-    assert f.text == "# openai==0.28 was the old pin\nopenai>=1.55.3,<2\n"
+    assert f.text == "# openai==0.28 was the old pin\nopenai>=1.55.3,<3\n"
     assert f.edits[0].line == 2
 
 
 def test_duplicate_entries_are_each_edited(tmp_path):
     f = one(tmp_path, "requirements/base.txt", "openai==0.28\nx\nopenai<1\n")
-    assert f.text == "openai>=1.55.3,<2\nx\nopenai>=1.55.3,<2\n"
+    assert f.text == "openai>=1.55.3,<3\nx\nopenai>=1.55.3,<3\n"
     assert [e.line for e in f.edits] == [1, 3]
 
 
@@ -128,7 +128,7 @@ def test_companion_pins_that_hold_openai_back_are_raised(tmp_path):
         """,
     )
     assert [(e.old, e.new, e.kind) for e in f.edits] == [
-        ("openai==0.28.1", "openai>=1.55.3,<2", "migration"),
+        ("openai==0.28.1", "openai>=1.55.3,<3", "migration"),
         ("typing_extensions==4.5.0", "typing_extensions>=4.11,<5", "companion"),
         ("httpx<0.20", "httpx>=0.23,<1", "companion"),
         ("anyio>=5.1", "anyio>=3.5,<5", "companion"),
@@ -187,7 +187,7 @@ def test_conda_entries_of_companions_are_reported_not_edited(tmp_path):
             - openai==0.27.6
         """,
     )
-    assert changed_lines(f) == [("    - openai==0.27.6", "    - openai>=1.55.3,<2")]
+    assert changed_lines(f) == [("    - openai==0.27.6", "    - openai>=1.55.3,<3")]
     assert f.notes == [
         "not changed: environment.yml:4 typing_extensions=4.5.0=pyha770c72_0 (conda entry); "
         "openai needs typing-extensions>=4.11,<5"
@@ -209,7 +209,7 @@ def test_environment_pip_list_quoted_and_commented(tmp_path):
             - pytest  # tests
         """,
     )
-    assert changed_lines(f) == [('    - "openai==0.27.6"', '    - "openai>=1.55.3,<2"')]
+    assert changed_lines(f) == [('    - "openai==0.27.6"', '    - "openai>=1.55.3,<3"')]
     assert f.edits[0].old == "openai==0.27.6"
 
 
@@ -245,10 +245,10 @@ def test_pyproject_project_optional_and_groups(tmp_path):
     assert changed_lines(f) == [
         (
             "    \"openai==0.28 ; python_version >= '3.8'\",",
-            "    \"openai>=1.55.3,<2 ; python_version >= '3.8'\",",
+            "    \"openai>=1.55.3,<3 ; python_version >= '3.8'\",",
         ),
-        ("ai = ['openai[datalib]<1']", "ai = ['openai[datalib]>=1.55.3,<2']"),
-        ('dev = ["openai==0.27.0", "pytest"]', 'dev = ["openai>=1.55.3,<2", "pytest"]'),
+        ("ai = ['openai[datalib]<1']", "ai = ['openai[datalib]>=1.55.3,<3']"),
+        ('dev = ["openai==0.27.0", "pytest"]', 'dev = ["openai>=1.55.3,<3", "pytest"]'),
     ]
     assert [(e.line, e.old) for e in f.edits] == [
         (5, "openai==0.28"),
@@ -275,12 +275,12 @@ def test_poetry_string_inline_table_and_sub_table(tmp_path):
         """,
     )
     assert changed_lines(f) == [
-        ("openai = '^0.28'", "openai = '>=1.55.3,<2'"),
+        ("openai = '^0.28'", "openai = '>=1.55.3,<3'"),
         (
             'openai = { version = "0.27.8", extras = ["datalib"] }',
-            'openai = { version = ">=1.55.3,<2", extras = ["datalib"] }',
+            'openai = { version = ">=1.55.3,<3", extras = ["datalib"] }',
         ),
-        ('version = "~0.28"', 'version = ">=1.55.3,<2"'),
+        ('version = "~0.28"', 'version = ">=1.55.3,<3"'),
     ]
     assert [e.old for e in f.edits] == [
         "openai = '^0.28'",
@@ -303,8 +303,8 @@ def test_same_version_string_on_another_key_is_not_touched(tmp_path):
         """,
     )
     assert changed_lines(f) == [
-        ('openai = "==0.28"', 'openai = ">=1.55.3,<2"'),
-        ('openai = {version = "==0.28"}', 'openai = {version = ">=1.55.3,<2"}'),
+        ('openai = "==0.28"', 'openai = ">=1.55.3,<3"'),
+        ('openai = {version = "==0.28"}', 'openai = {version = ">=1.55.3,<3"}'),
     ]
 
 
@@ -325,9 +325,9 @@ def test_pixi_tables_targets_and_features(tmp_path):
         """,
     )
     assert [(e.line, e.new) for e in f.edits] == [
-        (2, 'openai = ">=1.55.3,<2"'),
-        (5, 'openai = { version = ">=1.55.3,<2"'),
-        (8, 'openai = ">=1.55.3,<2"'),
+        (2, 'openai = ">=1.55.3,<3"'),
+        (5, 'openai = { version = ">=1.55.3,<3"'),
+        (8, 'openai = ">=1.55.3,<3"'),
         (9, 'typing-extensions = ">=4.11,<5"'),
     ]
 
@@ -341,7 +341,7 @@ def test_pyproject_pixi_with_lockfile_note(tmp_path):
         },
     )
     (f,) = p.files
-    assert f.text == '[tool.pixi.pypi-dependencies]\nopenai = ">=1.55.3,<2"\n'
+    assert f.text == '[tool.pixi.pypi-dependencies]\nopenai = ">=1.55.3,<3"\n'
     assert f.notes == ["not updated: pixi.lock; regenerate it"]
 
 
@@ -377,11 +377,11 @@ def test_setup_py_plain_literals(tmp_path):
     assert changed_lines(f) == [
         (
             """    install_requires=["openai==0.28.1", 'typing-extensions==4.5.0'],""",
-            """    install_requires=["openai>=1.55.3,<2", 'typing-extensions>=4.11,<5'],""",
+            """    install_requires=["openai>=1.55.3,<3", 'typing-extensions>=4.11,<5'],""",
         ),
         (
             """    extras_require={"ai": ["openai<1; python_version>'3.7'"]},""",
-            """    extras_require={"ai": ["openai>=1.55.3,<2; python_version>'3.7'"]},""",
+            """    extras_require={"ai": ["openai>=1.55.3,<3; python_version>'3.7'"]},""",
         ),
     ]
 
@@ -417,8 +417,8 @@ def test_setup_cfg_install_requires_and_extras(tmp_path):
         """,
     )
     assert changed_lines(f) == [
-        ("    openai==0.28.1", "    openai>=1.55.3,<2"),
-        ("ai = openai<1", "ai = openai>=1.55.3,<2"),
+        ("    openai==0.28.1", "    openai>=1.55.3,<3"),
+        ("ai = openai<1", "ai = openai>=1.55.3,<3"),
     ]
 
 
@@ -457,7 +457,7 @@ def test_partial_file_is_sent_whole_in_whole_file_mode(tmp_path):
         (2, "the requirement continues over several lines"),
     ]
     files, _ = p.applied(whole_file=False)
-    assert files[0].text.startswith("openai>=1.55.3,<2\n")
+    assert files[0].text.startswith("openai>=1.55.3,<3\n")
 
 
 def test_write_puts_the_edits_in_the_working_copy(tmp_path):
@@ -465,7 +465,7 @@ def test_write_puts_the_edits_in_the_working_copy(tmp_path):
     work = tmp_path / "work"
     work.mkdir()
     (written,) = p.write(work, whole_file=True)
-    assert (work / "requirements.txt").read_text() == "openai>=1.55.3,<2\n"
+    assert (work / "requirements.txt").read_text() == "openai>=1.55.3,<3\n"
     assert written.path == "requirements.txt"
 
 
@@ -485,62 +485,62 @@ def test_unparseable_file_falls_back(tmp_path):
 @pytest.mark.parametrize(
     ("rel", "content", "old", "new"),
     [
-        ("requirements.txt", "openai\nnumpy\n", "openai", "openai>=1.55.3,<2"),
+        ("requirements.txt", "openai\nnumpy\n", "openai", "openai>=1.55.3,<3"),
         (
             "requirements.txt",
             "openai[datalib] ; python_version < '3.12'  # why\n",
             "openai[datalib] ; python_version < '3.12'  # why",
-            "openai[datalib]>=1.55.3,<2 ; python_version < '3.12'  # why",
+            "openai[datalib]>=1.55.3,<3 ; python_version < '3.12'  # why",
         ),
-        ("requirements.txt", "openai >= 0.27, < 2\n", "openai >= 0.27, < 2", "openai >=1.55.3,<2"),
+        ("requirements.txt", "openai >= 0.27, < 2\n", "openai >= 0.27, < 2", "openai >=1.55.3,<3"),
         (
             "pyproject.toml",
             '[project]\nname = "x"\ndependencies = ["openai", "numpy"]\n',
             'dependencies = ["openai", "numpy"]',
-            'dependencies = ["openai>=1.55.3,<2", "numpy"]',
+            'dependencies = ["openai>=1.55.3,<3", "numpy"]',
         ),
         (
             "pyproject.toml",
             "[tool.poetry.dependencies]\nopenai = '*'\n",
             "openai = '*'",
-            "openai = '>=1.55.3,<2'",
+            "openai = '>=1.55.3,<3'",
         ),
         (
             "pyproject.toml",
             '[tool.poetry.dependencies]\nopenai = {version = "*", extras = ["x"]}\n',
             'openai = {version = "*", extras = ["x"]}',
-            'openai = {version = ">=1.55.3,<2", extras = ["x"]}',
+            'openai = {version = ">=1.55.3,<3", extras = ["x"]}',
         ),
         (
             "pyproject.toml",
             '[tool.poetry.dependencies]\nopenai = "^0.27 || ^1.0"\n',
             'openai = "^0.27 || ^1.0"',
-            'openai = ">=1.55.3,<2"',
+            'openai = ">=1.55.3,<3"',
         ),
-        ("Pipfile", '[packages]\nopenai = "*"\n', 'openai = "*"', 'openai = ">=1.55.3,<2"'),
+        ("Pipfile", '[packages]\nopenai = "*"\n', 'openai = "*"', 'openai = ">=1.55.3,<3"'),
         (
             "pixi.toml",
             '[pypi-dependencies]\nopenai = "*"\n',
             'openai = "*"',
-            'openai = ">=1.55.3,<2"',
+            'openai = ">=1.55.3,<3"',
         ),
         (
             "setup.py",
             'from setuptools import setup\nsetup(install_requires=["openai", "x"])\n',
             'setup(install_requires=["openai", "x"])',
-            'setup(install_requires=["openai>=1.55.3,<2", "x"])',
+            'setup(install_requires=["openai>=1.55.3,<3", "x"])',
         ),
         (
             "setup.cfg",
             "[options]\ninstall_requires =\n    openai\n    numpy\n",
             "    openai",
-            "    openai>=1.55.3,<2",
+            "    openai>=1.55.3,<3",
         ),
         (
             "environment.yml",
             "dependencies:\n  - pip\n  - pip:\n    - openai\n",
             "    - openai",
-            "    - openai>=1.55.3,<2",
+            "    - openai>=1.55.3,<3",
         ),
     ],
 )
@@ -553,7 +553,7 @@ def test_unpinned_and_loose_declarations_get_the_pin(tmp_path, rel, content, old
 
 def test_unpinned_entry_report_line(tmp_path):
     f = one(tmp_path, "requirements.txt", "numpy\nopenai\n")
-    assert [pin_line(e) for e in f.edits] == ["requirements.txt:2 openai -> openai>=1.55.3,<2"]
+    assert [pin_line(e) for e in f.edits] == ["requirements.txt:2 openai -> openai>=1.55.3,<3"]
 
 
 def test_unpinned_project_dependency_with_uv_lock_is_noted_not_edited(tmp_path):
@@ -567,7 +567,7 @@ def test_unpinned_project_dependency_with_uv_lock_is_noted_not_edited(tmp_path):
         },
     )
     (f,) = p.files
-    assert f.text.endswith('dependencies = ["together", "openai>=1.55.3,<2"]\n')
+    assert f.text.endswith('dependencies = ["together", "openai>=1.55.3,<3"]\n')
     assert f.notes == ["not updated: uv.lock; regenerate it"]
     assert (tmp_path / "repo" / "uv.lock").read_text() == lock
 
@@ -592,5 +592,5 @@ def test_unpinned_fixture_gets_the_pin_and_a_lockfile_note():
     ]
     assert any(f.category != "dependency" for f in findings)  # the 0.x calls
     (f,) = plan_pin_edits(root, findings, MIG).files
-    assert changed_lines(f) == [('    "openai",', '    "openai>=1.55.3,<2",')]
+    assert changed_lines(f) == [('    "openai",', '    "openai>=1.55.3,<3",')]
     assert f.complete and f.notes == ["not updated: uv.lock; regenerate it"]

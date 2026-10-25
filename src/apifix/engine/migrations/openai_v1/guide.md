@@ -267,8 +267,9 @@ def test_answer(create):
 <!-- part: dependencies -->
 ## Dependencies
 
-Pin `openai>=1.55.3,<2` wherever openai is declared (requirements files, pyproject.toml, setup.py,
-setup.cfg, Pipfile). Leave other dependencies alone, except exact pins that hold openai back:
-current openai releases need `typing_extensions>=4.11`, and releases before 1.55.3 do not work
-with `httpx>=0.28`. In a fully pinned file, raise such pins (e.g. `typing_extensions==4.5.0`)
-rather than let pip fall back to an old openai.
+Pin `openai>=1.55.3,<3` wherever openai is declared (requirements files, pyproject.toml, setup.py,
+setup.cfg, Pipfile); 2.x keeps the 1.x API used here. Leave other dependencies alone, except exact
+pins that hold openai back: openai 1.55.3 and later need `typing_extensions>=4.11` (recent 2.x
+releases `>=4.14`), and releases before 1.55.3 do not work with `httpx>=0.28`. In a fully pinned
+file, raise such pins (e.g. `typing_extensions==4.5.0`) rather than let pip fall back to an old
+openai.

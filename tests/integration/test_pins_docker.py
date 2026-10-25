@@ -11,7 +11,9 @@ from pathlib import Path
 import pytest
 
 from apifix.engine.agent import AgentConfig, fix
+from apifix.engine.dependencies import allows, pep440_clauses
 from apifix.engine.docker import DockerCLI
+from apifix.engine.migrations.openai_v1 import MIGRATION
 from apifix.engine.sandbox import Sandbox, SandboxConfig, default_pip_cache_dir
 from tests.integration.tiny_repo import make_repo
 from tests.test_agent import FakeLLM
@@ -56,5 +58,7 @@ def test_pin_only_job_is_verified_without_the_model(tmp_path: Path, edit_mode):
     assert result.outcome in ("verified", "verified_weak"), result.report_markdown
     smoke = result.verification.fixed.smoke
     assert smoke is not None and smoke.status == "ok", smoke
-    assert smoke.version is not None and smoke.version.startswith("1.")
+    # a release in the migration's range (2.x on current Pythons), not an old 1.x
+    assert smoke.version is not None
+    assert allows(pep440_clauses(MIGRATION.pin_spec), smoke.version), smoke.version
     assert "+typing_extensions>=4.11,<5" in result.diff

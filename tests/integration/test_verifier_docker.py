@@ -63,7 +63,7 @@ GOOD_TESTS = """\
     """
 
 GOOD_FIX = {
-    "requirements.txt": "openai>=1.55.3,<2\npytest\n",
+    "requirements.txt": "openai>=1.55.3,<3\npytest\n",
     "app.py": GOOD_APP,
     "tests/test_app.py": GOOD_TESTS,
 }

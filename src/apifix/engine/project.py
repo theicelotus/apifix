@@ -532,7 +532,7 @@ class InstallPlan:
     override: str | None = None  # SandboxRequirements.label when a user's file replaced detection
     replaced: tuple[str, ...] = ()  # its lines the fix's declarations replaced ("name: a -> b")
     # its lines for the migrated library that allow the old version, replaced by the target spec
-    # because no edit of the fix changed the library ("openai==0.28.1 -> openai>=1.55.3,<2")
+    # because no edit of the fix changed the library ("openai==0.28.1 -> openai>=1.55.3,<3")
     upgraded: tuple[str, ...] = ()
 
 
@@ -760,8 +760,8 @@ def _filter_pins(
             ):
                 notes.append(
                     f"{lockfile}: {name}=={version} allows none of "
-                    f">={companion.minimum},<{companion.upper}, which current "
-                    f"{target.package} releases need; pin not applied (regenerate {lockfile})"
+                    f">={companion.minimum},<{companion.upper}, which {target.package}"
+                    f"{target.spec} needs; pin not applied (regenerate {lockfile})"
                 )
                 continue
             kept.append(pin)

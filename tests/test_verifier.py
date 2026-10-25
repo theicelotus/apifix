@@ -192,7 +192,7 @@ ORIGINAL = {
 }
 GOOD_FIX = {
     "app.py": APP_NEW,
-    "requirements.txt": "openai>=1.55.3,<2\npytest\n",
+    "requirements.txt": "openai>=1.55.3,<3\npytest\n",
     "tests/test_app.py": TESTS_NEW,
 }
 
@@ -1120,7 +1120,7 @@ def test_verify_passes_the_migrations_library_target_to_the_fixed_run(trees):
     sandbox = FakeSandbox(baseline=PASSING, fixed=[PASSING])
     verify(original, fixed, "openai-v1", sandbox=sandbox)
     assert sandbox.targets == [
-        LibraryTarget("openai", "1.0", ">=1.55.3,<2", dict(openai_rules.COMPANION_PINS))
+        LibraryTarget("openai", "1.0", ">=1.55.3,<3", dict(openai_rules.COMPANION_PINS))
     ]
 
 
@@ -1198,15 +1198,15 @@ def test_report_says_when_the_fixed_run_got_the_target_for_the_users_pin(trees):
     original, fixed = trees({})
     fixed_run = run((T_ASK, "passed"), (T_STRIP, "passed"), coverage=FULL_COVERAGE)
     fixed_run.requirements_override = "--sandbox-requirements suspense-sandbox-reqs.txt"
-    fixed_run.override_upgraded = ["openai==0.28.1 -> openai>=1.55.3,<2"]
+    fixed_run.override_upgraded = ["openai==0.28.1 -> openai>=1.55.3,<3"]
     v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(PASSING, [fixed_run]))
     assert (
         "Fixed run: `openai==0.28.1` from --sandbox-requirements suspense-sandbox-reqs.txt "
-        "replaced by `openai>=1.55.3,<2` (the migration's target; no edit of the fix changed this "
+        "replaced by `openai>=1.55.3,<3` (the migration's target; no edit of the fix changed this "
         "library)." in v.report_markdown()
     )
     summary = v.to_dict()["runs"]["fixed"]
-    assert summary["override_upgraded"] == ["openai==0.28.1 -> openai>=1.55.3,<2"]
+    assert summary["override_upgraded"] == ["openai==0.28.1 -> openai>=1.55.3,<3"]
 
 
 def test_import_paths_are_in_the_report(trees):

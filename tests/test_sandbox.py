@@ -423,7 +423,7 @@ def test_plain_install_failure_is_not_retried(repo):
         # pip's network failure ends in "No matching distribution found" as well
         "WARNING: Retrying (Retry(total=4)) after connection broken by "
         "'NewConnectionError(...)': /simple/openai/\n"
-        "ERROR: No matching distribution found for openai>=1.55.3,<2",
+        "ERROR: No matching distribution found for openai>=1.55.3,<3",
         "ERROR: HTTP error 503 while getting https://files.pythonhosted.org/...",
         "Killed",  # no recognised marker: the cause is unknown, so it may be transient
     ],
@@ -814,7 +814,7 @@ def test_smoke_pins_record_where_they_are_declared(flat_service):
 
 
 LOCKED_PROJECT = {
-    "pyproject.toml": '[tool.poetry.dependencies]\nopenai = ">=1.55.3,<2"\n',
+    "pyproject.toml": '[tool.poetry.dependencies]\nopenai = ">=1.55.3,<3"\n',
     "poetry.lock": '[[package]]\nname = "tqdm"\nversion = "4.65.0"\n',
     "tests/test_a.py": "def test_x():\n    assert True\n",
 }
@@ -862,11 +862,11 @@ def test_fixed_run_with_sandbox_requirements_gets_the_target_for_an_old_library_
     (fixed / "svc" / "server.py").write_text("def reply():\n    return 2\n")
     docker = FakeDocker(test=pytest_run(passed=1))
     sandbox = Sandbox(SandboxConfig(requirements_override=override), docker=docker)
-    target = LibraryTarget("openai", "1.0", ">=1.55.3,<2")
+    target = LibraryTarget("openai", "1.0", ">=1.55.3,<3")
     result = sandbox.run(fixed, original=flat_service, target=target)
-    assert result.override_upgraded == ["openai==0.28.1 -> openai>=1.55.3,<2"]
+    assert result.override_upgraded == ["openai==0.28.1 -> openai>=1.55.3,<3"]
     (manifest,) = docker.requirements
-    assert "openai>=1.55.3,<2\n" in manifest and "openai==0.28.1" not in manifest
+    assert "openai>=1.55.3,<3\n" in manifest and "openai==0.28.1" not in manifest
     # without `original` (the baseline) the user's line stays
     docker = FakeDocker(test=pytest_run(passed=1))
     sandbox = Sandbox(SandboxConfig(requirements_override=override), docker=docker)

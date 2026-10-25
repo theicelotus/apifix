@@ -236,7 +236,12 @@ FIRST_V1 = "1.0"
 # httpx below 0.28, so a resolution held back below 1.55.3 (by a lockfile, a companion pin, an
 # old environment) installs a client whose OpenAI() raises TypeError. 1.55.3 has every 1.x API
 # the migration writes and needs Python >= 3.8. FIRST_V1 stays the first release of the API.
-PIN_SPEC = ">=1.55.3,<2"
+# The upper bound allows 2.x: 2.0's only breaking change is the type of function tool-call
+# outputs in the Responses API (`ResponseFunctionToolCallOutputItem.output` may be a list),
+# which 0.x code never used, so migrated code runs unchanged; 2.x needs Python >= 3.9 from
+# 2.7.2 and >= 3.10 from 2.49.0 (pip picks an older release for older Pythons). 3.0
+# (2026-08-12) replaced httpx with httpx2 and is not allowed.
+PIN_SPEC = ">=1.55.3,<3"
 DEPENDENCY = f"Pin openai>=1.0 (e.g. openai{PIN_SPEC}) and migrate call sites"
 # a declaration that allows 0.x and 1.x alike: pip alone picks a new release, but a lockfile,
 # constraints file or existing environment can hold 0.x
@@ -245,12 +250,14 @@ LOOSE_DEPENDENCY = (
     "0.x, which the migrated code cannot use"
 )
 
-# openai's own requirements, from the metadata of 1.109.1 (the last release before 2.0; PyPI,
-# checked 2026-10-22). openai 1.0 accepted typing-extensions>=4.5, so an exact older pin makes
-# pip fall back to an old 1.x, which breaks on httpx>=0.28. In files where apifix sets the
-# openai pin, a pin of one of these that allows none of the range is raised to it. pydantic
-# keeps the repo's major version (v1 code stays on v1). sniffio and tqdm are left out: no
-# realistic pin excludes what openai needs.
+# openai's own requirements, the loosest across PIN_SPEC: every release from 1.55.3 to 2.54.0
+# (the last before 3.0) has these upper bounds, and 1.55.3 these minimums (PyPI metadata,
+# checked 2026-10-25; later 2.x raise typing-extensions to >=4.14 and jiter to >=0.10, so a pin
+# between the two gets an older release in the range, which still works). openai 1.0 accepted
+# typing-extensions>=4.5, so an exact older pin makes pip fall back to an old 1.x, which breaks
+# on httpx>=0.28. In files where apifix sets the openai pin, a pin of one of these that allows
+# none of the range is raised to it. pydantic keeps the repo's major version (v1 code stays on
+# v1). sniffio and tqdm are left out: no realistic pin excludes what openai needs.
 COMPANION_PINS: dict[str, CompanionPin] = {
     "typing-extensions": CompanionPin("4.11", "5"),
     "anyio": CompanionPin("3.5", "5"),
@@ -304,16 +311,19 @@ CLIENT_KEY = ClientKey(
     classes=frozenset({"OpenAI", "AsyncOpenAI"}),
     resources="resources",
 )
-# A client's resources, cached properties of the class (openai 1.109.1): a client patched with
-# autospec=True has none of them usable (code_checks.autospec_client_problems).
+# A client's resources, cached properties of the class (openai 1.109.1 and 2.54.0, which added
+# admin, content_provenance_checks, skills and videos): a client patched with autospec=True has
+# none of them usable (code_checks.autospec_client_problems).
 CLIENT_RESOURCES = frozenset(
     {
+        "admin",
         "audio",
         "batches",
         "beta",
         "chat",
         "completions",
         "containers",
+        "content_provenance_checks",
         "conversations",
         "embeddings",
         "evals",
@@ -324,8 +334,10 @@ CLIENT_RESOURCES = frozenset(
         "moderations",
         "realtime",
         "responses",
+        "skills",
         "uploads",
         "vector_stores",
+        "videos",
         "webhooks",
         "with_raw_response",
         "with_streaming_response",

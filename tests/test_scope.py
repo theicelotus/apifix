@@ -81,7 +81,7 @@ openai = "==0.28"
 
 
 def test_pixi_pypi_dependency_edits_are_not_tooling_changes():
-    new = PIXI.replace('"==0.28"', '">=1.55.3,<2"').replace('"<0.28"', '">=0.27"')
+    new = PIXI.replace('"==0.28"', '">=1.55.3,<3"').replace('"<0.28"', '">=0.27"')
     assert tooling_change("pyproject.toml", PIXI, new) is None
 
 

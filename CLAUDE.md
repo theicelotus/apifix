@@ -220,7 +220,7 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   part `client.config` is selected by a "Never drop" / "never drop it" suggestion.
 
 - Dependency findings (openai-v1): a declaration that allows nothing from 1.0 on is [certain];
-  one that allows 0.x and 1.x (no version, `*`, `>=0.27`, `<2`, `!=x`, Poetry `||` ranges,
+  one that allows 0.x and 1.x (no version, `*`, `>=0.27`, `<3`, `!=x`, Poetry `||` ranges,
   which read as unconstrained) is [likely], also in a repo whose code is already on 1.x.
   Direct references (`name @ url`, git/path/url tables: `DeclaredDependency.direct`) are never
   flagged.
@@ -590,9 +590,10 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
 
 - `pin_edits.py` runs once per `fix` job, before attempt 1, on the working copy (the baseline
   uses the original). It edits the entries the migration's `check_dependency` flags, writing
-  `Migration.pin_spec` (openai-v1: `>=1.55.3,<2`: releases before 1.55.3 break with httpx
-  0.28). Only the version spec changes; spacing inside the old spec is not kept (`>= 0.27,
-  < 0.28` becomes `>=1.55.3,<2`).
+  `Migration.pin_spec` (openai-v1: `>=1.55.3,<3`: releases before 1.55.3 break with httpx
+  0.28; 2.x keeps the 1.x API apart from Responses API tool-call output types, which 0.x code
+  never used; 3.0 moved to httpx2). Only the version spec changes; spacing inside the old
+  spec is not kept (`>= 0.27, < 0.28` becomes `>=1.55.3,<3`).
 - Each format has its own locator (never the parser's first-occurrence `_locate`): requirements
   and environment.yml lines, TOML string literals found by trial edit (the decoded document may
   change at exactly the entry's path), setup.py AST constants (plain one-line literals only),
@@ -607,10 +608,13 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   one is not retried (no one in the job may change it). In agent mode the model is told to
   leave them.
 - Companion pins (`Migration.companion_pins`, openai-v1: typing-extensions, anyio, httpx,
-  pydantic, distro, jiter from openai 1.109.1's metadata): only in files where apifix sets the
-  library's pin, only pins that allow none of the needed range (exact pins outside it, ranges
-  entirely below it, lower bounds at or above its upper bound). Replaced with the library's
-  range for that package; pydantic keeps the pin's major version (`>=1.9,<2` or `>=2,<3`).
+  pydantic, distro, jiter: the loosest range across 1.55.3-2.54.0, i.e. 1.55.3's minimums;
+  every release there has the same upper bounds; later 2.x need typing-extensions>=4.14 and
+  jiter>=0.10, and pip falls back to an older release in the range): only in files where
+  apifix sets the library's pin, only pins that allow none of the needed range (exact pins
+  outside it, ranges entirely below it, lower bounds at or above its upper bound). Replaced
+  with the library's range for that package; pydantic keeps the pin's major version
+  (`>=1.9,<2` or `>=2,<3`).
   Packages further down the tree are not raised (an exact `httpcore` pin can then clash with
   the raised httpx: an install failure, resent to the model).
 - Never edited: conda entries (the report notes companion conda entries that hold the library

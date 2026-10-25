@@ -60,7 +60,7 @@ class PinEdit:
     file: str
     line: int
     old: str  # the entry's source text before the edit, e.g. `openai==0.27.6`
-    new: str  # ... and after, e.g. `openai>=1.55.3,<2`
+    new: str  # ... and after, e.g. `openai>=1.55.3,<3`
     kind: EditKind
     why: str = ""  # companion edits: what the migrated library needs
 
@@ -150,7 +150,7 @@ def plan_pin_edits(root: Path, findings: list[Finding], migration: Migration) ->
 
 
 def pin_line(edit: PinEdit) -> str:
-    """`environment.yml:158 openai==0.27.6 -> openai>=1.55.3,<2` (plus why, for companions)."""
+    """`environment.yml:158 openai==0.27.6 -> openai>=1.55.3,<3` (plus why, for companions)."""
     why = f" ({edit.why})" if edit.why else ""
     return f"{edit.file}:{edit.line} {edit.old} -> {edit.new}{why}"
 

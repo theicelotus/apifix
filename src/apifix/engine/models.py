@@ -52,7 +52,7 @@ class ClientKey:
 @dataclass(frozen=True)
 class LibraryTarget:
     """The migrated library and the version a fix needs (from the migration): `package`, its
-    first version with the new API, the spec apifix writes for it (`>=1.55.3,<2`), and what
+    first version with the new API, the spec apifix writes for it (`>=1.55.3,<3`), and what
     it needs from its own requirements (`companions`: lockfile pins that allow none of a
     companion's range are not applied in the fixed run)."""
 
