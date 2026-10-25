@@ -346,6 +346,7 @@ their code, the diff and the trajectory are copied here only when the repo's lic
 | 2026-10-23 | [biobootloader/wolverine](https://github.com/biobootloader/wolverine) | `openai/gpt-oss-120b` (hosted free tier, $0) | whole-file | hosted | 1 | 153 s | 17,571 | verified | [folder](benchmark/live/2026-10-23-wolverine-gptoss/) |
 | 2026-10-23 | [openai/bugbounty-gpt](https://github.com/openai/bugbounty-gpt) | `openai/gpt-oss-120b` (hosted free tier, $0) | whole-file | hosted | 1 | 317 s | 13,972 | verified | [folder](benchmark/live/2026-10-23-bugbounty-gpt-gptoss/) |
 | 2026-10-24 | [rgbkrk/genai](https://github.com/rgbkrk/genai) | `openai/gpt-oss-120b` (hosted free tier, $0) | whole-file | hosted | 1 | 579 s | 43,599 | verified | [folder](benchmark/live/2026-10-24-genai-gptoss/) |
+| 2026-10-25 | [stoyan-stoyanov/llmflows](https://github.com/stoyan-stoyanov/llmflows) | `openai/gpt-oss-120b` (hosted free tier, $0) | whole-file | hosted | 1 | 411 s | 51,095 | verified_weak | [folder](benchmark/live/2026-10-25-llmflows-gptoss/) |
 
 2026-10-22: a Flask app on openai 0.28.1, CRLF line endings, tests in `backend/testapp.py`.
 Time: LLM 57 s, sandbox 82 s with the pip cache warm. All 8 findings resolved, 100%
@@ -392,6 +393,17 @@ resolved: 23 in 5 Python files, plus the pin. Two test files over 8 KB were sent
 streaming code checks `delta.content is not None`. apifix set the Poetry pin
 `openai = "^0.27.0"` -> `">=1.55.3,<2"` itself, noted `poetry.lock` for regenerating, and
 reverted two stray comment edits the model made.
+
+2026-10-25 (llmflows): an MIT-licensed framework for LLM apps pinned to openai 0.28.1, with
+sync, async and Azure classes for completions, chat and embeddings. This repo drove the
+whole-file completeness check ([plan](docs/plans/llmflows-run-4-check.md)). Time: LLM 295 s,
+sandbox 108 s. 46 tests pass before and after the fix; 1 Claude test was already failing, so it
+counts as no signal. 87 of 90 findings are resolved, but the tests run only 36% of the changed
+lines: none calls the Azure classes or the async methods. A test file the server refused as a
+whole file was sent as regions. apifix set `openai==0.28.1` -> `openai>=1.55.3,<3` in
+`pyproject.toml` and `requirements.txt` itself and reverted three stray test edits the model made.
+Review notes, including a retry behavior change, are in the
+[folder README](benchmark/live/2026-10-25-llmflows-gptoss/README.md).
 
 `verified_weak` means the tests pass but do not exercise the migrated code, so the fix still
 needs a human review.

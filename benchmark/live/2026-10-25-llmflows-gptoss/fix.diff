@@ -1,0 +1,595 @@
+diff --git a/llmflows/llms/azure_openai.py b/llmflows/llms/azure_openai.py
+--- a/llmflows/llms/azure_openai.py
++++ b/llmflows/llms/azure_openai.py
+@@ -6,12 +6,14 @@
+ """
+ 
+ import openai
+-from openai.error import (
++from openai import (
+     APIError,
+-    Timeout,
++    APITimeoutError,
+     RateLimitError,
+     APIConnectionError,
+-    ServiceUnavailableError,
++    InternalServerError,
++    AzureOpenAI,
++    AsyncAzureOpenAI,
+ )
+ from .llm import BaseLLM
+ from .llm_utils import call_with_retry, async_call_with_retry
+@@ -68,10 +70,7 @@
+         if not self._azure_openai_endpoint:
+             raise ValueError("You must provide Azure OpenAI endpoint")
+ 
+-        openai.api_key = self._api_key
+-        openai.api_base = self._azure_openai_endpoint
+-        openai.api_type = "azure"
+-        openai.api_version = azure_api_version
++        self._azure_api_version = azure_api_version
+ 
+     def _format_results(self, model_outputs, retries) -> tuple[str, dict, dict]:
+         """
+@@ -85,7 +84,8 @@
+             A tuple containing the generated text, the raw response data, and the
+                 model configuration.
+         """
+-        text_result = model_outputs.choices[0]["text"]
++        # In OpenAI 1.x the response object uses attribute access.
++        text_result = model_outputs.choices[0].text
+ 
+         call_data = {
+             "raw_outputs": model_outputs,
+@@ -115,18 +115,24 @@
+         if not isinstance(prompt, str):
+             raise TypeError("Prompt must be a string")
+ 
++        # Build an Azure OpenAI client for this call.
++        client = AzureOpenAI(
++            azure_endpoint=self._azure_openai_endpoint,
++            api_version=self._azure_api_version,
++            api_key=self._api_key,
++        )
++
+         completion, retries = call_with_retry(
+-            func=openai.Completion.create,
++            func=client.completions.create,
+             exceptions_to_retry=(
+                 APIError,
+-                Timeout,
++                APITimeoutError,
+                 RateLimitError,
+                 APIConnectionError,
+-                ServiceUnavailableError,
++                InternalServerError,
+             ),
+-            engine=self._engine,
+             max_retries=self.max_retries,
+-            model=self.model,
++            model=self._engine,
+             prompt=prompt,
+             max_tokens=self.max_tokens,
+             temperature=self.temperature,
+@@ -149,18 +155,24 @@
+         if not isinstance(prompt, str):
+             raise TypeError("Prompt must be a string")
+ 
++        # Build an async Azure OpenAI client for this call.
++        async_client = AsyncAzureOpenAI(
++            azure_endpoint=self._azure_openai_endpoint,
++            api_version=self._azure_api_version,
++            api_key=self._api_key,
++        )
++
+         completion, retries = await async_call_with_retry(
+-            async_func=openai.Completion.acreate,
++            async_func=async_client.completions.create,
+             exceptions_to_retry=(
+                 APIError,
+-                Timeout,
++                APITimeoutError,
+                 RateLimitError,
+                 APIConnectionError,
+-                ServiceUnavailableError,
++                InternalServerError,
+             ),
+-            engine=self._engine,
+             max_retries=self.max_retries,
+-            model=self.model,
++            model=self._engine,
+             prompt=prompt,
+             max_tokens=self.max_tokens,
+             temperature=self.temperature,
+diff --git a/llmflows/llms/azure_openai_chat.py b/llmflows/llms/azure_openai_chat.py
+--- a/llmflows/llms/azure_openai_chat.py
++++ b/llmflows/llms/azure_openai_chat.py
+@@ -4,13 +4,14 @@
+ base class.
+ """
+ 
+-import openai
+-from openai.error import (
++from openai import (
++    AzureOpenAI,
++    AsyncAzureOpenAI,
+     APIError,
+-    Timeout,
++    APITimeoutError,
+     RateLimitError,
+     APIConnectionError,
+-    ServiceUnavailableError,
++    InternalServerError,
+ )
+ from llmflows.llms.chat_llm import BaseChatLLM
+ from llmflows.llms.llm_utils import call_with_retry, async_call_with_retry
+@@ -71,10 +72,7 @@
+         if not self._azure_openai_endpoint:
+             raise ValueError("You must provide Azure OpenAI endpoint")
+ 
+-        openai.api_key = self._api_key
+-        openai.api_base = self._azure_openai_endpoint
+-        openai.api_type = "azure"
+-        openai.api_version = azure_api_version
++        self._azure_api_version = azure_api_version
+ 
+     def _format_results(
+         self, model_outputs, retries, message_history
+@@ -90,7 +88,8 @@
+             tuple(str, dict, dict): Formatted output text, raw outputs, and model
+                 configuration.
+         """
+-        text_result = model_outputs.choices[0]["message"]["content"]
++        # Access the content using attribute access as returned by OpenAI 1.x
++        text_result = model_outputs.choices[0].message.content
+ 
+         call_data = {
+             "raw_outputs": model_outputs,
+@@ -116,18 +115,23 @@
+                 configuration.
+         """
+ 
++        client = AzureOpenAI(
++            azure_endpoint=self._azure_openai_endpoint,
++            api_version=self._azure_api_version,
++            api_key=self._api_key,
++        )
++
+         completion, retries = call_with_retry(
+-            func=openai.ChatCompletion.create,
++            func=client.chat.completions.create,
+             exceptions_to_retry=(
+                 APIError,
+-                Timeout,
++                APITimeoutError,
+                 RateLimitError,
+                 APIConnectionError,
+-                ServiceUnavailableError,
++                InternalServerError,
+             ),
+-            engine=self._deployment,
+             max_retries=self.max_retries,
+-            model=self.model,
++            model=self._deployment,
+             messages=message_history.messages,
+             max_tokens=self.max_tokens,
+             temperature=self.temperature,
+@@ -151,18 +155,23 @@
+                 configuration.
+         """
+ 
++        client = AsyncAzureOpenAI(
++            azure_endpoint=self._azure_openai_endpoint,
++            api_version=self._azure_api_version,
++            api_key=self._api_key,
++        )
++
+         completion, retries = await async_call_with_retry(
+-            async_func=openai.ChatCompletion.acreate,
++            async_func=client.chat.completions.create,
+             exceptions_to_retry=(
+                 APIError,
+-                Timeout,
++                APITimeoutError,
+                 RateLimitError,
+                 APIConnectionError,
+-                ServiceUnavailableError,
++                InternalServerError,
+             ),
+-            engine=self._deployment,
+             max_retries=self.max_retries,
+-            model=self.model,
++            model=self._deployment,
+             messages=message_history.messages,
+             max_tokens=self.max_tokens,
+             temperature=self.temperature,
+diff --git a/llmflows/llms/openai.py b/llmflows/llms/openai.py
+--- a/llmflows/llms/openai.py
++++ b/llmflows/llms/openai.py
+@@ -6,12 +6,13 @@
+ """
+ 
+ import openai
+-from openai.error import (
++from openai import (
+     APIError,
+-    Timeout,
++    APITimeoutError,
+     RateLimitError,
+     APIConnectionError,
+-    ServiceUnavailableError,
++    InternalServerError,
++    AsyncOpenAI,
+ )
+ from .llm import BaseLLM
+ from .llm_utils import call_with_retry, async_call_with_retry
+@@ -67,7 +68,8 @@
+             A tuple containing the generated text, the raw response data, and the
+                 model configuration.
+         """
+-        text_result = model_outputs.choices[0]["text"]
++        # 1.x responses are objects, not dicts.
++        text_result = model_outputs.choices[0].text
+ 
+         call_data = {
+             "raw_outputs": model_outputs,
+@@ -98,13 +100,13 @@
+             raise TypeError("Prompt must be a string")
+ 
+         completion, retries = call_with_retry(
+-            func=openai.Completion.create,
++            func=openai.completions.create,
+             exceptions_to_retry=(
+                 APIError,
+-                Timeout,
++                APITimeoutError,
+                 RateLimitError,
+                 APIConnectionError,
+-                ServiceUnavailableError,
++                InternalServerError,
+             ),
+             max_retries=self.max_retries,
+             model=self.model,
+@@ -130,14 +132,18 @@
+         if not isinstance(prompt, str):
+             raise TypeError("Prompt must be a string")
+ 
++        # Create an async client; pass the API key explicitly because the async
++        # client does not read from `openai.api_key`.
++        async_client = AsyncOpenAI(api_key=self._api_key)
++
+         completion, retries = await async_call_with_retry(
+-            async_func=openai.Completion.acreate,
++            async_func=async_client.completions.create,
+             exceptions_to_retry=(
+                 APIError,
+-                Timeout,
++                APITimeoutError,
+                 RateLimitError,
+                 APIConnectionError,
+-                ServiceUnavailableError,
++                InternalServerError,
+             ),
+             max_retries=self.max_retries,
+             model=self.model,
+diff --git a/llmflows/llms/openai_chat.py b/llmflows/llms/openai_chat.py
+--- a/llmflows/llms/openai_chat.py
++++ b/llmflows/llms/openai_chat.py
+@@ -5,12 +5,13 @@
+ """
+ 
+ import openai
+-from openai.error import (
++from openai import (
+     APIError,
+-    Timeout,
++    APITimeoutError,
+     RateLimitError,
+     APIConnectionError,
+-    ServiceUnavailableError,
++    InternalServerError,
++    AsyncOpenAI,
+ )
+ from llmflows.llms.chat_llm import BaseChatLLM
+ from llmflows.llms.llm_utils import call_with_retry, async_call_with_retry
+@@ -76,7 +77,8 @@
+             tuple(str, dict, dict): Formatted output text, raw outputs, and model
+                 configuration.
+         """
+-        text_result = model_outputs.choices[0]["message"]["content"]
++        # Updated for OpenAI 1.x response objects
++        text_result = model_outputs.choices[0].message.content
+ 
+         call_data = {
+             "raw_outputs": model_outputs,
+@@ -103,13 +105,13 @@
+         """
+ 
+         completion, retries = call_with_retry(
+-            func=openai.ChatCompletion.create,
++            func=openai.chat.completions.create,
+             exceptions_to_retry=(
+                 APIError,
+-                Timeout,
++                APITimeoutError,
+                 RateLimitError,
+                 APIConnectionError,
+-                ServiceUnavailableError,
++                InternalServerError,
+             ),
+             max_retries=self.max_retries,
+             model=self.model,
+@@ -136,14 +138,18 @@
+                 configuration.
+         """
+ 
++        async def _acreate_async(**kwargs):
++            client = AsyncOpenAI(api_key=self._api_key)
++            return await client.chat.completions.create(**kwargs)
++
+         completion, retries = await async_call_with_retry(
+-            async_func=openai.ChatCompletion.acreate,
++            async_func=_acreate_async,
+             exceptions_to_retry=(
+                 APIError,
+-                Timeout,
++                APITimeoutError,
+                 RateLimitError,
+                 APIConnectionError,
+-                ServiceUnavailableError,
++                InternalServerError,
+             ),
+             max_retries=self.max_retries,
+             model=self.model,
+diff --git a/llmflows/llms/openai_embeddings.py b/llmflows/llms/openai_embeddings.py
+--- a/llmflows/llms/openai_embeddings.py
++++ b/llmflows/llms/openai_embeddings.py
+@@ -6,12 +6,12 @@
+ 
+ from typing import Union
+ import openai
+-from openai.error import (
++from openai import (
+     APIError,
+-    Timeout,
++    APITimeoutError,
+     RateLimitError,
+     APIConnectionError,
+-    ServiceUnavailableError,
++    InternalServerError,
+ )
+ from llmflows.vectorstores.vector_doc import VectorDoc
+ from llmflows.llms.llm_utils import call_with_retry, async_call_with_retry
+@@ -74,21 +74,21 @@
+         texts = [doc.doc for doc in docs]
+ 
+         result, _ = call_with_retry(
+-            func=openai.Embedding.create,
++            func=openai.embeddings.create,
+             exceptions_to_retry=(
+                 APIError,
+-                Timeout,
++                APITimeoutError,
+                 RateLimitError,
+                 APIConnectionError,
+-                ServiceUnavailableError,
++                InternalServerError,
+             ),
+-            engine=self.model,
++            model=self.model,
+             input=texts,
+             max_retries=self.max_retries,
+         )
+ 
+         for i, doc in enumerate(docs):
+-            doc.embedding = result["data"][i]["embedding"]
++            doc.embedding = result.data[i].embedding
+ 
+         return docs[0] if single_item else docs
+ 
+@@ -114,21 +114,24 @@
+ 
+         texts = [doc.doc for doc in docs]
+ 
++        # Create an async client with the provided API key
++        async_client = openai.AsyncOpenAI(api_key=self._api_key)
++
+         result, _ = await async_call_with_retry(
+-            async_func=openai.Embedding.acreate,
++            async_func=async_client.embeddings.create,
+             exceptions_to_retry=(
+                 APIError,
+-                Timeout,
++                APITimeoutError,
+                 RateLimitError,
+                 APIConnectionError,
+-                ServiceUnavailableError,
++                InternalServerError,
+             ),
+-            engine=self.model,
++            model=self.model,
+             input=texts,
+             max_retries=self.max_retries,
+         )
+ 
+         for i, doc in enumerate(docs):
+-            doc.embedding = result["data"][i]["embedding"]
++            doc.embedding = result.data[i].embedding
+ 
+         return docs[0] if single_item else docs
+diff --git a/pyproject.toml b/pyproject.toml
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -19,7 +19,7 @@
+ dependencies = [
+     "anthropic==0.3.11",
+     "aiohttp",
+-    "openai==0.28.1",
++    "openai>=1.55.3,<3",
+     "tiktoken==0.5.1",
+     "pinecone-client==2.2.4",
+     "urllib3==1.26.17",
+diff --git a/requirements.txt b/requirements.txt
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,4 +1,4 @@
+-openai==0.28.1
++openai>=1.55.3,<3
+ anthropic==0.3.11
+ tiktoken==0.3.3
+ black==23.3.0
+diff --git a/tests/llms/test_openai.py b/tests/llms/test_openai.py
+--- a/tests/llms/test_openai.py
++++ b/tests/llms/test_openai.py
+@@ -7,6 +7,7 @@
+ import openai
+ import pytest
+ from llmflows.llms import OpenAI
++from types import SimpleNamespace
+ 
+ 
+ class TestOpenAI(unittest.TestCase):
+@@ -36,11 +37,11 @@
+                 api_key=None,
+             )
+ 
+-    @patch("openai.Completion.create", autospec=True)
++    @patch("openai.completions.create", autospec=True)
+     def test_generate(self, mock_openai_completion_create):
+         # Define the mock return value
+         mock_output = MagicMock()
+-        mock_output.choices = [{"text": "test_text"}]
++        mock_output.choices = [SimpleNamespace(text="test_text")]
+         mock_openai_completion_create.return_value = mock_output
+ 
+         # Call the generate method
+@@ -66,7 +67,7 @@
+     def test_format_results(self):
+         # Mock the model_outputs and retries arguments
+         model_outputs = MagicMock()
+-        model_outputs.choices = [{"text": "test_text"}]
++        model_outputs.choices = [SimpleNamespace(text="test_text")]
+         retries = 0
+ 
+         # Call the format_results method
+diff --git a/tests/llms/test_openai_chat.py b/tests/llms/test_openai_chat.py
+--- a/tests/llms/test_openai_chat.py
++++ b/tests/llms/test_openai_chat.py
+@@ -4,6 +4,7 @@
+ import asyncio
+ import unittest
+ from unittest.mock import MagicMock, patch
++from types import SimpleNamespace
+ import openai
+ from llmflows.llms import OpenAIChat, MessageHistory
+ 
+@@ -30,7 +31,9 @@
+     def tes_format_results(self):
+         # Mock the model_outputs and retries arguments
+         model_outputs = MagicMock()
+-        model_outputs.choices = [{"message": {"content": "test_text"}}]
++        model_outputs.choices = [
++            SimpleNamespace(message=SimpleNamespace(content="test_text"))
++        ]
+         retries = 0
+ 
+         mh = MessageHistory()
+@@ -49,12 +52,12 @@
+         self.assertEqual(config["temperature"], 0.7)
+         self.assertEqual(config["max_tokens"], 250)
+ 
+-    @patch("openai.ChatCompletion.create", autospec=True)
++    @patch("openai.chat.completions.create")
+     def test_generate(self, mock_openai_chatcompletion_create):
+         # Define the mock return value
+         mock_output = MagicMock()
+         mock_output.choices = [
+-            {"message": {"role": "assistant", "content": "test_text"}}
++            SimpleNamespace(message=SimpleNamespace(role="assistant", content="test_text"))
+         ]
+         mock_openai_chatcompletion_create.return_value = mock_output
+ 
+diff --git a/tests/llms/test_openai_embeddings.py b/tests/llms/test_openai_embeddings.py
+--- a/tests/llms/test_openai_embeddings.py
++++ b/tests/llms/test_openai_embeddings.py
+@@ -3,7 +3,9 @@
+ import os
+ import asyncio
+ import unittest
+-from unittest.mock import MagicMock, patch
++from unittest.mock import patch
++from types import SimpleNamespace
++
+ from llmflows.llms import OpenAIEmbeddings
+ from llmflows.vectorstores.vector_doc import VectorDoc
+ 
+@@ -18,11 +20,13 @@
+         self.assertEqual(self.llm.model, "test_model")
+         self.assertEqual(self.llm.max_retries, 3)
+ 
+-    @patch("openai.Embedding.create", autospec=True)
+-    def test_generate_single_doc(self, mock_openai_embedding_create):
+-        # Define the mock return value
+-        mock_output = {"data": [{"embedding": "test_embedding"}]}
+-        mock_openai_embedding_create.return_value = mock_output
++    @patch("openai.embeddings.create", autospec=True)
++    def test_generate_single_doc(self, mock_openai_embeddings_create):
++        # Define the mock return value as an object with attribute access
++        mock_output = SimpleNamespace(
++            data=[SimpleNamespace(embedding="test_embedding")]
++        )
++        mock_openai_embeddings_create.return_value = mock_output
+ 
+         # Prepare a VectorDoc
+         doc = VectorDoc(doc="test_doc")
+@@ -30,25 +34,25 @@
+         # Call the generate method
+         result_doc = self.llm.generate(doc)
+ 
+-        # Check that openai.Embedding.create was called with the right arguments
+-        mock_openai_embedding_create.assert_called_once_with(
+-            engine="test_model",
++        # Check that openai.embeddings.create was called with the right arguments
++        mock_openai_embeddings_create.assert_called_once_with(
++            model="test_model",
+             input=["test_doc"],
+         )
+ 
+         # Assert that the method returned the expected output
+         self.assertEqual(result_doc.embedding, "test_embedding")
+ 
+-    @patch("openai.Embedding.create", autospec=True)
+-    def test_generate_multiple_docs(self, mock_openai_embedding_create):
+-        # Define the mock return value
+-        mock_output = {
+-            "data": [
+-                {"embedding": "test_embedding_1"},
+-                {"embedding": "test_embedding_2"},
++    @patch("openai.embeddings.create", autospec=True)
++    def test_generate_multiple_docs(self, mock_openai_embeddings_create):
++        # Define the mock return value as an object with attribute access
++        mock_output = SimpleNamespace(
++            data=[
++                SimpleNamespace(embedding="test_embedding_1"),
++                SimpleNamespace(embedding="test_embedding_2"),
+             ]
+-        }
+-        mock_openai_embedding_create.return_value = mock_output
++        )
++        mock_openai_embeddings_create.return_value = mock_output
+ 
+         # Prepare VectorDocs
+         docs = [VectorDoc(doc="test_doc_1"), VectorDoc(doc="test_doc_2")]
+@@ -56,9 +60,9 @@
+         # Call the generate method
+         result_docs = self.llm.generate(docs)
+ 
+-        # Check that openai.Embedding.create was called with the right arguments
+-        mock_openai_embedding_create.assert_called_once_with(
+-            engine="test_model",
++        # Check that openai.embeddings.create was called with the right arguments
++        mock_openai_embeddings_create.assert_called_once_with(
++            model="test_model",
+             input=["test_doc_1", "test_doc_2"],
+         )
+ 
