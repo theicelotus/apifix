@@ -19,7 +19,7 @@ The candidate is compared with the original line by line (the same diff as
 After the reverts, every string constant of the original must still be in the candidate (as a
 multiset over the whole file), except strings on a finding's lines (mock targets, removed
 config values), the keys of a 0.x-shaped mock response dict, and keys that became attribute
-or keyword names. Pure and stdlib only; the rule and its limits are in CLAUDE.md.
+or keyword names. Pure and stdlib only; the rule and its limits are in docs/notes.md.
 """
 
 from __future__ import annotations

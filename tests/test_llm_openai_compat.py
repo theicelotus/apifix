@@ -999,7 +999,7 @@ def test_docs_and_error_suggest_the_same_models():
     root = Path(__file__).parent.parent
     suggested = re.findall(r"(?:qwen2\.5-coder|llama3\.3):\d+b", MODEL_SUGGESTIONS)
     assert len(suggested) == 4
-    for doc in ("README.md", "CLAUDE.md"):
+    for doc in ("README.md", "docs/notes.md"):
         text = (root / doc).read_text()
         assert all(f"`{m}`" in text for m in suggested), doc
 

@@ -2,7 +2,7 @@
 
 Every name is resolved through the file's imports to a canonical dotted path
 (``oa.ChatCompletion.create`` -> ``openai.ChatCompletion.create``), so only things that really
-come from ``openai`` are reported. Limitations are listed in CLAUDE.md.
+come from ``openai`` are reported. Limitations are listed in docs/notes.md.
 """
 
 from __future__ import annotations

@@ -1,1 +1,1 @@
-"""FastAPI service. Not built yet (see CLAUDE.md, "Later")."""
+"""FastAPI service. Not built yet (see docs/notes.md, "Later")."""
