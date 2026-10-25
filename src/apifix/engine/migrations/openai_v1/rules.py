@@ -222,11 +222,29 @@ INVALID_REQUEST_NOTE = (
     "1.x splits this by HTTP status (BadRequestError, NotFoundError, UnprocessableEntityError, "
     "ConflictError); except blocks may need several classes, or openai.APIStatusError"
 )
+APIERROR_NOTE = (
+    "0.x APIError was a sibling of RateLimitError, InvalidRequestError etc. (5xx other than "
+    "503, unmapped statuses, stream errors); 1.x APIError is the base class of every API "
+    "error, 4xx included"
+)
+# A name for APIError in an except type or a tuple/list/set literal (python_checks).
+CATCH_APIERROR = (
+    "1.x openai.APIError also catches 4xx errors (BadRequestError, AuthenticationError, ...), "
+    "which 0.x APIError did not: the closest 1.x class is openai.InternalServerError"
+)
+CATCH_APIERROR_DROP = (
+    "1.x openai.APIError also catches 4xx errors (BadRequestError, AuthenticationError, ...), "
+    "which 0.x APIError did not: drop it, {present} is already listed"
+)
+
+ERROR_MODULE_GONE = "openai.error is gone: error classes live at openai.*"
+# 5xx: a catch that names one of these does not need APIError for server errors
+SERVER_ERRORS = frozenset({"InternalServerError", "ServiceUnavailableError"})
 
 # openai.error.<old> -> (1.x name at openai.<new>, or None if removed; note; confidence)
 ERROR_CLASSES: dict[str, tuple[str | None, str, Confidence]] = {
     "OpenAIError": ("OpenAIError", "", CERTAIN),
-    "APIError": ("APIError", "", CERTAIN),
+    "APIError": ("APIError", APIERROR_NOTE, CERTAIN),
     "APIConnectionError": ("APIConnectionError", "", CERTAIN),
     "AuthenticationError": ("AuthenticationError", "", CERTAIN),
     "RateLimitError": ("RateLimitError", "", CERTAIN),
@@ -444,6 +462,7 @@ _V1_ERRORS = sorted(
     {new for new, _, _ in ERROR_CLASSES.values() if new}
     | {"APIStatusError", "NotFoundError", "UnprocessableEntityError", "ConflictError"}
 )
+ERROR_NAMES = frozenset(ERROR_CLASSES) | frozenset(_V1_ERRORS)
 KNOWN_IMPORTS: dict[str, str] = {
     **{name: f"from openai import {name}" for name in (*_CLIENT_CLASSES, *_V1_ERRORS)},
     "openai": "import openai",

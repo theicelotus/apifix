@@ -39,6 +39,9 @@ def check_python(
     aliases = _collect_aliases(tree)
     visitor = _Visitor(file, source, aliases, _targets_azure(tree, aliases), repo_modules, tree)
     visitor.visit(tree)
+    if visitor.findings:  # 0.x code: a lone APIError in a catch is 0.x's too
+        for node, suggestion in visitor.catch_apierror:
+            visitor._report(node, "error_class", suggestion, LIKELY)
     if aliases:  # key checks on a stream delta: only in files that use openai
         for c in content_checks(tree, source):
             message = rules.STREAM_CONTENT_CHECK.format(check=c.check, delta=c.delta)
@@ -200,12 +203,20 @@ def _resource_rule(resource: str, method: str | None, azure: bool) -> _Rule:
 
 def _error_rule(name: str) -> _Rule:
     if name not in rules.ERROR_CLASSES:
-        return _Rule("error_class", "openai.error is gone: error classes live at openai.*", LIKELY)
+        return _Rule("error_class", rules.ERROR_MODULE_GONE, LIKELY)
     new, note, confidence = rules.ERROR_CLASSES[name]
     if new is None:
         return _Rule("error_class", note, confidence)
     suggestion = f"Use openai.{new}" + (f"; {note}" if note else "")
     return _Rule("error_class", suggestion, confidence, name_changes=new != name)
+
+
+def _error_name(canonical: str | None) -> str | None:
+    """`APIError` for openai.APIError or openai.error.APIError; None if not an openai error."""
+    parts = (canonical or "").split(".")
+    if parts[0] != "openai" or not (len(parts) == 2 or (len(parts) == 3 and parts[1] == "error")):
+        return None
+    return parts[-1] if parts[-1] in rules.ERROR_NAMES else None
 
 
 def _classify(canonical: str, azure: bool) -> _Rule | None:
@@ -217,9 +228,7 @@ def _classify(canonical: str, azure: bool) -> _Rule | None:
         return _resource_rule(head, parts[2] if len(parts) > 2 else None, azure)
     if head == "error":
         if len(parts) == 2:
-            return _Rule(
-                "error_class", "openai.error is gone: error classes live at openai.*", CERTAIN
-            )
+            return _Rule("error_class", rules.ERROR_MODULE_GONE, CERTAIN)
         return _error_rule(parts[2])
     if head in rules.TOP_LEVEL_ERROR_REEXPORTS:
         return _error_rule(head)
@@ -498,6 +507,9 @@ class _Visitor(ast.NodeVisitor):
         self.fn_scopes: list[int] = [id(tree)]  # _Scopes of the node being visited
         self.classes: list[int | None] = [None]
         self.local_params = _top_level_params(tree)
+        # APIError in a catch in the form 1.x also uses: reported if the file has other findings.
+        self.catch_apierror: list[tuple[ast.AST, str]] = []
+        self.catch_reported: set[int] = set()  # openai.error.APIError nodes reported by _catch
 
     # reporting
 
@@ -560,6 +572,8 @@ class _Visitor(ast.NodeVisitor):
     # names and attribute chains
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
+        if id(node) in self.catch_reported:
+            return
         canonical = _resolve(node, self.aliases)
         if canonical and (rule := _classify(canonical, self.azure)):
             attr = canonical.split(".", 1)[1]
@@ -659,6 +673,50 @@ class _Visitor(ast.NodeVisitor):
         canonical = self.aliases.get(node.id)
         if canonical and (rule := _classify(canonical, self.azure)) and rule.name_changes:
             self._report_rule(node, rule)
+
+    # APIError in an except type or an exception tuple (retry lists): a sibling of RateLimitError
+    # etc. in 0.x, the base of every API error in 1.x
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if node.type is not None and not isinstance(node.type, ast.Tuple):
+            self._catch([node.type])
+        self.generic_visit(node)
+
+    def _visit_literal(self, node: ast.Tuple | ast.List | ast.Set) -> None:
+        self._catch(node.elts)
+        self.generic_visit(node)
+
+    visit_Tuple = _visit_literal
+    visit_List = _visit_literal
+    visit_Set = _visit_literal
+
+    def _catch(self, elts: list[ast.expr]) -> None:
+        if self.test_file:  # tests list exceptions to raise, not to catch
+            return
+        errors = [(e, name) for e in elts if (name := _error_name(_resolve(e, self.aliases)))]
+        for node, name in errors:
+            if name != "APIError":
+                continue
+            server = next((e for e, n in errors if n in rules.SERVER_ERRORS), None)
+            if server is None:
+                suggestion = rules.CATCH_APIERROR
+            else:
+                present = ast.get_source_segment(self.source, server) or ""
+                if _error_name(_resolve(server, self.aliases)) == "ServiceUnavailableError":
+                    present += " (1.x openai.InternalServerError, every 5xx)"
+                else:
+                    present += " (every 5xx)"
+                suggestion = rules.CATCH_APIERROR_DROP.format(present=present)
+            old = _resolve(node, self.aliases) == "openai.error.APIError"
+            if old and isinstance(node, ast.Attribute):  # the path itself is certain to change
+                self.catch_reported.add(id(node))
+                self._report(
+                    node, "error_class", f"{rules.ERROR_MODULE_GONE}; {suggestion}", CERTAIN
+                )
+            elif old or any(n not in ("APIError", "OpenAIError") for _, n in errors):
+                self._report(node, "error_class", suggestion, LIKELY)
+            else:
+                self.catch_apierror.append((node, suggestion))
 
     # string references, e.g. mock.patch("openai.ChatCompletion.create"), also through the module
     # that uses the library: mock.patch("app.openai.ChatCompletion.create")

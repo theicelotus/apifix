@@ -147,7 +147,8 @@ Mocked chunks in tests become objects with the same keys, role included:
 
 | 0.x | 1.x |
 |---|---|
-| `openai.error.OpenAIError`, `RateLimitError`, `APIError`, `AuthenticationError`, `APIConnectionError` | same name at `openai.` |
+| `openai.error.OpenAIError`, `RateLimitError`, `AuthenticationError`, `APIConnectionError` | same name at `openai.` |
+| `openai.error.APIError` | `openai.APIError`, but it now means something else (below) |
 | `openai.error.InvalidRequestError` | `openai.BadRequestError`; 1.x also has `NotFoundError`, `UnprocessableEntityError`, `ConflictError` for other statuses, so an `except` may need several classes |
 | `openai.error.Timeout` | `openai.APITimeoutError` |
 | `openai.error.ServiceUnavailableError` | `openai.InternalServerError` |
@@ -155,6 +156,24 @@ Mocked chunks in tests become objects with the same keys, role included:
 | `openai.error.TryAgain` | removed; the client retries itself (`max_retries=`) |
 | `openai.error.SignatureVerificationError` | removed |
 | `openai.error.InvalidAPIType` | removed; use `openai.AzureOpenAI` for Azure |
+
+`APIError` changed meaning. In 0.x it was a sibling of the other classes, raised for 5xx
+responses other than 503 (`ServiceUnavailableError`), statuses without a class of their own,
+malformed responses and error events in a stream; never for 400/401/403/404/409/429. In 1.x it
+is the base class of every API error: `BadRequestError`, `AuthenticationError`,
+`RateLimitError`, `APIConnectionError` and the rest all subclass it. So a retry list or
+`except` that names 0.x `APIError` next to `RateLimitError` would, kept as `openai.APIError`,
+also retry or swallow 400 and 401. For server errors use `openai.InternalServerError` (every
+5xx), or drop `APIError` when `InternalServerError` (0.x `ServiceUnavailableError`) is already
+in the tuple. Keep `openai.APIError` only where a catch-all is meant; 1.x raises it directly
+for an error event in a stream.
+
+```python
+# 0.x
+call_with_retry(exceptions_to_retry=(APIError, Timeout, RateLimitError, ServiceUnavailableError))
+# 1.x
+call_with_retry(exceptions_to_retry=(APITimeoutError, RateLimitError, InternalServerError))
+```
 
 1.x status errors need an HTTP response to construct, e.g. in tests:
 

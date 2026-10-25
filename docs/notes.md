@@ -13,7 +13,7 @@ Sections (related plans in parentheses):
 - Conventions (full text)
 - Dev commands (full list)
 - Known limitations (scanner) (scanner.md, first-real-repo.md, openai-2x-pin.md,
-  already-migrated.md, llmflows-run-1.md, llmflows-run-2.md)
+  already-migrated.md, llmflows-run-1.md, llmflows-run-2.md, apierror-mapping.md)
 - Known limitations (sandbox) (sandbox.md, pixi-conda-and-environment.md,
   unpinned-and-sandbox-reqs.md, genai-run-4.md)
 - Known limitations (verifier) (verifier.md, no-signal-messages.md,
@@ -245,6 +245,17 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   say to patch `openai.X` with a key set, and the assignment's suggestion names the files that
   make the calls. Other suggestion forms (resource classes, kwargs) are not rewritten. The guide
   part `client.config` is selected by a "Never drop" / "never drop it" suggestion.
+
+- openai-v1 `APIError` in a catch (0.x: a sibling for 5xx/unmapped statuses; 1.x: the base of
+  every API error): a [likely] `error_class` finding on a name for it in an `except` type or a
+  tuple/list/set literal, suggesting `openai.InternalServerError` (or dropping it when
+  InternalServerError / ServiceUnavailableError is listed). `openai.error.APIError` written out
+  is one [certain] finding with that suggestion. The forms 1.x also uses (`openai.APIError`,
+  `from openai import APIError`) are reported only when the literal names another openai error
+  class or the file has other findings, so a lone `except openai.APIError:` in otherwise-1.x
+  code is not. Not reported: a lone bare argument (`retry_if_exception_type(APIError)`), and
+  test files (they list exceptions to raise; a test that raises 1.x `APIError` to exercise a
+  retry fails once the code catches `InternalServerError`, and the fix must change it).
 
 - Dependency findings (openai-v1): a declaration that allows nothing from 1.0 on is [certain];
   one that allows 0.x and 1.x (no version, `*`, `>=0.27`, `<3`, `!=x`, Poetry `||` ranges,

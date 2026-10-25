@@ -6,7 +6,9 @@ import textwrap
 import pytest
 
 from apifix.engine.migrations import get_migration
+from apifix.engine.models import Finding
 from apifix.engine.scanner import repo_modules, scan, scan_text
+from apifix.engine.verifier import incomplete_findings
 from apifix.engine.walk import iter_files
 from tests.conftest import FIXTURES, at, summary
 
@@ -286,6 +288,87 @@ def test_top_level_invalid_request_error(scan_code):
         "import openai\ntry:\n    pass\nexcept openai.InvalidRequestError:\n    pass\n"
     )
     assert at(findings, 4, "error_class").confidence == "likely"
+
+
+def test_apierror_in_a_retry_tuple(scan_code):
+    findings = scan_code(
+        """
+        import openai
+        from openai.error import APIError, RateLimitError, ServiceUnavailableError
+        call_with_retry(f, exceptions_to_retry=(APIError, RateLimitError))
+        call_with_retry(f, exceptions_to_retry=(APIError, ServiceUnavailableError))
+        try:
+            pass
+        except APIError:
+            pass
+        except openai.error.APIError:
+            pass
+        """
+    )
+
+    def apierror(line: int) -> Finding:
+        (match,) = [f for f in findings if f.line == line and "APIError" in f.old_pattern]
+        return match
+
+    assert "1.x APIError is the base class of every API error" in apierror(3).suggestion
+    first = apierror(4)
+    assert (first.category, first.confidence) == ("error_class", "likely")
+    assert "closest 1.x class is openai.InternalServerError" in first.suggestion
+    assert "drop it, ServiceUnavailableError (1.x" in apierror(5).suggestion
+    assert apierror(8).confidence == "likely"  # a name from openai.error: always 0.x
+    written_out = apierror(10)  # one finding: the path must change, then the class
+    assert written_out.confidence == "certain"
+    assert written_out.suggestion.startswith("openai.error is gone")
+    assert "InternalServerError" in written_out.suggestion
+
+
+def test_apierror_kept_by_a_fix_is_likely(scan_code):
+    """The llmflows fix: 1.x imports, APIError kept next to InternalServerError. Listed for
+    review (remaining_likely_finding), not incomplete_migration."""
+    findings = scan_code(
+        """
+        from openai import APIError, APITimeoutError, InternalServerError, OpenAI
+        retry_on = [APIError, APITimeoutError, InternalServerError]
+        """
+    )
+    assert summary(findings) == [(3, "error_class")]
+    assert "drop it, InternalServerError (every 5xx)" in findings[0].suggestion
+    assert incomplete_findings(findings) == []
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        # the 1.x catch-all, in a file without 0.x usage
+        "import openai\ntry:\n    pass\nexcept openai.APIError:\n    pass\n",
+        "from openai import APIError\nerrors = (APIError, ValueError)\n",
+        "from openai import OpenAIError, APIError\nerrors = {OpenAIError, APIError}\n",
+        # tests list exceptions to raise
+        "from openai.error import APIError, RateLimitError\n"
+        "def test_x():\n    raise_each([APIError, RateLimitError])\n",
+    ],
+)
+def test_apierror_not_reported(scan_code, tmp_path, code):
+    if "def test_x" in code:
+        findings = _scan_file(tmp_path, "tests/test_retry.py", code)
+    else:
+        findings = scan_code(code)
+    assert not [f for f in findings if f.category == "error_class"]
+
+
+def test_lone_apierror_reported_in_0x_code(scan_code):
+    findings = scan_code(
+        """
+        import openai
+        openai.Completion.create(prompt="x")
+        try:
+            pass
+        except openai.APIError:
+            pass
+        """
+    )
+    assert summary(findings) == [(3, "api_call"), (6, "error_class")]
+    assert at(findings, 6).confidence == "likely"
 
 
 @pytest.mark.parametrize(
