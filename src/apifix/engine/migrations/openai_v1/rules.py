@@ -226,6 +226,52 @@ STREAM_CONTENT_CHECK = (
     "in 1.x a stream delta's content always exists and is None on role and final chunks, so "
     '`{check}` must become `if {delta}.content is not None:` (or `{delta}.content or ""`)'
 )
+# Mixed access (python_checks._mixed_access): 0.x responses were dicts with attribute access, so
+# `resp.choices[0]["text"]` and `resp["choices"][0].text` both worked; 1.x objects are not
+# subscriptable. A list container (choices / data) followed by an index, or usage, then its
+# keys; the shape is reported whatever the root (a parameter, a helper's argument).
+CHOICE_KEYS = frozenset(
+    {
+        "text",
+        "message",
+        "content",
+        "delta",
+        "role",
+        "finish_reason",
+        "index",
+        "logprobs",
+        "function_call",
+        "tool_calls",
+        "function",
+        "name",
+        "arguments",
+        "refusal",
+    }
+)
+DATA_KEYS = frozenset({"embedding", "index", "object", "url", "b64_json", "revised_prompt"})
+USAGE_KEYS = frozenset({"prompt_tokens", "completion_tokens", "total_tokens"})
+# container -> (indexed: a list read with [i] before its keys, keys)
+MIXED_CONTAINERS: dict[str, tuple[bool, frozenset[str]]] = {
+    "choices": (True, CHOICE_KEYS),
+    "data": (True, DATA_KEYS),
+    "usage": (False, USAGE_KEYS),
+}
+MIXED_ACCESS = (
+    "0.x responses allowed attribute and key access alike; 1.x returns typed objects, which "
+    "are not subscriptable: use {new}"
+)
+# Keys only (`x["choices"][0]["message"]`, `x["data"][i]["embedding"]`) on a root the file does
+# not track as a response: reported when the first key after the index is one of these, and the
+# root is not known to be a plain dict (json.loads, model_dump(), a dict literal, ...).
+KEY_ONLY_KEYS: dict[str, frozenset[str]] = {
+    "choices": frozenset({"message", "text", "delta"}),
+    "data": frozenset({"embedding"}),
+}
+KEY_ACCESS = (
+    "1.x returns typed objects, not dicts: use {new} (or .model_dump() where a dict is needed)"
+)
+# Calls whose result is a plain dict, so keys on it are fine in 1.x code.
+DICT_RESULT_METHODS = frozenset({"model_dump", "to_dict", "to_dict_recursive", "json", "dict"})
 DICT_METHODS = {"get", "keys", "values", "items", "to_dict", "to_dict_recursive"}
 JSON_DUMP = "Responses are not JSON-serialisable as-is: use resp.model_dump_json() / model_dump()"
 
@@ -378,8 +424,8 @@ MOCK_RESPONSES: dict[str, str] = {
     "audio.transcriptions.create": 'SimpleNamespace(text="hello")',
 }
 
-# Test files: dict literals shaped like a 0.x response ({"choices": [{"message"/"text": ...}]})
-# or a 0.x stream chunk ({"choices": [{"delta": ...}]}).
+# Test files: dict literals shaped like a 0.x response ({"choices": [{"message"/"text": ...}]},
+# {"data": [{"embedding": ...}]}) or a 0.x stream chunk ({"choices": [{"delta": ...}]}).
 MOCK_DICT_RESPONSE = (
     "1.x responses are objects: build mock responses with attribute access "
     "(e.g. SimpleNamespace), not dicts."
@@ -398,3 +444,20 @@ MOCK_DICT_CHUNK_ROLE = (
 RESPONSE_DICT_KEY = "choices"
 RESPONSE_CHOICE_KEYS = frozenset({"message", "text"})
 CHUNK_CHOICE_KEY = "delta"
+EMBEDDINGS_DICT_KEY = "data"  # {"data": [{"embedding": [...]}]}
+EMBEDDING_ITEM_KEY = "embedding"
+# Test files: dict-shaped mock data put on an object (python_checks._mock_attr_data):
+# `m.choices = [{"text": "x"}]`, `m.return_value.data = [{"embedding": [...]}]`,
+# `MagicMock(choices=[...])`, `m.choices[0].message = {"content": "x"}`. 1.x code reads them
+# with attributes, so they must be objects too. {target}: where the data goes, {example}: the
+# same data as SimpleNamespace objects (or a generic form when too long).
+MOCK_ATTR_KEYS: dict[str, frozenset[str]] = {
+    "choices": RESPONSE_CHOICE_KEYS | {CHUNK_CHOICE_KEY},
+    "data": frozenset({"embedding", "url", "b64_json"}),
+}
+MOCK_MESSAGE_ATTRS = frozenset({"message", "delta"})
+MOCK_MESSAGE_KEYS = frozenset({"content", "role", "function_call", "tool_calls"})
+MOCK_ATTR_DATA = (
+    "1.x code reads responses with attributes, so mock data must be objects, not dicts "
+    "(0.x responses allowed both): e.g. {target}{example}"
+)

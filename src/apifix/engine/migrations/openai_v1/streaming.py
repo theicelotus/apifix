@@ -193,6 +193,11 @@ def _guards(node: ast.AST, parents: dict[int, ast.AST]) -> list[tuple[set[str], 
     return [(names, code) for names, code in out if names]
 
 
+def dict_guarded(node: ast.AST, name: str, parents: dict[int, ast.AST]) -> bool:
+    """Whether `node` sits in code a dict guard on `name` covers (_guards)."""
+    return any(name in names for names, _ in _guards(node, parents))
+
+
 def _assignments(nodes: Iterable[ast.AST]) -> dict[str, list[ast.AST]]:
     """name -> the values assigned to it (for a loop target: what it iterates)."""
     out: dict[str, list[ast.AST]] = {}

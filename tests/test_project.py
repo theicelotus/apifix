@@ -1055,3 +1055,152 @@ def test_packages_apifix_installs_itself_are_not_listed_as_left_out(tmp_path):
     plan = build_install_plan(tmp_path, "pytest")
     assert "pytest" in plan.requirements
     assert [n.name for n in plan.not_installed] == ["typer"]
+
+
+# --- conflicting dependency sources (docs/plans/llmflows-run-1.md) ------------------------------
+
+CONFLICTING = {
+    "pyproject.toml": """
+        [project]
+        name = "flowkit"
+        dependencies = ["openai==0.28.1", "tiktoken==0.5.1", "aiohttp"]
+        """,
+    "requirements.txt": "openai==0.28.1\ntiktoken==0.3.3\nblack==23.3.0\n",
+    "tests/test_a.py": "def test_x():\n    pass\n",
+}
+
+
+def test_conflicting_sources_install_the_one_ci_uses(tmp_path):
+    files = dict(CONFLICTING)
+    files[".github/workflows/test.yml"] = """
+        jobs:
+          build:
+            steps:
+            - run: |
+                python -m pip install --upgrade pip
+                pip install pytest
+                pip install -r requirements.txt
+        """
+    plan = build_install_plan(write(tmp_path, files), "pytest")
+    assert plan.requirements == (
+        "openai==0.28.1",
+        "tiktoken==0.3.3",
+        "black==23.3.0",
+        "setuptools",
+        "wheel",
+        "pytest",
+    )
+    assert plan.sources == ("requirements.txt",)
+    (d,) = plan.dropped_sources
+    assert (d.file, d.kept, d.why) == (
+        "pyproject.toml",
+        "requirements.txt",
+        "the repo's CI installs it: .github/workflows/test.yml",
+    )
+    assert d.pins == (("tiktoken==0.5.1", "tiktoken==0.3.3"),)
+    assert d.text() == (
+        "`pyproject.toml` pins tiktoken==0.5.1 where `requirements.txt` pins tiktoken==0.3.3: "
+        "installed from `requirements.txt` (the repo's CI installs it: "
+        ".github/workflows/test.yml), not `pyproject.toml`"
+    )
+    assert d.text().replace("`", "") in plan.notes
+    # what only the dropped file declares is listed as not installed, with the reason
+    assert [(n.name, n.source, n.why) for n in plan.not_installed] == [
+        (
+            "aiohttp",
+            "pyproject.toml",
+            "its pins conflict with requirements.txt, which was installed instead",
+        )
+    ]
+    assert plan.declared["openai"] == ("requirements.txt",)
+    assert plan.lockfile == "requirements.txt (fully pinned)"
+
+
+@pytest.mark.parametrize(
+    ("extra", "kept", "why"),
+    [
+        # no install command anywhere: the package's own metadata
+        ({}, "pyproject.toml", "the package's own metadata"),
+        (
+            {"README.md": "Install:\n\n    pip install -r requirements.txt\n"},
+            "requirements.txt",
+            "the install command in README.md uses it",
+        ),
+        (
+            {"README.md": "```\npip install flowkit\n```\n"},  # the package itself, from PyPI
+            "pyproject.toml",
+            "the install command in README.md uses it",
+        ),
+        (
+            {".github/workflows/ci.yml": "      - run: pip install -e '.[dev]' && pytest\n"},
+            "pyproject.toml",
+            "the repo's CI installs it: .github/workflows/ci.yml",
+        ),
+        (
+            # CI installs both: the README decides
+            {
+                ".github/workflows/ci.yml": "- run: pip install . -r requirements.txt\n",
+                "README.md": "pip install -r requirements.txt\n",
+            },
+            "requirements.txt",
+            "the install command in README.md uses it",
+        ),
+    ],
+)
+def test_conflicting_sources_ranking(tmp_path, extra, kept, why):
+    plan = build_install_plan(write(tmp_path, {**CONFLICTING, **extra}), "pytest")
+    (d,) = plan.dropped_sources
+    assert (d.kept, d.why) == (kept, why)
+    assert plan.sources == (kept,)
+    if kept == "pyproject.toml":
+        assert plan.lockfile is None  # a dropped pinned file is no lockfile either
+        assert "tiktoken==0.5.1" in plan.requirements
+        assert [n.name for n in plan.not_installed] == ["black"]
+
+
+def test_two_requirement_files_without_metadata_keep_the_first(tmp_path):
+    files = {
+        "requirements.txt": "six==1.15.0\n",
+        "requirements-dev.txt": "six==1.16.0\npytest-mock\n",
+        "tests/test_a.py": "def test_x():\n    pass\n",
+    }
+    plan = build_install_plan(write(tmp_path, files), "pytest")
+    (d,) = plan.dropped_sources
+    assert (d.file, d.kept) == ("requirements.txt", "requirements-dev.txt")
+    assert d.why == "read first; no install command or package metadata decides between them"
+
+
+@pytest.mark.parametrize(
+    ("pyproject_dep", "conflict"),
+    [
+        ('"tiktoken>=0.5"', True),  # a range that rules the other file's pin out
+        ('"tiktoken>=0.3,<0.6"', False),  # allows it
+        ('"tiktoken"', False),
+        ("\"tiktoken==0.5.1; python_version < '3.8'\"", False),  # markers are not compared
+        ('"tiktoken @ https://example.test/tiktoken.whl"', False),  # direct reference
+    ],
+)
+def test_what_counts_as_a_conflict(tmp_path, pyproject_dep, conflict):
+    files = {
+        "pyproject.toml": f'[project]\nname = "x"\ndependencies = [{pyproject_dep}]\n',
+        "requirements.txt": "tiktoken==0.3.3\n",
+        "tests/test_a.py": "def test_x():\n    pass\n",
+    }
+    plan = build_install_plan(write(tmp_path, files), "pytest")
+    assert bool(plan.dropped_sources) is conflict
+    if not conflict:
+        assert set(plan.sources) == {"pyproject.toml", "requirements.txt"}
+
+
+def test_agreeing_sources_are_installed_together(tmp_path):
+    files = dict(CONFLICTING, **{"requirements.txt": "openai==0.28.1\ntiktoken==0.5.1\n"})
+    plan = build_install_plan(write(tmp_path, files), "pytest")
+    assert plan.dropped_sources == ()
+    assert set(plan.sources) == {"pyproject.toml", "requirements.txt"}
+
+
+def test_llmflows_shaped_fixture():
+    plan = build_install_plan(Path(__file__).parent / "fixtures" / "mixed_access", "pytest")
+    (d,) = plan.dropped_sources
+    assert d.pins == (("six==1.16.0", "six==1.15.0"), ("tiktoken==0.5.1", "tiktoken==0.3.3"))
+    assert d.kept == "requirements.txt"

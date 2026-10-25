@@ -374,3 +374,42 @@ def test_cleanup_removes_an_orphaned_container_and_its_workspace(tmp_path):
         )
     finally:
         subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+
+
+def test_conflicting_sources_install_from_the_one_ci_uses(tmp_path):
+    # llmflows run 1: pyproject.toml and requirements.txt pinned one package differently
+    repo = make_repo(
+        tmp_path / "repo",
+        {
+            "pyproject.toml": """
+            [project]
+            name = "pinned"
+            version = "0.1"
+            dependencies = ["six==1.16.0"]
+            """,
+            "requirements.txt": "six==1.15.0\n",
+            ".github/workflows/test.yml": "    - run: pip install -r requirements.txt\n",
+            "pinned.py": "import six\n\nVERSION = six.__version__\n",
+            "tests/test_pinned.py": "from pinned import VERSION\n\n"
+            "def test_version():\n    assert VERSION == '1.15.0'\n",
+        },
+    )
+    result = run_sandbox(repo, CONFIG)
+    assert result.status == "passed", (result.reason, result.notes)
+    (dropped,) = result.dropped_sources
+    assert (dropped.file, dropped.kept) == ("pyproject.toml", "requirements.txt")
+
+
+def test_resolution_conflict_keeps_pips_lines_and_is_not_retried(tmp_path):
+    repo = make_repo(
+        tmp_path / "repo",
+        {
+            # one file, so no source choice applies: pip itself must refuse it
+            "requirements.txt": "six==1.15.0\nsix>=1.16\n",
+            "tests/test_x.py": "def test_x():\n    pass\n",
+        },
+    )
+    result = run_sandbox(repo, CONFIG)
+    assert (result.status, result.reason) == ("error", "dependency install failed")
+    assert len(result.install_attempts) == 1 and result.install_retried is False
+    assert any("six==1.15.0" in line for line in result.install_conflict), result.install_conflict

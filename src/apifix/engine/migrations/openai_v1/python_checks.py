@@ -13,7 +13,7 @@ from collections import Counter
 from dataclasses import dataclass
 
 from apifix.engine.migrations.openai_v1 import rules
-from apifix.engine.migrations.openai_v1.streaming import content_checks
+from apifix.engine.migrations.openai_v1.streaming import content_checks, dict_guarded
 from apifix.engine.models import CERTAIN, LIKELY, Category, Confidence, Finding
 from apifix.engine.project import is_test_file
 
@@ -37,7 +37,7 @@ def check_python(
     """`repo_modules`: dotted names of the repo's own modules (``pkg.mod``), so a string such as
     ``"app.openai.X"`` is not taken for the library when the repo has its own ``openai``."""
     aliases = _collect_aliases(tree)
-    visitor = _Visitor(file, source, aliases, _targets_azure(tree, aliases), repo_modules)
+    visitor = _Visitor(file, source, aliases, _targets_azure(tree, aliases), repo_modules, tree)
     visitor.visit(tree)
     if aliases:  # key checks on a stream delta: only in files that use openai
         for c in content_checks(tree, source):
@@ -244,6 +244,94 @@ def _unwrap_chain(node: ast.AST) -> tuple[ast.AST, list[ast.Subscript], bool]:
     return node, subscripts, has_key
 
 
+def _chain_parts(node: ast.AST) -> tuple[ast.AST, list[ast.Attribute | ast.Subscript]]:
+    """(root, the chain's attributes and subscripts from the root outwards)."""
+    parts: list[ast.Attribute | ast.Subscript] = []
+    while isinstance(node, ast.Attribute | ast.Subscript):
+        parts.append(node)
+        node = node.value
+    return node, parts[::-1]
+
+
+def _part(node: ast.Attribute | ast.Subscript) -> tuple[str, str | None]:
+    """("attr", name), ("key", string key) or ("index", None) for any other subscript."""
+    if isinstance(node, ast.Attribute):
+        return "attr", node.attr
+    s = node.slice
+    if isinstance(s, ast.Constant) and isinstance(s.value, str):
+        return "key", s.value
+    return "index", None
+
+
+def _mixed_end(parts: list[ast.Attribute | ast.Subscript]) -> tuple[int, bool] | None:
+    """(index of the last part, mixed?) of a 0.x response access in `parts` (see
+    rules.MIXED_CONTAINERS): mixed, `.choices[i]` then a string key, `["choices"][i]` then an
+    attribute, `.usage["total_tokens"]`, `["usage"].total_tokens`; or keys only,
+    `["choices"][i]["message"]` / `["data"][i]["embedding"]` (rules.KEY_ONLY_KEYS). None if
+    there is none."""
+    kinds = [_part(p) for p in parts]
+    for i, (kind, name) in enumerate(kinds):
+        if kind == "index" or name not in rules.MIXED_CONTAINERS:
+            continue
+        indexed, keys = rules.MIXED_CONTAINERS[name]  # type: ignore[index]
+        start = i + 1
+        if indexed:
+            if start >= len(kinds) or kinds[start][0] != "index":
+                continue
+            start += 1
+        other = "key" if kind == "attr" else "attr"  # the access style that mixes with it
+        end, mixed, strong = None, False, False
+        for j in range(start, len(kinds)):
+            k, n = kinds[j]
+            if k != "index" and n not in keys:
+                break
+            mixed = mixed or k == other
+            strong = strong or (j == start and n in rules.KEY_ONLY_KEYS.get(name, ()))  # type: ignore[arg-type]
+            end = j
+        if end is not None and (mixed or (kind == "key" and strong)):
+            return end, mixed
+    return None
+
+
+def _attribute_form(root: str, parts: list[ast.Attribute | ast.Subscript]) -> str:
+    """The chain with identifier string keys written as attributes."""
+    out = root
+    for p in parts:
+        kind, name = _part(p)
+        if kind == "attr" or (kind == "key" and name and name.isidentifier()):
+            out += f".{name}"
+        else:
+            out += f"[{ast.unparse(p.slice)}]"  # type: ignore[union-attr]
+    return out
+
+
+def _namespace(node: ast.expr, source: str, depth: int = 0) -> str | None:
+    """A dict/list literal as SimpleNamespace objects (`{"text": "x"}` ->
+    `SimpleNamespace(text="x")`, other values as written); None when a key is no identifier
+    or it gets too deep."""
+    if depth > 4:
+        return None
+    if isinstance(node, ast.Dict):
+        items = []
+        for k, v in zip(node.keys, node.values, strict=True):
+            if not (isinstance(k, ast.Constant) and isinstance(k.value, str)):
+                return None
+            if not k.value.isidentifier():
+                return None
+            value = _namespace(v, source, depth + 1)
+            if value is None:
+                return None
+            items.append(f"{k.value}={value}")
+        return f"SimpleNamespace({', '.join(items)})"
+    if isinstance(node, ast.List | ast.Tuple):
+        elts = [_namespace(e, source, depth + 1) for e in node.elts]
+        if any(e is None for e in elts):
+            return None
+        inner = ", ".join(elts)  # type: ignore[arg-type]
+        return f"[{inner}]" if isinstance(node, ast.List) else f"({inner}{',' * (len(elts) == 1)})"
+    return " ".join((ast.get_source_segment(source, node) or ast.unparse(node)).split())
+
+
 # --- visitor --------------------------------------------------------------------------------
 
 
@@ -255,8 +343,11 @@ class _Visitor(ast.NodeVisitor):
         aliases: dict[str, str],
         azure: bool,
         repo_modules: frozenset[str] = frozenset(),
+        tree: ast.Module | None = None,
     ) -> None:
         self.file = file
+        self.tree = tree
+        self._parents: dict[int, ast.AST] | None = None
         self.repo_modules = repo_modules
         self.source = source
         self.aliases = aliases
@@ -265,6 +356,8 @@ class _Visitor(ast.NodeVisitor):
         self.findings: list[Finding] = []
         # One dict per function/class scope: name -> True if it holds a stream, else False.
         self.scopes: list[dict[str, bool]] = [{}]
+        # One set per scope: names last assigned a plain dict (_dict_value).
+        self.dict_names: list[set[str]] = [set()]
         self.streaming_calls: set[int] = set()  # ids of the func of resource calls with stream=
 
     # reporting
@@ -337,7 +430,70 @@ class _Visitor(ast.NodeVisitor):
                 rule = _Rule(rule.category, rule.suggestion + rules.STREAM_CALL, rule.confidence)
             self._report_rule(node, rule)
             return  # the rest of the chain is part of this finding
+        if self._mixed_access(node):
+            return
         self.generic_visit(node)
+
+    def _mixed_access(self, node: ast.Attribute | ast.Subscript) -> bool:
+        """Report a 0.x access in the chain ending at `node` by its shape (_mixed_end), in a file
+        that imports openai, unless its root is a response this file tracks (visit_Subscript
+        reports those) or, for keys only, a plain dict (_dict_root). True when reported; the
+        chain's root and subscript keys are then visited, not its inner parts."""
+        if not self.aliases:
+            return False
+        root, parts = _chain_parts(node)
+        found = _mixed_end(parts)
+        if found is None or self._response_kind(root) is not None:
+            return False
+        end, mixed = found
+        if not mixed and self._dict_root(root):
+            return False
+        segment = ast.get_source_segment(self.source, root) or ast.unparse(root)
+        new = _attribute_form(" ".join(segment.split()), parts[: end + 1])
+        if len(new) > _MAX_PATTERN:
+            new = _attribute_form("resp", parts[: end + 1])
+        message = (rules.MIXED_ACCESS if mixed else rules.KEY_ACCESS).format(new=new)
+        self._report(parts[end], "response_access", message, LIKELY)
+        self.visit(root)
+        for p in parts:
+            if isinstance(p, ast.Subscript):
+                self.visit(p.slice)
+        return True
+
+    @staticmethod
+    def _dict_value(node: ast.AST | None) -> bool:
+        """Whether `node` evaluates to a plain dict: a dict literal or comprehension,
+        `dict(...)`, `json.load(s)(...)`, `x.model_dump()` / `to_dict()` / `json()`
+        (rules.DICT_RESULT_METHODS)."""
+        if isinstance(node, ast.Await):
+            node = node.value
+        if isinstance(node, ast.Dict | ast.DictComp):
+            return True
+        if not isinstance(node, ast.Call):
+            return False
+        func = node.func
+        if isinstance(func, ast.Name):
+            return func.id == "dict"
+        if isinstance(func, ast.Attribute):
+            if isinstance(func.value, ast.Name) and func.value.id == "json":
+                return func.attr in {"load", "loads"}
+            return func.attr in rules.DICT_RESULT_METHODS
+        return False
+
+    def _dict_root(self, root: ast.AST) -> bool:
+        """`root` is a plain dict: a dict value, a name last assigned one in this scope, or a
+        name under a dict guard (`if isinstance(chunk, dict):`, streaming.dict_guarded)."""
+        if self._dict_value(root):
+            return True
+        if not isinstance(root, ast.Name):
+            return False
+        if root.id in self.dict_names[-1]:
+            return True
+        if self.tree is None:
+            return False
+        if self._parents is None:
+            self._parents = {id(c): p for p in ast.walk(self.tree) for c in ast.iter_child_nodes(p)}
+        return dict_guarded(root, root.id, self._parents)
 
     def _config_rule(self, attr: str, value: ast.expr) -> _Rule:
         """The finding for an assignment of `value` to openai.<attr> (CONFIG_ASSIGN_ATTRS)."""
@@ -456,13 +612,16 @@ class _Visitor(ast.NodeVisitor):
                 and self._response_kind(node.args[0]) is not None
             ):
                 self._report(node, "response_access", rules.JSON_DUMP, LIKELY)
+        if self.test_file:
+            self._mock_keyword_data(node)
         self.generic_visit(node)
 
     def visit_Subscript(self, node: ast.Subscript) -> None:
         cur, chain, has_key = _unwrap_chain(node)
         kind = self._response_kind(cur) if has_key else None
         if kind is None:
-            self.generic_visit(node)
+            if not self._mixed_access(node):
+                self.generic_visit(node)
             return
         self._report(
             node, "response_access", rules.STREAM_ACCESS if kind else rules.RESPONSE_ACCESS, LIKELY
@@ -475,8 +634,12 @@ class _Visitor(ast.NodeVisitor):
 
     # bindings
 
-    def _bind(self, target: ast.AST, kind: bool | None) -> None:
+    def _bind(self, target: ast.AST, kind: bool | None, value: ast.AST | None = None) -> None:
         if isinstance(target, ast.Name):
+            if self._dict_value(value):
+                self.dict_names[-1].add(target.id)
+            else:
+                self.dict_names[-1].discard(target.id)
             if kind is None:
                 self.scopes[-1].pop(target.id, None)
             else:
@@ -496,15 +659,17 @@ class _Visitor(ast.NodeVisitor):
                     self.visit(t)
             self.visit(node.value)
         else:
+            if self.test_file:
+                self._mock_attr_data(node)
             self.generic_visit(node)
         kind = self._response_kind(node.value)
         for t in node.targets:
-            self._bind(t, kind)
+            self._bind(t, kind, node.value)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         self.generic_visit(node)
         if node.value is not None:
-            self._bind(node.target, self._response_kind(node.value))
+            self._bind(node.target, self._response_kind(node.value), node.value)
 
     def _visit_for(self, node: ast.For | ast.AsyncFor) -> None:
         self.visit(node.iter)
@@ -524,15 +689,21 @@ class _Visitor(ast.NodeVisitor):
 
     def _response_dict(self, node: ast.Dict) -> str | None:
         """The suggestion for {"choices": [{"message": ...}]} or {"choices": [{"text": ...}]}
-        (a response), or {"choices": [{"delta": ...}]} (a stream chunk); list or tuple."""
+        (a response), {"data": [{"embedding": ...}]} (embeddings), or
+        {"choices": [{"delta": ...}]} (a stream chunk); list or tuple."""
         for key, value in zip(node.keys, node.values, strict=True):
-            if self._key(key) != rules.RESPONSE_DICT_KEY:
+            name = self._key(key)
+            if name not in (rules.RESPONSE_DICT_KEY, rules.EMBEDDINGS_DICT_KEY):
                 continue
             if isinstance(value, ast.List | ast.Tuple):
                 for elt in value.elts:
                     if not isinstance(elt, ast.Dict):
                         continue
                     keys = {self._key(k) for k in elt.keys}
+                    if name == rules.EMBEDDINGS_DICT_KEY:
+                        if rules.EMBEDDING_ITEM_KEY in keys:
+                            return rules.MOCK_DICT_RESPONSE
+                        continue
                     if keys & rules.RESPONSE_CHOICE_KEYS:
                         return rules.MOCK_DICT_RESPONSE
                     if rules.CHUNK_CHOICE_KEY in keys:
@@ -564,10 +735,68 @@ class _Visitor(ast.NodeVisitor):
             self._report(node, "response_access", suggestion, LIKELY)
         self.generic_visit(node)
 
+    @staticmethod
+    def _mock_attr_shaped(attr: str, value: ast.expr, chain: ast.expr | None = None) -> bool:
+        """Whether `value`, put on attribute (or keyword) `attr`, is dict-shaped 0.x response
+        data: choices / data as a list of dicts with a choice / item key, usage as a dict with
+        a token key, and (`chain`: what the attribute is read from) a choice's message /
+        delta as a dict with a message key when `chain` reads `.choices[...]`."""
+
+        def keys(d: ast.Dict) -> set[object]:
+            return {k.value for k in d.keys if isinstance(k, ast.Constant)}
+
+        if attr in rules.MOCK_ATTR_KEYS:
+            wanted = rules.MOCK_ATTR_KEYS[attr]
+            return isinstance(value, ast.List | ast.Tuple) and any(
+                isinstance(e, ast.Dict) and keys(e) & wanted for e in value.elts
+            )
+        if attr == "usage":
+            return isinstance(value, ast.Dict) and bool(keys(value) & rules.USAGE_KEYS)
+        if attr in rules.MOCK_MESSAGE_ATTRS and chain is not None:
+            _, parts = _chain_parts(chain)
+            reads_choice = any(
+                _part(p) == ("attr", "choices")
+                and i + 1 < len(parts)
+                and _part(parts[i + 1])[0] == "index"
+                for i, p in enumerate(parts)
+            )
+            return (
+                reads_choice
+                and isinstance(value, ast.Dict)
+                and bool(keys(value) & rules.MOCK_MESSAGE_KEYS)
+            )
+        return False
+
+    def _mock_attr_report(self, node: ast.AST, target: str, value: ast.expr) -> None:
+        example = _namespace(value, self.source)
+        if example is None or len(target) + len(example) > _MAX_PATTERN:
+            example = "SimpleNamespace(...) objects"
+            target = ""
+        message = rules.MOCK_ATTR_DATA.format(target=target, example=example)
+        self._report(node, "response_access", message, LIKELY)
+
+    def _mock_attr_data(self, node: ast.Assign) -> None:
+        """Test files: dict-shaped mock data assigned to a response attribute
+        (`m.choices = [{"text": "x"}]`, `m.return_value.data = [...]`)."""
+        for t in node.targets:
+            if isinstance(t, ast.Attribute) and self._mock_attr_shaped(t.attr, node.value, t.value):
+                segment = ast.get_source_segment(self.source, t) or ast.unparse(t)
+                self._mock_attr_report(node, f"{' '.join(segment.split())} = ", node.value)
+                return
+
+    def _mock_keyword_data(self, node: ast.Call) -> None:
+        """Test files: dict-shaped mock data passed as `choices=` / `data=` / `usage=`
+        (`MagicMock(choices=[{"text": "x"}])`, `dict(choices=...)`)."""
+        for kw in node.keywords:
+            if kw.arg and self._mock_attr_shaped(kw.arg, kw.value):
+                self._mock_attr_report(kw, f"{kw.arg}=", kw.value)
+
     def _visit_scope(self, node: ast.AST) -> None:
         self.scopes.append({})
+        self.dict_names.append(set())
         self.generic_visit(node)
         self.scopes.pop()
+        self.dict_names.pop()
 
     visit_FunctionDef = _visit_scope
     visit_AsyncFunctionDef = _visit_scope

@@ -520,6 +520,27 @@ def detect_tests(repo: Path) -> TestPlan:
 
 
 @dataclass(frozen=True)
+class DroppedSource:
+    """A dependency file left out because its exact pins conflict with another file's, which
+    was installed instead: a user installs from one of them, not both."""
+
+    file: str
+    kept: str  # the file installed instead
+    why: str  # why that one, e.g. "the repo's CI installs it: .github/workflows/test.yml"
+    # (this file's line, the kept file's line) for each conflict: ("tiktoken==0.5.1",
+    # "tiktoken==0.3.3")
+    pins: tuple[tuple[str, str], ...]
+
+    def text(self) -> str:
+        ignored = ", ".join(d for d, _ in self.pins)
+        used = ", ".join(k for _, k in self.pins)
+        return (
+            f"`{self.file}` pins {ignored} where `{self.kept}` pins {used}: installed from "
+            f"`{self.kept}` ({self.why}), not `{self.file}`"
+        )
+
+
+@dataclass(frozen=True)
 class InstallPlan:
     requirements: tuple[str, ...]
     constraints: tuple[str, ...]  # exact pins from a lockfile, passed to pip with -c
@@ -534,6 +555,8 @@ class InstallPlan:
     # its lines for the migrated library that allow the old version, replaced by the target spec
     # because no edit of the fix changed the library ("openai==0.28.1 -> openai>=1.55.3,<3")
     upgraded: tuple[str, ...] = ()
+    # dependency files left out because their exact pins conflict with an installed file's
+    dropped_sources: tuple[DroppedSource, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -794,6 +817,145 @@ def _with_tooling(
     return reqs
 
 
+_METADATA_FILES = ("pyproject.toml", "setup.cfg", "setup.py")
+_PIP_INSTALL_RE = re.compile(r"\bpip3?\s+install\b(.*)")
+_TOOL_INSTALL = {"poetry": "pyproject.toml", "pipenv": "Pipfile"}
+_SHELL_STOPS = frozenset({"&&", "||", ";", "|", "&", ">", ">>"})
+
+
+def _install_targets(args: str, repo: Path, own: str | None) -> list[str]:
+    """Repo files one `pip install` command line installs from: `-r FILE`, and the package
+    metadata files for `.`, `-e .`, `.[extras]` or the project's own name."""
+    try:
+        tokens = shlex.split(args, comments=True)
+    except ValueError:
+        tokens = args.split()
+    out: list[str] = []
+    expect_file = False
+    for tok in tokens:
+        if tok in _SHELL_STOPS:
+            break
+        if expect_file:
+            expect_file = False
+            out.append(tok)
+            continue
+        if tok in ("-r", "--requirement"):
+            expect_file = True
+            continue
+        if tok in ("-e", "--editable"):
+            continue
+        for prefix in ("--requirement=", "-r"):
+            if tok.startswith(prefix) and len(tok) > len(prefix):
+                out.append(tok[len(prefix) :])
+                break
+        else:
+            target = tok.removeprefix("--editable=").removeprefix("-e")
+            target = re.sub(r"\[[^\]]*\]$", "", target)
+            name = re.split(r"[<>=!~\[ ;]", target, maxsplit=1)[0]
+            if target in (".", "./") or (own and name and normalize_name(name) == own):
+                out += [m for m in _METADATA_FILES if (repo / m).is_file()]
+    files = []
+    for f in out:
+        if f in _METADATA_FILES:
+            files.append(f)
+            continue
+        rel = PurePosixPath(f.removeprefix("./")).as_posix()
+        if (repo / rel).is_file():
+            files.append(rel)
+    return files
+
+
+def _install_commands(repo: Path, paths: Iterable[Path]) -> dict[str, str]:
+    """Repo file -> the first of `paths` (relative) with a command that installs from it."""
+    own = _project_name(repo)
+    found: dict[str, str] = {}
+    for path in paths:
+        rel = path.relative_to(repo).as_posix()
+        for line in (_read(path) or "").splitlines():
+            targets: list[str] = []
+            if m := _PIP_INSTALL_RE.search(line):
+                targets = _install_targets(m.group(1), repo, own)
+            for tool, file in _TOOL_INSTALL.items():
+                if re.search(rf"\b{tool}\s+install\b", line) and (repo / file).is_file():
+                    targets.append(file)
+            for t in targets:
+                found.setdefault(t, rel)
+    return found
+
+
+def _excludes_pin(pin: str, other: str) -> bool:
+    """`pin` is an exact `name==v` that `other` (a requirement for the same name) rules out."""
+    if not _PINNED_RE.match(pin.strip()):
+        return False
+    version = pin.split("==", 1)[1].strip()
+    return not allows(_req_clauses(other), version)
+
+
+def _pin_conflicts(a: list[str], b: list[str]) -> list[tuple[str, str]]:
+    """(line of a, line of b) for each pair where an exact pin on one side is outside the other
+    side's requirement. Lines with markers and direct references are not compared."""
+
+    def plain(reqs: list[str]) -> dict[str, list[str]]:
+        return _by_name(r.strip() for r in reqs if ";" not in r and "@" not in r)
+
+    by_a, by_b = plain(a), plain(b)
+    return [
+        (ra, rb)
+        for name in sorted(set(by_a) & set(by_b))
+        for ra in by_a[name]
+        for rb in by_b[name]
+        if _excludes_pin(ra, rb) or _excludes_pin(rb, ra)
+    ]
+
+
+def _readme_files(repo: Path) -> list[Path]:
+    return sorted(p for p in repo.glob("README*") if p.is_file() and not p.is_symlink())
+
+
+def _conflicting_sources(repo: Path, files: dict[str, list[str]]) -> list[DroppedSource]:
+    """Dependency files to leave out because their exact pins conflict with another file's.
+    Files in a conflict are ranked: installed by the repo's GitHub Actions workflows, then by a
+    README's install command, then package metadata (pyproject.toml, setup.cfg, setup.py),
+    then `files` order; each is kept unless it conflicts with one kept before."""
+    names = list(files)
+    conflicts = {
+        (a, b): pairs
+        for i, a in enumerate(names)
+        for b in names[i + 1 :]
+        if (pairs := _pin_conflicts(files[a], files[b]))
+    }
+    if not conflicts:
+        return []
+    ci = _install_commands(repo, _workflow_files(repo))
+    readme = _install_commands(repo, _readme_files(repo))
+
+    def rank(f: str) -> tuple[bool, bool, bool, int]:
+        return (f not in ci, f not in readme, f not in _METADATA_FILES, names.index(f))
+
+    def why(kept: str, other: str) -> str:
+        a, b = rank(kept), rank(other)
+        if a[0] != b[0]:
+            return f"the repo's CI installs it: {ci[kept]}"
+        if a[1] != b[1]:
+            return f"the install command in {readme[kept]} uses it"
+        if a[2] != b[2]:
+            return "the package's own metadata"
+        return "read first; no install command or package metadata decides between them"
+
+    involved = sorted({f for pair in conflicts for f in pair}, key=rank)
+    kept: list[str] = []
+    dropped: list[DroppedSource] = []
+    for f in involved:
+        clash = next((k for k in kept if (k, f) in conflicts or (f, k) in conflicts), None)
+        if clash is None:
+            kept.append(f)
+            continue
+        pairs = conflicts.get((clash, f)) or [(k, d) for d, k in conflicts[(f, clash)]]
+        pins = tuple(dict.fromkeys((d, k) for k, d in pairs))
+        dropped.append(DroppedSource(f, clash, why(clash, f), pins))
+    return dropped
+
+
 def build_install_plan(
     repo: Path,
     runner: Runner | None,
@@ -823,6 +985,7 @@ def build_install_plan(
     pixi = has_pixi_manifest(
         _read(pyproject) if pyproject.is_file() else None, (repo / "pixi.toml").is_file()
     )
+    parsed: list[tuple[str, list[tuple[str, str]], list[NotInstalled]]] = []
     for rel in [m for m in _MANIFESTS if (repo / m).is_file()] + req_files + env_files:
         text = _read(repo / rel)
         if text is None:
@@ -832,6 +995,22 @@ def build_install_plan(
             found, skipped = install_requirements(rel, text)
         except (SyntaxError, ValueError, configparser.Error) as exc:
             notes.append(f"{rel}: could not parse ({type(exc).__name__}); skipped")
+            continue
+        parsed.append((rel, found, skipped))
+    # conda environment files yield to every other source by name already
+    dropped_sources = _conflicting_sources(
+        repo, {rel: [req for req, _ in found] for rel, found, _ in parsed if rel not in env_files}
+    )
+    dropped = {d.file: d for d in dropped_sources}
+    for rel, found, skipped in parsed:
+        if rel in dropped:
+            d = dropped[rel]
+            notes.append(d.text().replace("`", ""))
+            why = f"its pins conflict with {d.kept}, which was installed instead"
+            left_out += [
+                NotInstalled(name, source, why) for req, source in found if (name := _req_name(req))
+            ]
+            left_out += skipped
             continue
         if rel in env_files and pixi:
             # pixi never reads environment.yml: next to a pixi manifest it is another,
@@ -864,7 +1043,9 @@ def build_install_plan(
         left_out += skipped
 
     reqs = _with_tooling(repo, runner, reqs, notes)
-    lockfile, pins, lock_notes = _lock_pins(repo, req_files, python)
+    lockfile, pins, lock_notes = _lock_pins(
+        repo, [f for f in req_files if f not in dropped], python
+    )
     notes += lock_notes
     if lockfile:
         pins = _filter_pins(pins, reqs, notes, lockfile, target)
@@ -879,6 +1060,7 @@ def build_install_plan(
         not_installed=tuple(
             n for n in left_out if n.name not in declared and n.name not in _by_name(reqs)
         ),
+        dropped_sources=tuple(dropped_sources),
     )
 
 

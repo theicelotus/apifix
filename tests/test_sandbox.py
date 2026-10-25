@@ -1021,3 +1021,120 @@ def test_detected_dependencies_are_recorded_per_run(repo):
     result = run_sandbox(repo, docker=FakeDocker(test=pytest_run(passed=1)))
     assert result.declared == {"openai": ["pyproject.toml"]}
     assert result.requirements_override is None and result.not_installed == []
+
+
+# --- resolution conflicts (docs/plans/llmflows-run-1.md) ----------------------------------------
+
+# llmflows' baseline: pyproject.toml and requirements.txt pinned tiktoken differently
+PIP_CONFLICT_STDOUT = """\
+Collecting openai==0.28.1 (from -r /manifest/requirements.txt (line 1))
+  Using cached openai-0.28.1-py3-none-any.whl.metadata (11 kB)
+Collecting tiktoken==0.5.1 (from -r /manifest/requirements.txt (line 2))
+
+The conflict is caused by:
+    The user requested tiktoken==0.5.1
+    The user requested tiktoken==0.3.3
+
+To fix this you could try to:
+1. loosen the range of package versions you've specified
+2. remove package versions to allow pip attempt to solve the dependency conflict
+"""
+PIP_CONFLICT_STDERR = """\
+ERROR: Cannot install tiktoken==0.3.3 and tiktoken==0.5.1 because these package versions have \
+conflicting dependencies.
+ERROR: ResolutionImpossible: for help visit https://pip.pypa.io/en/latest/topics/dependency-\
+resolution/#dealing-with-dependency-conflicts
+"""
+
+
+def _plan(reqs=(), constraints=()):
+    from apifix.engine.project import InstallPlan
+
+    return InstallPlan(tuple(reqs), tuple(constraints), (), None)
+
+
+def test_install_conflict_lines():
+    lines = sandbox_mod.install_conflict(PIP_CONFLICT_STDOUT + PIP_CONFLICT_STDERR, _plan())
+    assert lines == [
+        "The conflict is caused by:",
+        "    The user requested tiktoken==0.5.1",
+        "    The user requested tiktoken==0.3.3",
+        "Cannot install tiktoken==0.3.3 and tiktoken==0.5.1 because these package versions "
+        "have conflicting dependencies.",
+    ]
+
+
+def test_install_conflict_shows_manifest_lines_as_requirements():
+    output = (
+        "ERROR: Cannot install -r /manifest/requirements.txt (line 2) and httpx==0.27.0 because "
+        "these package versions have conflicting dependencies.\n\n"
+        "The conflict is caused by:\n"
+        "    The user requested httpx==0.27.0\n"
+        "    The user requested (constraint) httpx==0.23.0\n"
+        "    openai 1.55.3 depends on httpx<1 and >=0.23.0\n"
+        "\nAdditionally, some packages ...\n"
+        "-c /manifest/constraints.txt (line 1) and -r /manifest/requirements.txt (line 9)\n"
+    )
+    plan = _plan(["openai>=1.55.3,<3", "httpx==0.27.0"], ["httpx==0.23.0"])
+    lines = sandbox_mod.install_conflict(output, plan)
+    assert lines[0].startswith("Cannot install httpx==0.27.0 and httpx==0.27.0 because")
+    assert lines[1:] == [
+        "The conflict is caused by:",
+        "    The user requested httpx==0.27.0",
+        "    The user requested (constraint) httpx==0.23.0",
+        "    openai 1.55.3 depends on httpx<1 and >=0.23.0",
+    ]
+    assert sandbox_mod.conflict_sources(lines, {"httpx": ["requirements.txt"], "x": ["a"]}) == {
+        "httpx": ["requirements.txt"]
+    }
+
+
+def test_a_conflict_is_not_retried_as_a_network_failure(repo):
+    # a network warning in the output does not make a resolution conflict transient
+    stderr = "WARNING: Retrying after connection broken by 'NewConnectionError'\n"
+    failed = exited(1, PIP_CONFLICT_STDOUT, stderr + PIP_CONFLICT_STDERR)
+    result = run_sandbox(repo, docker=FakeDocker(install=[failed]))
+    assert (result.status, result.reason) == ("error", "dependency install failed")
+    assert len(result.install_attempts) == 1 and result.install_retried is False
+    assert "    The user requested tiktoken==0.3.3" in result.install_conflict
+
+
+def test_a_conflict_without_a_lockfile_pin_is_not_retried_without_the_lockfile(repo):
+    (repo / "requirements.txt").write_text("openai==0.28.1\nrequests==2.31.0\n")
+    failed = exited(1, PIP_CONFLICT_STDOUT, PIP_CONFLICT_STDERR)
+    docker = FakeDocker(install=[failed, ok()], test=pytest_run(passed=1))
+    result = run_sandbox(repo, docker=docker)
+    assert result.status == "error" and len(result.install_attempts) == 1
+    assert (
+        "pip's conflict involves no requirements.txt (fully pinned) pin; not retried without "
+        "them" in result.notes
+    )
+
+
+def test_a_conflict_with_a_lockfile_pin_is_retried_without_the_lockfile(repo):
+    (repo / "requirements.txt").write_text("openai==0.28.1\nrequests==2.31.0\n")
+    stdout = PIP_CONFLICT_STDOUT.replace(
+        "The user requested tiktoken==0.3.3", "The user requested (constraint) tiktoken==0.3.3"
+    )
+    docker = FakeDocker(
+        install=[exited(1, stdout, PIP_CONFLICT_STDERR), ok()], test=pytest_run(passed=1)
+    )
+    result = run_sandbox(repo, docker=docker)
+    assert result.status == "passed"
+    assert [p.constraints_applied for p in result.install_attempts] == [True, False]
+    assert result.install_conflict == []  # resolved by the retry
+
+
+def test_dropped_sources_reach_the_result(tmp_path):
+    root = tmp_path / "repo"
+    shutil.copytree(Path(__file__).parent / "fixtures" / "mixed_access", root)
+    docker = FakeDocker(test=pytest_run(passed=1))
+    result = run_sandbox(root, docker=docker)
+    (dropped,) = result.dropped_sources
+    assert (dropped.file, dropped.kept) == ("pyproject.toml", "requirements.txt")
+    assert docker.requirements[0].splitlines()[:3] == [
+        "openai==0.28.1",
+        "tiktoken==0.3.3",
+        "six==1.15.0",
+    ]
+    assert "tiktoken==0.5.1" not in docker.requirements[0]

@@ -90,8 +90,10 @@ from apifix.engine.verifier import (
     UNCALLED_MOCK_MARKERS,
     Verification,
     VerifierConfig,
+    dependency_source_texts,
     downloads_line,
     feedback_lines,
+    install_conflict_section,
     mock_failures,
     requirements_override,
     run_summary,
@@ -2855,6 +2857,9 @@ def report_markdown(
     downloads = downloads_line(runs)
     if downloads:
         lines.append(downloads)
+    lines += [
+        f"- Dependency sources conflict: {t}" for t in dependency_source_texts(r for _, r in runs)
+    ]
     if job.whole_file:
         for a in job.attempts:
             for f in a.files:
@@ -2928,6 +2933,8 @@ def report_markdown(
         )
     lines.append("")
     lines += undeclared_section(job.undeclared)
+    if not (chosen and chosen.verification) and job.baseline is not None:
+        lines += install_conflict_section([("original code", job.baseline)])
     if chosen and chosen.verification:
         lines.append(chosen.verification.report_markdown())
     elif result_outcome == "already_migrated" and job.already_migrated:

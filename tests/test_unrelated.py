@@ -718,3 +718,50 @@ def test_error_key_strips_the_new_line_prefixes():
     assert error_key("after original line 21: added code") == "added code"
     assert error_key("before original line 1: added code") == "added code"
     assert error_key("line 3: undefined name") == "undefined name"
+
+
+# --- llmflows run 1: mixed response access and attribute mock data -------------------------------
+
+MIXED = FIXTURE.parent / "mixed_access"
+
+
+def _mixed_check(path: str, old: str, new: str, *, new_rules: bool = True) -> list[str]:
+    """check_candidate's errors for one edit of a mixed_access file; `new_rules=False` drops the
+    findings the scanner did not have before (the run's situation)."""
+    from apifix.engine.whole_file import check_candidate
+
+    findings = [f for f in scan(MIXED, "openai-v1").findings if f.file == path]
+    if not new_rules:
+        findings = [
+            f
+            for f in findings
+            if not f.suggestion.startswith(("0.x responses allowed", "1.x code reads responses"))
+        ]
+    original = (MIXED / path).read_text()
+    assert old in original
+    candidate = original.replace(old, new)
+    r = check_candidate(
+        path, original, candidate, required=False, library_modules=LIBRARY, findings=findings
+    )
+    return r.errors
+
+
+def test_mixed_access_rewrite_is_related_now():
+    args = ("flowkit/llms/completion.py", 'choices[0]["text"]', "choices[0].text")
+    (error,) = _mixed_check(*args, new_rules=False)
+    assert error.startswith("original line 19: changed code unrelated to the migration")
+    assert _mixed_check(*args) == []
+
+
+def test_attribute_mock_data_conversion_is_related_now():
+    args = (
+        "tests/test_completion.py",
+        "        model_outputs = MagicMock()\n"
+        '        model_outputs.choices = [{"text": "test_text"}]\n',
+        "        model_outputs = SimpleNamespace(\n"
+        '            choices=[SimpleNamespace(text="test_text")]\n'
+        "        )\n",
+    )
+    errors = _mixed_check(*args, new_rules=False)
+    assert errors and errors[0].startswith("original line 22: changed code unrelated")
+    assert [e for e in _mixed_check(*args) if "unrelated" in e] == []

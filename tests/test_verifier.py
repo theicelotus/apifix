@@ -1615,3 +1615,53 @@ def test_review_line_forms():
     assert review_line(removed) == "`a.py:3`: removed `x = 1` (+1 line)"
     ticks = {**one, "new": "print(`x`)"}
     assert review_line(ticks) == "`a.py:3`: `x = 1` -> `` print(`x`) ``"
+
+
+# --- conflicting dependency sources and pip conflicts (docs/plans/llmflows-run-1.md) -----------
+
+
+def test_report_and_summary_show_dropped_sources_and_pip_conflicts(trees):
+    from apifix.engine.project import DroppedSource
+
+    original, fixed = trees({})
+    dropped = DroppedSource(
+        "pyproject.toml",
+        "requirements.txt",
+        "the repo's CI installs it: .github/workflows/test.yml",
+        (("tiktoken==0.5.1", "tiktoken==0.3.3"),),
+    )
+    baseline = run(status="error", reason="dependency install failed")
+    baseline.dropped_sources = [dropped]
+    baseline.install_conflict = [
+        "The conflict is caused by:",
+        "    The user requested anthropic==0.3.11",
+        "    openai 1.55.3 depends on httpx<1,>=0.23.0",
+    ]
+    baseline.declared = {"anthropic": ["requirements.txt"], "openai": ["requirements.txt"]}
+    fixed_run = run((T_ASK, "passed"), (T_STRIP, "passed"), coverage=FULL_COVERAGE)
+    fixed_run.dropped_sources = [dropped]
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(baseline, [fixed_run]))
+    md = v.report_markdown()
+    assert md.count("**Dependency sources:**") == 1
+    assert (
+        "**Dependency sources:** `pyproject.toml` pins tiktoken==0.5.1 where `requirements.txt` "
+        "pins tiktoken==0.3.3: installed from `requirements.txt` (the repo's CI installs it: "
+        ".github/workflows/test.yml), not `pyproject.toml`." in md
+    )
+    assert (
+        "### Dependency install conflict\n\n"
+        "pip could not install the original code's dependencies (pip's output, untrusted):\n\n"
+        "```\nThe conflict is caused by:\n    The user requested anthropic==0.3.11\n"
+        "    openai 1.55.3 depends on httpx<1,>=0.23.0\n```\n\n"
+        "- `anthropic` is declared in `requirements.txt`\n" in md
+    )
+    runs = v.to_dict()["runs"]
+    assert runs["baseline"]["install_conflict"] == baseline.install_conflict
+    assert runs["fixed"]["dropped_sources"] == [
+        {
+            "file": "pyproject.toml",
+            "kept": "requirements.txt",
+            "why": "the repo's CI installs it: .github/workflows/test.yml",
+            "pins": [["tiktoken==0.5.1", "tiktoken==0.3.3"]],
+        }
+    ]

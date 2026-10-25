@@ -25,7 +25,13 @@ from apifix.engine.diffing import FileChange, diff_trees, read_text
 from apifix.engine.migrations import Migration, get_migration
 from apifix.engine.models import Finding, LibraryTarget
 from apifix.engine.project import NotInstalled, SandboxRequirements, is_test_file
-from apifix.engine.sandbox import PYTEST_USAGE_ERROR, PhaseResult, Sandbox, SandboxResult
+from apifix.engine.sandbox import (
+    PYTEST_USAGE_ERROR,
+    PhaseResult,
+    Sandbox,
+    SandboxResult,
+    conflict_sources,
+)
 from apifix.engine.scanner import scan
 from apifix.engine.scope import tooling_change
 from apifix.engine.suspicious import check_dependencies, check_python
@@ -390,6 +396,17 @@ def run_summary(run: SandboxResult) -> dict:
         ),
         **({"smoke": asdict(run.smoke)} if run.smoke else {}),
         **({"not_installed": [asdict(n) for n in run.not_installed]} if run.not_installed else {}),
+        **(
+            {
+                "dropped_sources": [
+                    asdict(d) | {"pins": [list(pair) for pair in d.pins]}
+                    for d in run.dropped_sources
+                ]
+            }
+            if run.dropped_sources
+            else {}
+        ),
+        **({"install_conflict": list(run.install_conflict)} if run.install_conflict else {}),
         **(
             {
                 "requirements_override": run.requirements_override,
@@ -1438,6 +1455,40 @@ def _tests_suffix(r: Reason, shown: int = 5) -> str:
     return f" ({names}{more})"
 
 
+def dependency_source_texts(runs: Iterable[SandboxResult]) -> list[str]:
+    """What each dependency file left out for conflicting pins (DroppedSource) says, once each."""
+    return list(dict.fromkeys(d.text() for run in runs for d in run.dropped_sources))
+
+
+def install_conflict_section(runs: Iterable[tuple[str, SandboxResult]]) -> list[str]:
+    """pip's conflict lines for each (label, run) whose install failed with ResolutionImpossible,
+    plus where the repo declares each package pip names."""
+    out: list[str] = []
+    for label, run in runs:
+        if not run.install_conflict:
+            continue
+        if not out:
+            out += ["### Dependency install conflict", ""]
+        out += [
+            f"pip could not install the {label}'s dependencies (pip's output, untrusted):",
+            "",
+            "```",
+            *run.install_conflict,
+            "```",
+            "",
+        ]
+        where = conflict_sources(run.install_conflict, run.declared)
+        out += _bullets(
+            [
+                f"`{name}` is declared in {', '.join(f'`{f}`' for f in files)}"
+                for name, files in where.items()
+            ]
+        )
+        if where:
+            out.append("")
+    return out
+
+
 def _not_installed_section(left_out: Sequence[NotInstalled], shown: int = 12) -> list[str]:
     """Declared dependencies the install left out, grouped by where and why."""
     groups: dict[tuple[str, str], list[str]] = {}
@@ -1499,6 +1550,10 @@ def _report(v: Verification) -> str:
             for u in v.fixed.override_upgraded
         )
         out.append(line)
+    out += [
+        f"**Dependency sources:** {text}."
+        for text in dependency_source_texts((v.baseline, v.fixed))
+    ]
     resolved = v.findings_before - len(v.remaining_findings)
     out += [
         f"**Migration findings:** {resolved} of {v.findings_before} resolved, "
@@ -1529,6 +1584,7 @@ def _report(v: Verification) -> str:
             out.append(f"- ... and {len(v.review_by_hand) - MAX_LISTED} more (see fix.diff)")
         out.append("")
 
+    out += install_conflict_section((("original code", v.baseline), ("fixed code", v.fixed)))
     out += _not_installed_section(v.fixed.not_installed or v.baseline.not_installed)
 
     if d.fixed_by_change:

@@ -3005,3 +3005,42 @@ def test_mock_failure_tracebacks_add_no_regions_to_the_code_under_test():
     )
     assert feedback_lines_in("app.py", source, source, v) == [5]
     assert feedback_lines_in("app.py", source, source, v, skip_tracebacks_of={T_ASK}) == []
+
+
+# --- llmflows run 1: conflicting dependency sources in the job report ---------------------------
+
+
+def test_report_shows_dropped_sources_and_the_baselines_pip_conflict(repo):
+    from apifix.engine.project import DroppedSource
+
+    baseline = run(status="error", reason="dependency install failed")
+    baseline.dropped_sources = [
+        DroppedSource(
+            "pyproject.toml",
+            "requirements.txt",
+            "the repo's CI installs it: .github/workflows/test.yml",
+            (("tiktoken==0.5.1", "tiktoken==0.3.3"),),
+        )
+    ]
+    baseline.install_conflict = [
+        "The conflict is caused by:",
+        "    The user requested anthropic==0.3.11",
+        "    openai 0.28.1 depends on aiohttp",
+    ]
+    baseline.declared = {"anthropic": ["requirements.txt"]}
+    llm = FakeLLM([tools(FIX_APP), tools(FIX_TESTS, usage=Usage(input_tokens=600_000))])
+    result = go(repo, llm, JudgingSandbox(baseline=baseline), max_cost_usd=0.5)
+    assert result.outcome == "aborted"
+    md = result.report_markdown
+    assert (
+        "- Dependency sources conflict: `pyproject.toml` pins tiktoken==0.5.1 where "
+        "`requirements.txt` pins tiktoken==0.3.3: installed from `requirements.txt` (the "
+        "repo's CI installs it: .github/workflows/test.yml), not `pyproject.toml`\n" in md
+    )
+    # no verification follows, so the job report shows the baseline's conflict itself
+    assert (
+        "pip could not install the original code's dependencies (pip's output, untrusted):\n\n"
+        "```\nThe conflict is caused by:\n    The user requested anthropic==0.3.11\n" in md
+    )
+    assert "- `anthropic` is declared in `requirements.txt`" in md
+    assert md.index("### Dependency install conflict") < md.index("were not verified")

@@ -566,7 +566,7 @@ def test_other_dicts_and_non_test_files_are_not_flagged(tmp_path):
         a = {"choices": ["red", "green"]}
         b = {"choices": [{"label": "x"}]}
         c = {"message": {"content": "x"}}
-        d = dict(choices=[{"message": {}}])
+        d = dict(choices=["red", "green"])
         """,
         )
         == []
@@ -741,3 +741,235 @@ def test_a_test_file_setting_a_key_does_not_trigger_the_repo_pass(tmp_path):
     )
     call = next(f for f in findings if f.file == "app/chat.py")
     assert call.suggestion.startswith("Use client.chat.completions.create(...) with")
+
+
+# --- mixed response access and attribute mock data (docs/plans/llmflows-run-1.md) ------------
+
+MIXED = "0.x responses allowed attribute and key access alike"
+
+
+@pytest.mark.parametrize(
+    ("expr", "new"),
+    [
+        ('model_outputs.choices[0]["text"]', "model_outputs.choices[0].text"),
+        (
+            'model_outputs.choices[0]["message"]["content"]',
+            "model_outputs.choices[0].message.content",
+        ),
+        ('model_outputs.choices[0].message["content"]', "model_outputs.choices[0].message.content"),
+        (
+            'model_outputs.choices[-1]["delta"]["content"]',
+            "model_outputs.choices[-1].delta.content",
+        ),
+        ('model_outputs.data[i]["embedding"]', "model_outputs.data[i].embedding"),
+        ('model_outputs.usage["total_tokens"]', "model_outputs.usage.total_tokens"),
+        ('model_outputs["choices"][0].text', "model_outputs.choices[0].text"),
+        (
+            'model_outputs["choices"][0]["message"].content',
+            "model_outputs.choices[0].message.content",
+        ),
+        ('model_outputs["data"][0].embedding', "model_outputs.data[0].embedding"),
+        ('model_outputs["usage"].total_tokens', "model_outputs.usage.total_tokens"),
+        ('self.last.choices[0]["text"]', "self.last.choices[0].text"),
+    ],
+)
+def test_mixed_access_on_any_root_is_flagged(scan_code, expr, new):
+    findings = scan_code(f"import openai\n\ndef fmt(self, model_outputs, i):\n    return {expr}\n")
+    (f,) = findings
+    assert (f.line, f.category, f.confidence) == (4, "response_access", "likely")
+    assert f.old_pattern == expr
+    assert f.suggestion.startswith(MIXED) and f.suggestion.endswith(f"use {new}")
+
+
+def test_mixed_access_finding_ends_at_the_response_part(scan_code):
+    (f,) = scan_code(
+        'import openai\n\ndef fmt(out):\n    return out.choices[0]["text"].strip().split()[0]\n'
+    )
+    assert f.old_pattern == 'out.choices[0]["text"]'
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        "out.choices[0].text",  # 1.x
+        'out.choices["text"]',  # no index after a list container
+        'out.data["rows"]',
+        'out.data[0]["label"]',  # not an embeddings key
+        'out.usage["cost"]',
+        'out["choices"][0]["label"]',
+        'out["usage"]["total_tokens"]',  # keys only, usage: a plain dict reads the same
+        'out["data"][0]["url"]',  # keys only: url is no strong key
+    ],
+)
+def test_other_shapes_are_not_flagged(scan_code, expr):
+    assert scan_code(f"import openai\n\ndef fmt(out):\n    return {expr}\n") == []
+
+
+def test_keys_only_on_an_untracked_root(scan_code):
+    findings = scan_code(
+        """
+        import json
+        import openai
+
+        def embed(result, i):
+            return result["data"][i]["embedding"]
+
+        def chat(resp):
+            return resp["choices"][0]["message"]["content"]
+
+        def plain(payload, resp):
+            data = json.loads(payload)
+            d2 = resp.model_dump()
+            d3 = {"choices": [{"text": "x"}]}
+            return data["data"][0]["embedding"], d2["choices"][0]["text"], d3["choices"][0]["text"]
+
+        def guarded(chunk):
+            if isinstance(chunk, dict):
+                return chunk["choices"][0]["delta"]
+            return json.loads(chunk)["choices"][0]["delta"]
+        """
+    )
+    assert [(f.line, f.old_pattern) for f in findings] == [
+        (6, 'result["data"][i]["embedding"]'),
+        (9, 'resp["choices"][0]["message"]["content"]'),
+    ]
+    assert findings[0].suggestion == (
+        "1.x returns typed objects, not dicts: use result.data[i].embedding (or .model_dump() "
+        "where a dict is needed)"
+    )
+
+
+def test_shapes_need_an_openai_import(scan_code):
+    code = 'def fmt(out):\n    return out.choices[0]["text"], out["data"][0]["embedding"]\n'
+    assert scan_code(code) == []
+
+
+def test_tracked_responses_keep_their_finding(scan_code):
+    findings = scan_code(
+        """
+        import openai
+        r = openai.Completion.create(prompt="x")
+        a = r.choices[0]["text"]
+        b = r["choices"][0].text
+        c = r["data"][0]["embedding"]
+        """
+    )
+    accesses = [f for f in findings if f.category == "response_access"]
+    assert [f.line for f in accesses] == [4, 5, 6]
+    assert {f.suggestion for f in accesses} == {
+        "1.x returns typed objects, not dicts: use attribute access "
+        "(e.g. resp.choices[0].message.content) or resp.model_dump() for a dict"
+    }
+
+
+MOCK_ATTR = (
+    "1.x code reads responses with attributes, so mock data must be objects, not dicts "
+    "(0.x responses allowed both): e.g. "
+)
+
+
+def test_attribute_mock_data_in_test_files(tmp_path):
+    findings = _scan_file(
+        tmp_path,
+        "tests/test_llm.py",
+        """
+        from unittest.mock import MagicMock
+
+        def test_format(llm, create):
+            model_outputs = MagicMock()
+            model_outputs.choices = [{"text": "test_text"}]
+            create.return_value.choices = ({"message": {"content": 'hi'}},)
+            create.return_value.data = [{"embedding": [0.1, 0.2]}]
+            create.return_value.usage = {"total_tokens": 3}
+            create.return_value.choices[0].message = {"content": "x"}
+            other = MagicMock(choices=[{"text": "kw"}], data=[{"embedding": [1]}])
+            raw = dict(choices=[{"message": {}}])
+            fine = MagicMock(choices=["red"], data=[{"rows": 1}], usage={"cost": 1})
+            fine.choices = []
+            fine.message = {"content": "not under choices"}
+        """,
+    )
+    assert [(f.line, f.old_pattern, f.suggestion.removeprefix(MOCK_ATTR)) for f in findings] == [
+        (
+            6,
+            'model_outputs.choices = [{"text": "test_text"}]',
+            'model_outputs.choices = [SimpleNamespace(text="test_text")]',
+        ),
+        (
+            7,
+            'create.return_value.choices = ({"message": {"content": \'hi\'}},)',
+            "create.return_value.choices = (SimpleNamespace(message=SimpleNamespace("
+            "content='hi')),)",
+        ),
+        (
+            8,
+            'create.return_value.data = [{"embedding": [0.1, 0.2]}]',
+            "create.return_value.data = [SimpleNamespace(embedding=[0.1, 0.2])]",
+        ),
+        (
+            9,
+            'create.return_value.usage = {"total_tokens": 3}',
+            "create.return_value.usage = SimpleNamespace(total_tokens=3)",
+        ),
+        (
+            10,
+            'create.return_value.choices[0].message = {"content": "x"}',
+            'create.return_value.choices[0].message = SimpleNamespace(content="x")',
+        ),
+        (11, 'choices=[{"text": "kw"}]', 'choices=[SimpleNamespace(text="kw")]'),
+        (11, 'data=[{"embedding": [1]}]', "data=[SimpleNamespace(embedding=[1])]"),
+        (12, 'choices=[{"message": {}}]', "choices=[SimpleNamespace(message=SimpleNamespace())]"),
+    ]
+
+
+def test_attribute_mock_data_long_or_odd_keys_get_a_generic_example(tmp_path):
+    (f,) = _scan_file(
+        tmp_path,
+        "tests/test_llm.py",
+        'def test_x(m):\n    m.choices = [{"text": "t", "odd-key": 1}]\n',
+    )
+    assert f.suggestion == MOCK_ATTR + "SimpleNamespace(...) objects"
+
+
+def test_attribute_mock_data_outside_test_files_is_not_flagged(tmp_path):
+    code = 'def sample(m):\n    m.choices = [{"text": "t"}]\n'
+    assert _scan_file(tmp_path, "app/samples.py", code) == []
+
+
+def test_embeddings_dict_literal_in_test_files(tmp_path):
+    findings = _scan_file(
+        tmp_path,
+        "tests/test_embed.py",
+        """
+        def test_x(create):
+            create.return_value = {"data": [{"embedding": [0.1]}]}
+            rows = {"data": [{"id": 1}]}
+        """,
+    )
+    assert [(f.line, f.suggestion) for f in findings] == [(3, MOCK_DICT)]
+
+
+def test_mixed_access_fixture():
+    findings = scan(FIXTURES.parent / "mixed_access", "openai-v1").findings
+    accesses = [
+        (f.file, f.line, f.old_pattern) for f in findings if f.category == "response_access"
+    ]
+    assert accesses == [
+        ("flowkit/llms/chat.py", 12, 'model_outputs.choices[0]["message"]["content"]'),
+        ("flowkit/llms/chat.py", 13, 'model_outputs["usage"].total_tokens'),
+        ("flowkit/llms/completion.py", 19, 'model_outputs.choices[0]["text"]'),
+        ("flowkit/llms/embeddings.py", 13, 'result["data"][i]["embedding"]'),
+        ("flowkit/llms/embeddings.py", 16, 'result.data[0]["embedding"]'),
+        (
+            "tests/test_chat.py",
+            11,
+            'model_outputs.choices = [{"message": {"role": "assistant", "content": "hi"}}]',
+        ),
+        ("tests/test_completion.py", 14, 'mock_output.choices = [{"text": "test_text"}]'),
+        ("tests/test_completion.py", 23, 'model_outputs.choices = [{"text": "test_text"}]'),
+        (
+            "tests/test_embeddings.py",
+            10,
+            '{"data": [{"embedding": [0.1]}, {"embedding": [0.2]}]}',
+        ),
+    ]

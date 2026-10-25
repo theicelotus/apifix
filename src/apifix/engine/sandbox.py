@@ -36,6 +36,7 @@ from apifix.engine.docker import DockerCLI, DockerClient
 from apifix.engine.models import LibraryTarget, SmokeCheck
 from apifix.engine.project import (
     DEFAULT_PYTHON,
+    DroppedSource,
     InstallPlan,
     NotInstalled,
     SandboxRequirements,
@@ -146,6 +147,58 @@ RESOLUTION_ERROR_MARKERS = (
     "conflicting dependencies",
     "No matching distribution found",
 )
+# pip found the requirements themselves contradictory: never retried as transient, even when
+# its output also has a network marker (an outage prints "No matching distribution", not these).
+CONFLICT_MARKERS = ("ResolutionImpossible", "conflicting dependencies")
+MAX_CONFLICT_LINES = 20
+_MANIFEST_LINE_RE = re.compile(r"-([rc]) /manifest/(requirements|constraints)\.txt \(line (\d+)\)")
+_REQUESTED_RE = re.compile(r"The user requested (?:\(constraint\) )?([A-Za-z0-9][A-Za-z0-9._-]*)")
+
+
+def install_conflict(output: str, plan: InstallPlan) -> list[str]:
+    """pip's conflict lines from a ResolutionImpossible failure: "Cannot install ..." and the
+    list under "The conflict is caused by:", with the generated manifest's `-r
+    /manifest/requirements.txt (line N)` shown as the requirement itself (and a constraint as
+    the lockfile's pin). At most MAX_CONFLICT_LINES lines of 300 characters."""
+
+    def manifest_line(m: re.Match[str]) -> str:
+        lines = plan.requirements if m.group(1) == "r" else plan.constraints
+        n = int(m.group(3))
+        if not 1 <= n <= len(lines):
+            return m.group(0)
+        return lines[n - 1] if m.group(1) == "r" else f"{lines[n - 1]} (lockfile constraint)"
+
+    out: list[str] = []
+    in_causes = False
+    for raw in output.splitlines():
+        line = raw.rstrip()
+        if line.strip() == "The conflict is caused by:":
+            in_causes = True
+            out.append("The conflict is caused by:")
+            continue
+        if in_causes:
+            if line.startswith((" ", "\t")) and line.strip():
+                out.append("    " + line.strip())
+                continue
+            in_causes = False
+        if line.startswith("ERROR: Cannot install "):
+            out.append(line.removeprefix("ERROR: "))
+    out = [_MANIFEST_LINE_RE.sub(manifest_line, line) for line in dict.fromkeys(out)]
+    return [line if len(line) <= 300 else line[:297] + "..." for line in out[:MAX_CONFLICT_LINES]]
+
+
+def conflict_sources(
+    lines: Sequence[str], declared: Mapping[str, Sequence[str]]
+) -> dict[str, list[str]]:
+    """Package -> the repo files that declare it, for each package pip's conflict lines say
+    the user requested."""
+    out: dict[str, list[str]] = {}
+    for line in lines:
+        for m in _REQUESTED_RE.finditer(line):
+            name = normalize_name(m.group(1))
+            if name in declared:
+                out.setdefault(name, list(declared[name]))
+    return out
 
 
 @dataclass(frozen=True)
@@ -292,6 +345,10 @@ class SandboxResult:
     # its output
     runner_error: str | None = None
     runner_output: str = ""
+    # dependency files left out because their pins conflict with an installed one's
+    dropped_sources: list[DroppedSource] = field(default_factory=list)
+    # pip's conflict lines when the install failed with ResolutionImpossible (install_conflict)
+    install_conflict: list[str] = field(default_factory=list)
 
 
 _ARGPARSE_ERROR_RE = re.compile(r"^\S+: error: .+")
@@ -570,6 +627,7 @@ class Sandbox:
 
             if phase.status == "ok":
                 result.lockfile_applied = use_constraints
+                result.install_conflict = []  # an earlier attempt's conflict was resolved
                 return image
             if phase.status == "timeout":
                 result.status = "timeout"
@@ -577,8 +635,13 @@ class Sandbox:
                 return None
             if phase.status == "error":
                 break
-            if not result.install_retried and (
-                _has_marker(phase, NETWORK_ERROR_MARKERS) or not _has_marker(phase, known)
+            conflict = _has_marker(phase, CONFLICT_MARKERS)
+            if conflict:
+                result.install_conflict = install_conflict(phase.stdout + "\n" + phase.stderr, plan)
+            if (
+                not result.install_retried
+                and not conflict
+                and (_has_marker(phase, NETWORK_ERROR_MARKERS) or not _has_marker(phase, known))
             ):
                 result.install_retried = True
                 result.notes.append(
@@ -590,6 +653,12 @@ class Sandbox:
                 result.notes.append(f"build error on the slim image; retrying with {image}")
                 continue
             if use_constraints and _has_marker(phase, RESOLUTION_ERROR_MARKERS):
+                causes = [line for line in result.install_conflict if line.startswith("    ")]
+                if conflict and causes and not any("(constraint)" in c for c in causes):
+                    result.notes.append(
+                        f"pip's conflict involves no {plan.lockfile} pin; not retried without them"
+                    )
+                    break
                 use_constraints = False
                 result.notes.append(
                     f"{plan.lockfile} pins could not be resolved; retrying without them"
@@ -900,6 +969,7 @@ class SandboxSession:
         base.requirements_override = plan.override
         base.override_replaced = list(plan.replaced)
         base.override_upgraded = list(plan.upgraded)
+        base.dropped_sources = list(plan.dropped_sources)
 
         usable, why = self.sandbox.docker.available()
         if not usable:

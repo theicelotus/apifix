@@ -70,11 +70,13 @@ src/apifix/
     project.py        target repo facts: Python version, test files (`is_test_file`, the one
                       definition everything uses), test plan (pytest, explicit file list,
                       import paths), install plan (where each dependency is declared, what
-                      is left out, --sandbox-requirements plans), lockfile pins, env vars the
-                      repo's GitHub Actions set
+                      is left out, one file of those whose exact pins conflict,
+                      --sandbox-requirements plans), lockfile pins, env vars the repo's
+                      GitHub Actions set
     sandbox.py        two-phase Docker run (install with network, test without); sessions
                       install once and run tests repeatedly; optional coverage; one retry of
-                      an install that failed transiently; test-phase env placeholders; the
+                      an install that failed transiently (never a resolution conflict, whose
+                      pip conflict lines are kept); test-phase env placeholders; the
                       migration's post-install smoke check (no network, no repo code);
                       persistent pip cache (install phase only) and download figures
     sandbox_driver.py runs INSIDE containers (Python 3.8+ compatible, stdlib only)
@@ -230,7 +232,24 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   list) are not scanned. Environment files: `environment.yml` / `environment.yaml` only (not
   `environment-dev.yml` or files passed to `conda env create -f` under other names).
 - No cross-function tracking of response objects: dict-style access is only flagged when the
-  response is assigned and used in the same function/module scope.
+  response is assigned and used in the same function/module scope, or by its shape (below).
+- openai-v1 response shapes (`python_checks._mixed_end`, files with an openai import, any root,
+  e.g. a parameter: llmflows' `_format_results(self, model_outputs)`), [likely]
+  `response_access` with the rewritten expression in the suggestion: mixed access, which only
+  0.x objects allowed: `.choices[i]` / `.data[i]` followed by a string key of
+  `rules.CHOICE_KEYS` / `DATA_KEYS` (`x.choices[0]["text"]`, `x.choices[0].message["content"]`,
+  `x.data[0]["embedding"]`), `.usage["total_tokens"]`, and the reverse (`x["choices"][0].text`,
+  `x["data"][0].embedding`, `x["usage"].total_tokens`); keys only, `x["choices"][i]["message" |
+  "text" | "delta"]` and `x["data"][i]["embedding"]` (`rules.KEY_ONLY_KEYS`), unless the root
+  is known to be a plain dict: a dict literal / `dict()` / `json.load(s)` / `.model_dump()` /
+  `.to_dict()` / `.json()` value or a name last assigned one in the scope (in source order), or
+  a name under a dict guard (`streaming.dict_guarded`). The finding ends at the last response
+  part (not a trailing `.strip()`). A tracked response keeps its RESPONSE_ACCESS finding. Not
+  flagged: files without an openai import (a helper module that only receives responses;
+  litellm-style SDKs whose objects allow both), `.get(...)` on such chains, keys-only
+  `["usage"][...]` / `["data"][i]["url"]`. Known false positive: keys only on a plain dict
+  that comes in as a parameter (a raw HTTP reply's `.json()` made in another function) in a
+  file that imports openai.
 - openai-v1 streaming: an api_call finding whose call passes `stream=` (anything but a `False`
   / `None` constant, so `stream=stream` counts) ends with `rules.STREAM_CALL` (delta.content
   always exists, None on role and final chunks); that text selects the Streaming guide part.
@@ -268,8 +287,19 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   suggestion, `rules.MOCK_DICT_CHUNK`, or `MOCK_DICT_CHUNK_ROLE` when the delta has a `"role"`
   key: its example keeps `role=` with the literal's value, `...` when not a string constant;
   both select the Streaming part) are a [likely]
-  `response_access` finding, without requiring an openai import. `dict(choices=...)` calls and dicts built step by step are
-  missed; the same literal in a non-test file (fixtures modules, sample data) is not flagged.
+  `response_access` finding, without requiring an openai import; so is `{"data": [{"embedding":
+  ...}]}` (MOCK_DICT_RESPONSE). Dicts built step by step are missed; the same literal in a
+  non-test file (fixtures modules, sample data) is not flagged.
+- openai-v1, test files only: dict-shaped mock data put on an object (`python_checks.
+  _mock_attr_data` / `_mock_keyword_data`, `rules.MOCK_ATTR_DATA`, [likely] `response_access`):
+  an assignment to an attribute `.choices` / `.data` (a list or tuple holding a dict with a key
+  of `rules.MOCK_ATTR_KEYS`: message, text, delta; embedding, url, b64_json) or `.usage` (a dict
+  with a token key), on any chain (`m.choices`, `create.return_value.data`); `.message` /
+  `.delta` assigned a dict with content / role / function_call / tool_calls under
+  `.choices[i]`; and the keywords `choices=` / `data=` / `usage=` of any call
+  (`MagicMock(choices=[...])`, `dict(choices=[...])`). The suggestion converts the literal to
+  `SimpleNamespace(...)` objects (identifier keys, values as written; else a generic example).
+  Not flagged: augmented or annotated assignments, `setattr`, data built in a helper.
 
 - Already migrated (`already_migrated.py`): all of (a) at least one declaration of the library,
   and every one allows only `first_version` or later (`==1.12.0`, `>=1.0`, `~=1.3`; unpinned,
@@ -315,6 +345,28 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   original's only -> `library_removed` (reject); declared for the fix but not installed
   (markers, extras) -> the dependency message above.
 
+- Conflicting dependency sources (`project._conflicting_sources`): two dependency files
+  conflict when an exact pin (`name==v`, no marker, no direct reference) in one is ruled out by
+  the other's requirement for that name (also without a marker). Conda environment files are
+  not compared. Files in a conflict are ranked: installed by an install command in a GitHub
+  Actions workflow, then in a root `README*`, then package metadata (pyproject.toml, setup.cfg,
+  setup.py), then read order (manifests, requirement files); each is kept unless it conflicts
+  with one kept before. Install commands, by regex per line (no YAML parser, no shell `cd`):
+  `pip install` (`pip3`, `python -m pip`, `uv pip`) with `-r` / `--requirement FILE`, `.` /
+  `-e .` / `.[extras]` / the project's own name (the metadata files); `poetry install`
+  (pyproject.toml); `pipenv install` (Pipfile). A dropped file installs nothing (not even
+  entries no conflict touches; they are listed under "Declared dependencies not installed")
+  and is no lockfile; `InstallPlan.dropped_sources` / run summaries `dropped_sources`, a plan
+  note, the job report ("Dependency sources conflict: ...") and the verification report
+  ("**Dependency sources:**"). Conflicts with transitive requirements are pip's to find.
+- Resolution conflicts (`ResolutionImpossible` / "conflicting dependencies"): never retried as
+  transient, even with a network marker in the output; retried without the lockfile only when
+  pip's conflict list names a constraint ("(constraint)") or there is no list. pip's conflict
+  lines ("Cannot install ...", "The conflict is caused by:" and its list; manifest references
+  `-r /manifest/requirements.txt (line N)` shown as the requirement) are kept on the run
+  (`install_conflict`, at most 20 lines) and shown under "Dependency install conflict" with the
+  repo files declaring each package "The user requested": in the verification report, and in
+  the job report when the baseline failed and no verification follows.
 - Dependencies come from static parsing. Requirements computed dynamically in `setup.py`, `-r`
   includes outside the repo root / `requirements/`, and nested packages in monorepos are missed;
   a missing dependency shows up as an import error in the test phase.
