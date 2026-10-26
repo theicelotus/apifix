@@ -22,6 +22,7 @@ from apifix.engine.code_checks import (
     ImportTable,
     add_missing_imports,
     added_call_assertions,
+    commented_out_code,
     mock_target_problems,
     undefined_names,
 )
@@ -641,7 +642,8 @@ def check_candidate(
     key while the code under test builds a client without one; `importable` a target whose
     first name is no repo module and nothing the test run can import). Test files also get
     the call-assertion check: no call assertion (`create.assert_called_once()`) a test did not
-    make before (code_checks.added_call_assertions). Python files that parse first get an
+    make before (code_checks.added_call_assertions), and no changed line that is only an old
+    line commented out (code_checks.commented_out_code). Python files that parse first get an
     import for each new undefined name with exactly one
     `known_imports` entry, so every check sees the completed file (`text`, `auto_imports`).
 
@@ -751,6 +753,7 @@ def check_candidate(
     tests = python and is_test_file(path, original)
     added_calls = added_call_assertions(original, candidate) if tests else []
     record_all("call_assertions", added_calls, tests)
+    record_all("commented_out", commented_out_code(original, candidate) if python else [], python)
 
     unrelated_problems = (
         revert_errors

@@ -26,6 +26,9 @@ def ask(msgs):
 - `OpenAI()` reads `OPENAI_API_KEY` from the environment itself: do not add
   `api_key=os.getenv("OPENAI_API_KEY")` or `import os` for it. Pass `api_key=` only where
   0.x code set a key from somewhere else.
+- Delete code you replace or no longer need (`openai.api_key = ...`, an old call): never leave
+  it behind as a comment, with or without an explanation such as `# Removed: ...`. The diff
+  already shows what was removed.
 - Prefer creating the client where it is used: inside the function that calls the API, or
   lazily through a small cached function (`functools.lru_cache` on `get_client()`). Avoid a
   module-level `client = OpenAI()`: `OpenAI()` raises at construction when no API key is

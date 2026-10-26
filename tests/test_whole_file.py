@@ -114,6 +114,7 @@ def test_valid_changed_python_passes():
         "undefined_names": "ok",
         "mock_targets": "n/a",  # not a test file
         "call_assertions": "n/a",
+        "commented_out": "ok",
         "unrelated_edits": "n/a",  # no findings given
         "config": "n/a",  # no migration checks given
         "completeness": "n/a",  # no rescan given
@@ -856,3 +857,55 @@ def test_llmflows_attempt_5_version_passes_the_check():
     kept = (LLMFLOWS / "openai_embeddings_attempt5.txt").read_text()
     r = _embeddings_check(kept, remaining=_rescan, old_api=MIGRATION.source_name)
     assert r.checks["completeness"] == "ok"
+
+
+# --- commented-out old code -------------------------------------------------------------------
+
+KEYED = (
+    'import os\nimport openai\n\nopenai.api_key = os.getenv("OPENAI_API_KEY")\n'
+    + APP.split("\n", 1)[1]
+)
+KEY_LINE = 'openai.api_key = os.getenv("OPENAI_API_KEY")'
+KEY_FIXED = (
+    "import openai\n\nclient = openai.OpenAI()\nr = client.chat.completions.create(model='m')\n"
+)
+
+
+@pytest.mark.parametrize(
+    "comment",
+    [
+        f"# {KEY_LINE}",
+        f"# {KEY_LINE}  # Removed: OpenAI() reads the env variable itself",
+        f"#{KEY_LINE}",
+    ],
+)
+def test_the_old_code_commented_out_is_a_check_error_asking_to_delete_it(comment):
+    candidate = KEY_FIXED.replace("import openai\n\n", f"import openai\n\n{comment}\n", 1)
+    result = check_candidate("app.py", KEYED, candidate, required=True)
+    assert result.error_checks == ["commented_out"]
+    (error,) = result.errors
+    assert "line 3" in error and KEY_LINE in error and "delete" in error
+    assert result.checks["commented_out"].startswith("line 3")
+
+
+def test_deleting_the_old_code_or_explaining_without_it_passes():
+    assert (
+        check_candidate("app.py", KEYED, KEY_FIXED, required=True).checks["commented_out"] == "ok"
+    )
+    explained = KEY_FIXED.replace(
+        "import openai\n\n", "import openai\n\n# OpenAI() reads the key from the environment\n", 1
+    )
+    assert check_candidate("app.py", KEYED, explained, required=True).ok
+
+
+def test_comments_the_original_already_had_are_not_commented_out_code():
+    original = "import openai\n\n# x = 1\nr = openai.ChatCompletion.create(model='m')\n"
+    candidate = "import openai\n\n# x = 1\n" + NEW.split("\n\n", 1)[1]
+    assert (
+        check_candidate("app.py", original, candidate, required=True).checks["commented_out"]
+        == "ok"
+    )
+    assert (
+        check_candidate("notes.txt", "a = 1\n", "# a = 1\n", required=True).checks["commented_out"]
+        == "n/a"
+    )

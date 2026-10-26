@@ -276,27 +276,93 @@ def test_guide_prefers_creating_the_client_where_it_is_used():
 
 
 @pytest.mark.parametrize(
-    ("category", "old", "new"),
+    ("category", "old", "new_code", "bullet"),
     [
-        ("api_call", "openai.ChatCompletion.create", "`client.chat.completions.create`"),
-        ("api_call", '"openai.ChatCompletion.create"', "`client.chat.completions.create`"),
-        ("api_call", "openai.ChatCompletion.acreate", "`await client.chat.completions.create`"),
-        ("api_call", "openai.Image.create", "`client.images.generate`"),
-        ("api_call", "engine=self.model", "`model=`"),
-        ("response_access", 'resp["choices"]', "attributes"),
-        ("client_config", "openai.api_key = key", "client arguments"),
-        ("error_class", "RateLimitError", "`openai.*`"),
-        ("import", "APIError", "`openai.*`"),
-        ("api_call", "openai.FineTune.create", None),  # removed API: no single replacement
-        ("import", "numpy", None),
-        ("dependency", "openai==0.27.4", None),
+        (
+            "api_call",
+            "openai.ChatCompletion.create",
+            "client.chat.completions.create(",
+            "`openai.ChatCompletion.create` → `client.chat.completions.create`",
+        ),
+        (
+            "api_call",
+            '"openai.ChatCompletion.create"',
+            'mock.patch("x.client.chat.completions.create")',
+            "`openai.ChatCompletion.create` → `client.chat.completions.create`",
+        ),
+        (
+            "api_call",
+            "openai.ChatCompletion.acreate",
+            "await client.chat.completions.create(",
+            "`openai.ChatCompletion.acreate` → `await client.chat.completions.create`",
+        ),
+        ("api_call", "openai.Image.create", "client.images.generate(", "`client.images.generate`"),
+        ("api_call", "engine=self.model", "model=self.model", "`engine=` → `model=`"),
+        ("api_call", "openai.ChatCompletion.create", "something_else()", None),  # not in the diff
+        ("api_call", "engine=self.model", "self.model", None),
+        (
+            "response_access",
+            'resp["choices"]',
+            "resp.choices",
+            'dict responses (`resp["choices"]`)',
+        ),
+        ("response_access", 'resp["choices"]', 'resp["choices"]', None),  # still there
+        ("error_class", "RateLimitError", "openai.RateLimitError", "`openai.RateLimitError`"),
+        ("import", "InvalidRequestError", "BadRequestError", "→ `openai.BadRequestError`"),
+        ("import", "TryAgain", "pass", None),  # removed: no replacement
+        ("api_call", "openai.FineTune.create", "client.x.create", None),  # removed API
+        ("import", "numpy", "numpy", None),
+        ("dependency", "openai==0.27.4", "openai>=1", None),
     ],
 )
-def test_openai_pr_change_bullets(category, old, new):
-    bullet = get_migration("openai-v1").pr_change(category, old)
-    assert (new in bullet) if new else bullet is None
+def test_openai_pr_change_bullets(category, old, new_code, bullet):
+    got = get_migration("openai-v1").pr_change(category, old, new_code, new_code)
+    assert (bullet in got) if bullet else got is None
+
+
+KEY = 'openai.api_key = os.getenv("OPENAI_API_KEY")'
+
+
+@pytest.mark.parametrize(
+    ("old", "new_code", "bullet"),
+    [
+        (KEY, "", f"`{KEY}` removed: `OpenAI()` reads `OPENAI_API_KEY` itself"),
+        (KEY, "client = OpenAI()", f"`{KEY}` removed: `OpenAI()` reads `OPENAI_API_KEY` itself"),
+        (
+            KEY,
+            'client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=5)',
+            f'`{KEY}` → client argument `api_key=os.getenv("OPENAI_API_KEY")`',
+        ),
+        ("openai.api_key = key", "client = OpenAI()", "`openai.api_key = key` removed"),
+        (
+            'openai.api_base = "http://x"',
+            'client = OpenAI(base_url="http://x")',
+            '`openai.api_base = "http://x"` → client argument `base_url="http://x"`',
+        ),
+        (
+            'openai.api_base = "http://x"',
+            'openai.base_url = "http://x"',
+            '`openai.api_base = "http://x"` → `openai.base_url = "http://x"`',
+        ),
+        (  # a commented-out line is not a replacement
+            KEY,
+            f"# {KEY}  # Removed: api_key=...",
+            f"`{KEY}` removed: `OpenAI()` reads `OPENAI_API_KEY` itself",
+        ),
+        ("openai.something = 1", "", None),
+    ],
+)
+def test_openai_config_bullets_name_only_what_the_diff_did(old, new_code, bullet):
+    got = get_migration("openai-v1").pr_change("client_config", old, new_code, new_code)
+    assert got == bullet
 
 
 def test_openai_pin_reasons_name_each_clause_of_the_pin_spec():
     mig = get_migration("openai-v1")
     assert set(mig.pin_reasons) == set(mig.pin_spec.split(","))
+
+
+def test_guide_says_to_delete_replaced_code_not_comment_it_out():
+    client = get_migration("openai-v1").guide.split("## Client")[1].split("##")[0]
+    assert "Delete code you replace" in client and "never leave" in client
+    assert "as a comment" in client

@@ -31,6 +31,15 @@ class ChangedFile:
 
 
 @dataclass(frozen=True)
+class _Edit:
+    """One run of changed lines in a diff: the old lines it removed and the text it added."""
+
+    first: int  # first old line removed
+    last: int  # last old line removed
+    added: str
+
+
+@dataclass(frozen=True)
 class PullRequestText:
     title: str
     body: str
@@ -145,9 +154,77 @@ def _weak_section(v: dict[str, Any]) -> list[str]:
     return lines + [""]
 
 
-def _main_changes(v: dict[str, Any], trajectory: dict[str, Any], migration: Migration) -> list[str]:
+def _edit(removed: list[int], added: list[str]) -> _Edit:
+    return _Edit(removed[0], removed[-1], "\n".join(added))
+
+
+_HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,(\d+))? @@")
+
+
+def _diff_edits(diff: str) -> dict[str, list[_Edit]]:
+    """Per file, the runs of removed and added lines of a unified diff (context lines split
+    them), with the old line numbers the removed lines had."""
+    edits: dict[str, list[_Edit]] = {}
+    path: str | None = None
+    lines = diff.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        if line.startswith("+++ "):
+            name = line[4:].split("\t")[0]
+            path = name[2:] if name.startswith("b/") else None
+            continue
+        header = _HUNK_HEADER.match(line)
+        if not header or path is None:
+            continue
+        old_left = int(header[2] if header[2] is not None else 1)
+        new_left = int(header[3] if header[3] is not None else 1)
+        old_line = int(header[1])
+        removed: list[int] = []
+        added: list[str] = []
+        while (old_left > 0 or new_left > 0) and i < len(lines):
+            line = lines[i]
+            i += 1
+            if line.startswith("\\"):
+                continue
+            if line.startswith("-"):
+                removed.append(old_line)
+                old_line += 1
+                old_left -= 1
+            elif line.startswith("+"):
+                added.append(line[1:])
+                new_left -= 1
+            else:  # context ends a run of changes
+                if removed:
+                    edits.setdefault(path, []).append(_edit(removed, added))
+                removed, added = [], []
+                old_line += 1
+                old_left -= 1
+                new_left -= 1
+        if removed:
+            edits.setdefault(path, []).append(_edit(removed, added))
+    return edits
+
+
+def _fixed_code(edits: dict[str, list[_Edit]], finding: dict[str, Any]) -> tuple[str, str] | None:
+    """(the code the diff put where a finding's old code was, every line the diff added to its
+    file), None when the diff did not touch the finding's lines."""
+    first = finding["line"]
+    last = finding.get("end_line") or first
+    here = [e.added for e in edits.get(finding["file"], []) if e.first <= last and e.last >= first]
+    if not here:
+        return None
+    return "\n".join(here), "\n".join(e.added for e in edits[finding["file"]])
+
+
+def _main_changes(
+    v: dict[str, Any], trajectory: dict[str, Any], migration: Migration, diff: str
+) -> list[str]:
     """Up to MAIN_CHANGES "old -> new" bullets for the findings the change resolved, the most
-    common first. A remaining finding is matched without its line, which the fix moved."""
+    common first, each built from the finding's old code and what the diff put there. A remaining
+    finding is matched without its line, which the fix moved."""
+    edits = _diff_edits(diff)
     remaining = Counter(
         (r["file"], r["category"], r["old_pattern"]) for r in v["remaining_findings"]
     )
@@ -157,7 +234,8 @@ def _main_changes(v: dict[str, Any], trajectory: dict[str, Any], migration: Migr
         if remaining[key]:
             remaining[key] -= 1
             continue
-        bullet = migration.pr_change(f["category"], f["old_pattern"])
+        fixed = _fixed_code(edits, f)
+        bullet = fixed and migration.pr_change(f["category"], f["old_pattern"], *fixed)
         if bullet:
             bullets[bullet] += 1
     if not bullets:
@@ -370,11 +448,13 @@ def build_pull_request_text(
     *,
     files: Sequence[ChangedFile],
     base: str,
+    diff: str = "",
     lockfiles: Sequence[str] = (),
     repo_url: str | None = None,
 ) -> PullRequestText:
-    """Title, body and commit message. `lockfiles`: lockfiles the change leaves stale;
-    `repo_url`: apifix's home page (the re-check section is left out without one)."""
+    """Title, body and commit message. `diff`: the change (the main changes come from it);
+    `lockfiles`: lockfiles the change leaves stale; `repo_url`: apifix's home page (the
+    re-check section is left out without one)."""
     job = trajectory["job"]
     build = job.get("apifix") or {}
     v = verification
@@ -383,7 +463,7 @@ def build_pull_request_text(
     if weak:
         body += _weak_section(v)
     body += ["## Why", "", migration.pr_why, ""]
-    body += _main_changes(v, trajectory, migration)
+    body += _main_changes(v, trajectory, migration, diff)
     body += ["## What changed", ""]
     body += _what_changed(v, job, files, migration) + ["", "## Tests", ""]
     body += _tests_section(v) + [""]

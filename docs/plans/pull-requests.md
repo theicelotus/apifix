@@ -280,3 +280,55 @@ Request (verbatim):
 - Tests: `test_pr_body.py`, `test_migrations.py`, `test_verifier.py`. Full suite 1874 passed.
 - Known gap: runs made before this change have no `uncovered` lines, so their body shows the
   coverage ratio only until they are re-verified.
+
+## PR-quality fixes (wolverine-gptoss-pr)
+
+Request (verbatim):
+
+> Two PR-quality fixes, found in ~/apifix-runs/wolverine-gptoss-pr:
+>
+> 1. pr-body "Main changes" must describe what this diff did, not the
+>    finding type's generic pattern. wolverine's bullet says settings moved
+>    to client arguments (api_key=..., base_url=...), but the fix dropped
+>    `openai.api_key = os.getenv("OPENAI_API_KEY")` because OpenAI() reads
+>    OPENAI_API_KEY itself, and the repo has no api_base. Build each bullet
+>    from the resolved findings' actual old code and the fixed code, and
+>    only name settings that appear in the diff.
+>
+> 2. The fix commented the line out instead of deleting it:
+>    `# openai.api_key = ...  # Removed: OpenAI() reads the env variable itself`.
+>    Add to the openai-v1 guide: delete replaced code, never leave it
+>    commented out. Add a check in whole-file mode: a changed line that is
+>    only the old code commented out (with or without an explanation) is a
+>    check error asking to delete it.
+>
+> Tests, a short section in docs/plans/pull-requests.md, commit when the
+> full suite and ruff pass.
+
+### Plan
+
+- `build_pull_request_text` takes the run's `fix.diff`. Each resolved finding is matched to the
+  diff's run of changed lines that removed its old lines (old line numbers), and
+  `Migration.pr_change(category, old_pattern, new_code, file_code)` builds the bullet from the
+  old code and the lines the diff added there (`file_code`: all lines added to the file, since
+  a setting moves to a client built elsewhere). A finding the diff did not touch gets no bullet.
+- openai-v1 (`rules.pr_change`): a call bullet needs the new name in the added lines; a
+  module setting is "→ client argument `api_key=...`" (the argument as the diff wrote it),
+  "→ `openai.base_url = ...`", or "removed" (with "`OpenAI()` reads `OPENAI_API_KEY` itself"
+  when the old value came from the variable 1.x reads); comment-only added lines never count.
+  Response-access bullets show the old expression; error bullets name the class pair.
+- Guide (`client` part): delete replaced code, never leave it as a comment.
+- Check `commented_out` (`code_checks.commented_out_code`, run by `check_candidate` on Python
+  files): a changed line that is only a removed original line behind `#`, optionally followed
+  by `# explanation`, is an error naming the line and asking to delete it. Comments the original
+  already had and comments that are not old code are not flagged.
+
+### Built
+
+- As planned. `apifix pr` passes the diff; runs made before this change need no new data.
+- wolverine-gptoss-pr's body now reads: `openai.api_key = os.getenv("OPENAI_API_KEY")` removed:
+  `OpenAI()` reads `OPENAI_API_KEY` itself (no `base_url`, no "client arguments").
+- Tests: `test_pr_body.py`, `test_migrations.py`, `test_whole_file.py`, `test_agent.py`.
+- Known gap: the whole-file check sees only a line that is exactly the old line behind `#`; old
+  code reworded inside a comment, or a multi-line statement commented out as a block string, is
+  not caught. Agent (tool-edit) mode has no such check yet.

@@ -10,6 +10,7 @@ import pytest
 
 from apifix.engine import pr_body
 from apifix.engine.migrations import get_migration
+from apifix.engine.migrations.openai_v1.rules import RESOURCES
 from apifix.engine.pr_body import LIST_LIMIT, ChangedFile, build_pull_request_text
 
 MIGRATION = get_migration("openai-v1")
@@ -370,36 +371,69 @@ def trajectory_with(*findings):
     return out
 
 
+def edit(line, old, new, file="app.py"):
+    """A one-line-context-free diff of `file` that replaces the old lines starting at `line`."""
+    old, new = old.splitlines(), new.splitlines()
+    return (
+        f"diff --git a/{file} b/{file}\n--- a/{file}\n+++ b/{file}\n"
+        f"@@ -{line},{len(old)} +{line},{len(new)} @@\n"
+        + "".join(f"-{x}\n" for x in old)
+        + "".join(f"+{x}\n" for x in new)
+    )
+
+
+def main_changes(body):
+    return body.split("## Main changes\n\n")[1].split("\n\n")[0].splitlines()
+
+
 def test_main_changes_are_the_resolved_patterns_deduplicated():
     trajectory = trajectory_with(
-        finding("api_call", "openai.Embedding.create"),
+        finding("api_call", "openai.Embedding.create", line=2),
         finding("api_call", "openai.ChatCompletion.create", line=5),
         finding("api_call", '"openai.ChatCompletion.create"', line=9),
-        finding("response_access", 'r["choices"][0]'),
-        finding("response_access", 'r["data"]', line=12),
+        finding("response_access", 'r["choices"][0]', line=11),
+        finding("response_access", 'r["choices"][0]', line=12),
         finding("dependency", "openai==0.27.4"),
     )
-    body = build(trajectory=trajectory).body
-    section = body.split("## Main changes\n\n")[1].split("\n\n")[0].splitlines()
-    assert section == [
-        "- `openai.ChatCompletion.create` → `client.chat.completions.create`",
-        '- dict responses (`resp["choices"][0]["message"]["content"]`) → attributes '
-        "(`resp.choices[0].message.content`)",
+    diff = "".join(
+        [
+            edit(2, "e = openai.Embedding.create(x)", "e = client.embeddings.create(x)"),
+            edit(5, "r = openai.ChatCompletion.create(", "r = client.chat.completions.create("),
+            edit(9, '"openai.ChatCompletion.create"', '"app.OpenAI"'),
+            edit(11, 'a = r["choices"][0]', "a = r.choices[0]"),
+            edit(12, 'b = r["choices"][0]', "b = r.choices[0]"),
+        ]
+    )
+    body = build(trajectory=trajectory, diff=diff).body
+    assert main_changes(body) == [
+        '- dict responses (`r["choices"][0]`) → attributes',
         "- `openai.Embedding.create` → `client.embeddings.create`",
+        "- `openai.ChatCompletion.create` → `client.chat.completions.create`",
     ]
     assert body.index("## Main changes") < body.index("## What changed")
 
 
 def test_main_changes_skip_findings_left_and_stop_at_five():
     resources = ["Embedding", "Image", "Moderation", "File", "Model", "Completion", "Audio"]
-    trajectory = trajectory_with(*[finding("api_call", f"openai.{r}.list") for r in resources])
-    section = build(trajectory=trajectory).body.split("## Main changes\n\n")[1]
-    assert len(section.split("\n\n")[0].splitlines()) == 5
+    trajectory = trajectory_with(
+        *[finding("api_call", f"openai.{r}.list", line=i + 1) for i, r in enumerate(resources)]
+    )
+    diff = "".join(
+        edit(i + 1, f"openai.{r}.list()", f"client.{RESOURCES[r]}.list()")
+        for i, r in enumerate(resources)
+    )
+    assert len(main_changes(build(trajectory=trajectory, diff=diff).body)) == 5
     left = {"file": "app.py", "line": 7, "category": "api_call", "old_pattern": "openai.Model.list"}
     only = trajectory_with(
-        finding("api_call", "openai.Model.list"), finding("api_call", "openai.File.list")
+        finding("api_call", "openai.Model.list", line=1),
+        finding("api_call", "openai.File.list", line=2),
     )
-    body = build(modified(VERIFICATION, remaining_findings=[left], findings_before=2), only).body
+    diff = edit(1, "openai.Model.list()", "client.models.list()") + edit(
+        2, "openai.File.list()", "client.files.list()"
+    )
+    body = build(
+        modified(VERIFICATION, remaining_findings=[left], findings_before=2), only, diff=diff
+    ).body
     assert "client.files.list" in body and "client.models.list" not in body
 
 
@@ -407,6 +441,73 @@ def test_there_is_no_main_changes_section_without_resolved_patterns():
     assert "Main changes" not in build().body
     only_pin = trajectory_with(finding("dependency", "openai==0.27.4"))
     assert "Main changes" not in build(trajectory=only_pin).body
+
+
+WOLVERINE_KEY = 'openai.api_key = os.getenv("OPENAI_API_KEY")'
+
+
+def test_a_dropped_setting_is_described_as_dropped_not_as_a_client_argument():
+    """wolverine: `openai.api_key = ...` went because OpenAI() reads the variable itself, and
+    the repo has no api_base; the bullet must not mention client arguments or base_url."""
+    trajectory = trajectory_with(finding("client_config", WOLVERINE_KEY, line=16))
+    diff = edit(16, WOLVERINE_KEY, "") + edit(
+        60, "r = openai.Model.list()", "r = client.models.list()"
+    )
+    body = build(trajectory=trajectory, diff=diff).body
+    assert main_changes(body) == [
+        f"- `{WOLVERINE_KEY}` removed: `OpenAI()` reads `OPENAI_API_KEY` itself"
+    ]
+    assert "base_url" not in body and "api_base" not in body and "client argument" not in body
+
+
+def test_a_setting_moved_to_the_client_names_the_argument_the_diff_wrote():
+    trajectory = trajectory_with(
+        finding("client_config", 'openai.api_key = os.getenv("MY_KEY")', line=3),
+        finding("client_config", 'openai.api_base = "http://x/v1"', line=4),
+    )
+    diff = edit(
+        3, 'openai.api_key = os.getenv("MY_KEY")\nopenai.api_base = "http://x/v1"', ""
+    ) + edit(
+        20,
+        "r = openai.Model.list()",
+        'client = OpenAI(api_key=os.getenv("MY_KEY"), base_url="http://x/v1")',
+    )
+    assert main_changes(build(trajectory=trajectory, diff=diff).body) == [
+        '- `openai.api_key = os.getenv("MY_KEY")` → client argument `api_key=os.getenv("MY_KEY")`',
+        '- `openai.api_base = "http://x/v1"` → client argument `base_url="http://x/v1"`',
+    ]
+
+
+def test_a_setting_commented_out_is_not_reported_as_moved():
+    trajectory = trajectory_with(finding("client_config", WOLVERINE_KEY, line=16))
+    diff = edit(16, WOLVERINE_KEY, f"# {WOLVERINE_KEY}  # Removed: api_key=...")
+    (bullet,) = main_changes(build(trajectory=trajectory, diff=diff).body)
+    assert "client argument" not in bullet and "removed" in bullet
+
+
+def test_a_finding_the_diff_did_not_touch_gets_no_bullet():
+    trajectory = trajectory_with(finding("api_call", "openai.Model.list", line=30))
+    diff = edit(5, "x = 1", "x = 2")
+    assert "Main changes" not in build(trajectory=trajectory, diff=diff).body
+    # the diff must change the finding's file, and must really contain the new name
+    other = edit(30, "openai.Model.list()", "client.models.list()", file="other.py")
+    assert "Main changes" not in build(trajectory=trajectory, diff=other).body
+    wrong = edit(30, "openai.Model.list()", "something_else()")
+    assert "Main changes" not in build(trajectory=trajectory, diff=wrong).body
+
+
+def test_the_diff_is_read_across_hunks_context_lines_and_new_files():
+    diff = (
+        "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
+        "@@ -1,3 +1,3 @@\n import os\n-x = 1\n+x = 2\n y = 1\n"
+        "@@ -10,4 +10,4 @@\n a\n b\n-openai.Model.list()\n+client.models.list()\n"
+        "\\ No newline at end of file\n"
+        "diff --git a/new.py b/new.py\n--- /dev/null\n+++ b/new.py\n@@ -0,0 +1,1 @@\n+z = 1\n"
+    )
+    edits = pr_body._diff_edits(diff)
+    assert edits == {
+        "app.py": [pr_body._Edit(2, 2, "x = 2"), pr_body._Edit(12, 12, "client.models.list()")]
+    }
 
 
 def test_the_pin_line_says_why_from_the_migrations_data():

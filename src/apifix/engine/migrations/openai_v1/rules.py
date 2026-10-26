@@ -542,37 +542,79 @@ MOCK_ATTR_DATA = (
 # Pull request text (Migration.pr_change): the bullets of "main changes".
 _CALL_PATTERN = re.compile(r"openai\.(\w+)\.(\w+)")
 _KWARG_PATTERN = re.compile(r"^(\w+)=")
-PR_RESPONSE_ACCESS = (
-    'dict responses (`resp["choices"][0]["message"]["content"]`) → attributes '
-    "(`resp.choices[0].message.content`)"
-)
-PR_CONFIG = (
-    "module-level settings (`openai.api_key`, `openai.api_base`) → client arguments "
-    "(`openai.OpenAI(api_key=..., base_url=...)`)"
-)
-PR_ERRORS = (
-    "`openai.error.*` exceptions → `openai.*` (`openai.error.RateLimitError` → "
-    "`openai.RateLimitError`)"
-)
+_ASSIGNMENT = re.compile(r"^[\w.]*\.(\w+)\s*=\s*(.+)$")
+_CONFIG_NAMES = {"api_key": "api_key", "organization": "organization", "api_base": "base_url"}
+_CODE_WIDTH = 80
 
 
-def pr_change(category: str, old_pattern: str) -> str | None:
-    """The "old -> new" bullet for a resolved finding (see Migration.pr_change)."""
+def _inline(text: str) -> str:
+    """Inline code: one line, clipped, with no backticks to break the span."""
+    text = " ".join(text.replace("`", "'").split())
+    return "`" + (text[: _CODE_WIDTH - 1] + "…" if len(text) > _CODE_WIDTH else text) + "`"
+
+
+def _argument(code: str, name: str) -> str | None:
+    """`name=value` as written in `code` (a keyword argument), up to the `,` or `)` that ends it."""
+    start = re.search(rf"\b{name}\s*=(?!=)\s*", code)
+    if not start:
+        return None
+    depth, end = 0, len(code)
+    for i in range(start.end(), len(code)):
+        if code[i] in "([{":
+            depth += 1
+        elif depth == 0 and code[i] in ",\n)]}":
+            end = i
+            break
+        elif code[i] in ")]}":
+            depth -= 1
+    return code[start.start() : end].strip() or None
+
+
+def _config_change(old_pattern: str, new_code: str) -> str | None:
+    """What the diff did with a module-level setting: moved it to a client argument, renamed
+    it, or dropped it (1.x reads the environment variable itself). Only what is in the diff."""
+    old = _ASSIGNMENT.match(old_pattern)
+    if not old or old[1] not in _CONFIG_NAMES:
+        return None
+    attr, new_name = old[1], _CONFIG_NAMES[old[1]]
+    new_code = "\n".join(x for x in new_code.splitlines() if not x.lstrip().startswith("#"))
+    before = _inline(old_pattern)
+    kept = re.search(rf"^[^#\n]*\.{new_name}\s*=(?!=).*$", new_code, re.MULTILINE)
+    if kept:
+        return f"{before} → {_inline(kept[0].strip())}"
+    argument = _argument(new_code, new_name)
+    if argument:
+        return f"{before} → client argument {_inline(argument)}"
+    env = ENV_READ_BY_V1.get(new_name)
+    if env and env in old[2]:
+        return f"{before} removed: `OpenAI()` reads `{env}` itself"
+    return f"{before} removed" if attr in CONFIG_ASSIGN_ATTRS else None
+
+
+def pr_change(category: str, old_pattern: str, new_code: str, file_code: str) -> str | None:
+    """The "old -> new" bullet for a resolved finding (see Migration.pr_change), from its old
+    code and the lines the diff added; None when the diff does not show the change."""
     if category == "api_call":
         call = _CALL_PATTERN.search(old_pattern)
         if call and call[1] in RESOURCES:
             resource, method = call[1], call[2]
             is_async = method not in SYNC_METHODS and method[1:] in SYNC_METHODS
             sync = method[1:] if is_async else method
-            new = f"client.{RESOURCES[resource]}.{METHOD_RENAMES.get((resource, sync), sync)}"
-            return f"`openai.{resource}.{method}` → `{'await ' if is_async else ''}{new}`"
+            new = f"{RESOURCES[resource]}.{METHOD_RENAMES.get((resource, sync), sync)}"
+            if new not in new_code:
+                return None
+            return f"`openai.{resource}.{method}` → `{'await ' if is_async else ''}client.{new}`"
         kwarg = _KWARG_PATTERN.match(old_pattern)
-        if kwarg and kwarg[1] in KWARG_RENAMES:
+        if kwarg and kwarg[1] in KWARG_RENAMES and f"{KWARG_RENAMES[kwarg[1]]}=" in new_code:
             return f"`{kwarg[1]}=` → `{KWARG_RENAMES[kwarg[1]]}=`"
     elif category == "response_access":
-        return PR_RESPONSE_ACCESS
+        if old_pattern not in new_code:
+            return f"dict responses ({_inline(old_pattern)}) → attributes"
     elif category == "client_config":
-        return PR_CONFIG
+        return _config_change(old_pattern, file_code)
     elif category == "error_class" or (category == "import" and old_pattern in ERROR_CLASSES):
-        return PR_ERRORS
+        name = old_pattern.rsplit(".", 1)[-1]
+        new = ERROR_CLASSES.get(name, (None,))[0]
+        if new and new in new_code:
+            return f"`openai.error.{name}` → `openai.{new}`"
     return None

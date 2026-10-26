@@ -1254,6 +1254,7 @@ def test_whole_file_migrates_each_file_in_its_own_request(repo):
                 "undefined_names": "ok",
                 "mock_targets": "n/a",  # not a test file
                 "call_assertions": "n/a",
+                "commented_out": "ok",
                 "unrelated_edits": "ok",
                 "config": "ok",
                 "streaming": "ok",

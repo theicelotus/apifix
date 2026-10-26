@@ -79,9 +79,14 @@ class Migration(Protocol):
     # pin apifix wrote, in the pull request.
     pin_reasons: Mapping[str, str]
 
-    def pr_change(self, category: str, old_pattern: str) -> str | None:
+    def pr_change(
+        self, category: str, old_pattern: str, new_code: str, file_code: str
+    ) -> str | None:
         """For a resolved finding: one "old -> new" bullet (Markdown) for the pull request's
-        main changes, or None when it is not worth one. Findings with the same bullet merge."""
+        main changes, or None when it is not worth one. `new_code`: the lines the diff put
+        where the old code was, `file_code` every line the diff added to the file (a setting
+        moves to a client built elsewhere); a bullet names only what appears in them or in
+        `old_pattern`. Findings with the same bullet merge."""
         ...
 
     def job_guide(

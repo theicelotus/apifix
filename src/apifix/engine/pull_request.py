@@ -274,6 +274,7 @@ def make_pull_request(
         migration,
         files=files,
         base=base,
+        diff=diff.decode("utf-8", errors="replace"),
         lockfiles=lockfiles,
         repo_url=repo_url,
     )

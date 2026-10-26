@@ -30,6 +30,7 @@ from pathlib import PurePosixPath
 from pyflakes import checker, messages
 
 from apifix.engine.context import reachable_modules
+from apifix.engine.diffing import opcodes
 from apifix.engine.models import ClientKey
 
 # Imports suggested for common standard-library names a rewrite forgets to import.
@@ -1776,3 +1777,53 @@ def patches_client_class(source: str, test: str, client_classes: Collection[str]
         fn in site.tests and site.target.rsplit(".", 1)[-1] in client_classes
         for site in _patch_sites(tree)
     )
+
+
+def _uncommented(line: str) -> str | None:
+    """The text of a comment-only line without its `#`, None for any other line."""
+    text = line.strip()
+    return text.lstrip("#").strip() if text.startswith("#") else None
+
+
+def _without_comment(line: str) -> str:
+    """A code line without its trailing `# comment` (a `#` inside a string does not count)."""
+    quote = ""
+    for i, char in enumerate(line):
+        if quote:
+            if char == quote and line[i - 1] != "\\":
+                quote = ""
+        elif char in "\"'":
+            quote = char
+        elif char == "#":
+            return line[:i].rstrip()
+    return line.strip()
+
+
+def commented_out_code(original: str, candidate: str) -> list[str]:
+    """Changed lines that are only an old line commented out, with or without an explanation
+    after it (`# x = f()` or `# x = f()  # Removed: ...`), one error each. The line an edit
+    replaced must be deleted: a commented-out copy of the old code stays in the file for good
+    and tells a reviewer nothing the diff does not."""
+    old, new = original.splitlines(), candidate.splitlines()
+    regions = opcodes(original, candidate)
+    removed = {
+        code
+        for i1, i2, _, _ in regions
+        for line in old[i1:i2]
+        if _uncommented(line) is None and (code := _without_comment(line))
+    }
+    problems = []
+    for _, _, j1, j2 in regions:
+        for n in range(j1, j2):
+            text = _uncommented(new[n])
+            if not text:
+                continue
+            for line in removed:
+                rest = text[len(line) :]
+                if text.startswith(line) and (not rest.strip() or rest.lstrip().startswith("#")):
+                    problems.append(
+                        f"line {n + 1}: `{line}` is commented out instead of deleted; delete "
+                        "the line and leave no comment in its place"
+                    )
+                    break
+    return problems

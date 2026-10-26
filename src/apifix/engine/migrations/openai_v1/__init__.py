@@ -111,8 +111,10 @@ class OpenAIV1Migration:
         "`openai.error`, ...), so code written for 0.x fails once `openai>=1` is installed."
     )
 
-    def pr_change(self, category: str, old_pattern: str) -> str | None:
-        return rules.pr_change(category, old_pattern)
+    def pr_change(
+        self, category: str, old_pattern: str, new_code: str, file_code: str
+    ) -> str | None:
+        return rules.pr_change(category, old_pattern, new_code, file_code)
 
     def job_guide(
         self, findings: list[Finding], root: Path | None = None, shared: bool = False
