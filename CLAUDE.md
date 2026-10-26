@@ -91,3 +91,5 @@ Docker skips are not passes: fix Docker access instead of committing.
 - Read large source files by line range after a grep, not whole.
 - Don't add history or run notes to CLAUDE.md; they go in docs/notes.md.
 - Keep final summaries short: what changed, test count, known gaps.
+- Never start a second full test suite while one is still running (the Docker
+  tests clash). Wait for it to finish, or stop it first.
