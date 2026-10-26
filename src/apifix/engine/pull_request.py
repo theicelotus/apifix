@@ -12,7 +12,7 @@ import hashlib
 import json
 import re
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -27,6 +27,7 @@ from apifix.engine.verify_diff import VerifyError, check_no_symlinks
 
 OK_VERDICTS = ("verified", "verified_weak")
 RUN_FILES = ("fix.diff", "report.md", "verification.json", "trajectory.json")
+OUTPUT_FILES = ("pr-title.txt", "pr-body.md", "pr.json")
 NOREPLY_DOMAIN = "@users.noreply.github.com"
 _NOT_CONTROL = re.compile(r"[\x00-\x1f\x7f<>]")
 _NOT_RECORDED = re.compile(r"^not updated: (\S+); regenerate it$")
@@ -47,6 +48,7 @@ class PullRequestResult:
     dirty_apifix: bool
     lockfiles: list[str]
     outputs: list[str]
+    resumed: bool = False  # the branch was made by an earlier `--push` run that did not finish
 
 
 def identity_from_env(env: Mapping[str, str]) -> Identity:
@@ -200,38 +202,71 @@ def stale_lockfiles(
     return sorted(found - changed)
 
 
-def _build_commit(
-    repo: Path, base: str, branch: str, diff: bytes, message: str, who: Identity
-) -> tuple[str, list[str]]:
-    """Commit base + diff on `branch` with a temporary index. Returns (sha, files changed)."""
+def _tree_of_fix(repo: Path, base: str, diff: bytes, index: Path) -> str:
+    """The tree of base + diff, built in the temporary index file `index`."""
     try:
         check_no_symlinks(diff.decode("utf-8"))
     except (VerifyError, UnicodeDecodeError) as exc:
         raise PullRequestError(str(exc)) from None
+    env = {"GIT_INDEX_FILE": str(index)}
+    git(repo, ["read-tree", base], env=env)
+    applied = git(
+        repo, ["apply", "--cached", "--whitespace=nowarn", "-"], env=env, input=diff, check=False
+    )
+    if applied.returncode != 0:
+        detail = applied.stderr.decode("utf-8", "replace").strip()[-600:]
+        raise PullRequestError(f"fix.diff does not apply to {base[:12]}: {detail}")
+    return git_text(repo, ["write-tree"], env=env)
+
+
+def _changed_names(repo: Path, base: str, sha: str) -> list[str]:
+    changed = git(repo, ["diff-tree", "-r", "-z", "--no-renames", "--name-only", base, sha]).stdout
+    return sorted(n for n in changed.decode("utf-8", "replace").split("\0") if n)
+
+
+def _build_commit(
+    repo: Path, base: str, branch: str, diff: bytes, message: str, who: Identity
+) -> tuple[str, list[str]]:
+    """Commit base + diff on `branch` with a temporary index. Returns (sha, files changed)."""
     with tempfile.TemporaryDirectory(prefix="apifix-pr-") as tmp:
-        env = {"GIT_INDEX_FILE": str(Path(tmp) / "index")}
-        git(repo, ["read-tree", base], env=env)
-        applied = git(
-            repo,
-            ["apply", "--cached", "--whitespace=nowarn", "-"],
-            env=env,
-            input=diff,
-            check=False,
-        )
-        if applied.returncode != 0:
-            detail = applied.stderr.decode("utf-8", "replace").strip()[-600:]
-            raise PullRequestError(f"fix.diff does not apply to {base[:12]}: {detail}")
-        tree = git_text(repo, ["write-tree"], env=env)
+        tree = _tree_of_fix(repo, base, diff, Path(tmp) / "index")
         sha = git_text(
             repo,
             ["commit-tree", tree, "-p", base],
             identity=who,
-            env=env,
+            env={"GIT_INDEX_FILE": str(Path(tmp) / "index")},
             input=message.encode("utf-8"),
         )
-    changed = git(repo, ["diff-tree", "-r", "-z", "--no-renames", "--name-only", base, sha]).stdout
-    names = sorted(n for n in changed.decode("utf-8", "replace").split("\0") if n)
-    return sha, names
+    return sha, _changed_names(repo, base, sha)
+
+
+def _is_unfinished_push(
+    repo: Path, run: Path, branch: str, sha: str, base: str, diff: bytes, who: Identity
+) -> bool:
+    """`branch` is the commit an earlier `apifix pr --push` made for this run and never
+    opened a PR for: same commit as pr.json records, one commit on `base`, exactly base + diff,
+    authored by the env identity."""
+    try:
+        recorded = json.loads((run / "pr.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(recorded, dict) or recorded.get("pr_url"):
+        return False
+    if (
+        recorded.get("branch") != branch
+        or recorded.get("commit") != sha
+        or recorded.get("base") != base
+    ):
+        return False
+    parents = git_text(repo, ["rev-list", "--parents", "-n", "1", sha]).split()
+    if parents != [sha, base]:
+        return False
+    author = git_text(repo, ["log", "-1", "--format=%an <%ae>", sha])
+    with tempfile.TemporaryDirectory(prefix="apifix-pr-") as tmp:
+        tree = _tree_of_fix(repo, base, diff, Path(tmp) / "index")
+    return author == f"{who.name} <{who.email}>" and (
+        git_text(repo, ["rev-parse", f"{sha}^{{tree}}"]) == tree
+    )
 
 
 def make_pull_request(
@@ -240,8 +275,14 @@ def make_pull_request(
     *,
     env: Mapping[str, str],
     branch: str | None = None,
+    for_push: bool = False,
+    preflight: Callable[[str, str], None] | None = None,
 ) -> PullRequestResult:
-    """The dry run. Raises PullRequestError (nothing created) with the reason it refused."""
+    """The dry run. Raises PullRequestError (nothing created) with the reason it refused.
+
+    `for_push` adds the checks a published PR needs (an apifix build that can be reproduced) and
+    lets a branch left by an unfinished push be reused. `preflight(base, branch)` runs after every
+    local check and before anything is created; it may raise to refuse."""
     run_path, repo_path = Path(run_dir).resolve(), Path(repo).resolve()
     if not run_path.is_dir():
         raise PullRequestError(f"not a directory: {run_dir}")
@@ -257,10 +298,25 @@ def make_pull_request(
         migration = get_migration(job["migration"])
     except ValueError as exc:
         raise PullRequestError(str(exc)) from None
+    dirty = bool((job.get("apifix") or {}).get("dirty"))
+    if for_push and dirty:
+        raise PullRequestError(
+            "the run was made with a dirty apifix build (uncommitted changes in apifix itself), "
+            "so the version named in the pull request cannot be reproduced; commit apifix's "
+            f"changes, then {_verify_hint(repo_path, run_path, job['migration'])}"
+        )
     branch = branch or f"apifix/{migration.name}"
     if git(repo_path, ["check-ref-format", "--branch", branch], check=False).returncode != 0:
         raise PullRequestError(f"{branch!r} is not a valid branch name")
-    if git(repo_path, ["rev-parse", "--verify", "-q", f"refs/heads/{branch}"], check=False).stdout:
+    existing = git_text(
+        repo_path, ["rev-parse", "--verify", "-q", f"refs/heads/{branch}"], check=False
+    )
+    resumed = bool(
+        existing
+        and for_push
+        and _is_unfinished_push(repo_path, run_path, branch, existing, base, diff, who)
+    )
+    if existing and not resumed:
         raise PullRequestError(
             f"branch {branch} already exists in {repo_path}; delete it (git branch -D {branch}) "
             "or rename it, then run again"
@@ -278,16 +334,23 @@ def make_pull_request(
         lockfiles=lockfiles,
         repo_url=repo_url,
     )
-    sha, names = _build_commit(repo_path, base, branch, diff, text.commit_message, who)
-    if names != sorted(f.path for f in files):
-        raise PullRequestError(
-            f"the commit changes {names}, but fix.diff names {sorted(f.path for f in files)}; "
-            "nothing was created"
-        )
-    # "" as the old value: create the ref only if the branch is still absent.
-    git(repo_path, ["update-ref", f"refs/heads/{branch}", sha, ""])
-    dirty = bool((job.get("apifix") or {}).get("dirty"))
-    outputs = _write_outputs(run_path, text, branch, base, sha, names, verification, job, dirty)
+    if preflight:
+        preflight(base, branch)
+    if resumed:
+        # An earlier --push made this commit; keep pr-title.txt / pr-body.md (they may have been
+        # edited by hand since) and pr.json (it records how far the push got).
+        sha, names = existing, _changed_names(repo_path, base, existing)
+        outputs = [n for n in OUTPUT_FILES if (run_path / n).is_file()]
+    else:
+        sha, names = _build_commit(repo_path, base, branch, diff, text.commit_message, who)
+        if names != sorted(f.path for f in files):
+            raise PullRequestError(
+                f"the commit changes {names}, but fix.diff names "
+                f"{sorted(f.path for f in files)}; nothing was created"
+            )
+        # "" as the old value: create the ref only if the branch is still absent.
+        git(repo_path, ["update-ref", f"refs/heads/{branch}", sha, ""])
+        outputs = _write_outputs(run_path, text, branch, base, sha, names, verification, job, dirty)
     return PullRequestResult(
         branch=branch,
         base=base,
@@ -298,6 +361,7 @@ def make_pull_request(
         dirty_apifix=dirty,
         lockfiles=lockfiles,
         outputs=outputs,
+        resumed=resumed,
     )
 
 
@@ -322,6 +386,10 @@ def _write_outputs(
         "verdict": verification["verdict"],
         "apifix": job.get("apifix"),
         "apifix_dirty": dirty,
+        "github_user": None,
+        "upstream": None,
+        "fork": None,
+        "draft": None,
         "pushed": False,
         "pr_url": None,
     }
@@ -329,4 +397,12 @@ def _write_outputs(
     (run / "pr-title.txt").write_text(title, encoding="utf-8")
     (run / "pr-body.md").write_text(body, encoding="utf-8")
     (run / "pr.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-    return ["pr-title.txt", "pr-body.md", "pr.json"]
+    return list(OUTPUT_FILES)
+
+
+def update_summary(run_dir: str | Path, fields: Mapping[str, Any]) -> None:
+    """Add `fields` to the run's pr.json (redacted like the rest)."""
+    path = Path(run_dir) / "pr.json"
+    summary = _load_json(path)
+    summary.update(fields)
+    path.write_text(json.dumps(redact_local_paths(summary), indent=2) + "\n", encoding="utf-8")

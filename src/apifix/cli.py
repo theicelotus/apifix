@@ -18,6 +18,11 @@ apifix pr RUN_DIR --repo CHECKOUT
                                  run's fix, plus pr-title.txt, pr-body.md and pr.json in RUN_DIR
                                  (needs APIFIX_GIT_NAME and APIFIX_GIT_EMAIL, a noreply
                                  address; pushes nothing, no LLM)
+apifix pr RUN_DIR --repo CHECKOUT --push [--github-user LOGIN] [--upstream OWNER/REPO] [--ready]
+                                 also fork (unless you own the upstream), push the branch and
+                                 open a draft pull request with the `gh` CLI (--ready: not a
+                                 draft). LOGIN, or $APIFIX_GITHUB_USER, is the account gh must
+                                 be logged in as; any other account is refused
 apifix cleanup [--dry-run]      remove containers/temp dirs left by interrupted runs
 
 Exit codes: 0 clean (fix: verified; pr: branch made), 1 findings (fix: not verified),
@@ -171,6 +176,24 @@ def main(argv: list[str] | None = None) -> int:
     p_pr.add_argument("run_dir", help="output directory of a verified `fix` or `verify` run")
     p_pr.add_argument(
         "--repo", required=True, help="clean checkout of the repo the run was made on"
+    )
+    p_pr.add_argument(
+        "--push",
+        action="store_true",
+        help="also push the branch (to your fork, or to the upstream you own) and open a draft "
+        "pull request with gh",
+    )
+    p_pr.add_argument(
+        "--github-user",
+        help="the GitHub login gh must be logged in as ($APIFIX_GITHUB_USER); needed with --push",
+    )
+    p_pr.add_argument(
+        "--upstream",
+        metavar="OWNER/REPO",
+        help="repository to open the pull request in (default: the checkout's origin)",
+    )
+    p_pr.add_argument(
+        "--ready", action="store_true", help="open the pull request ready for review, not a draft"
     )
     p_clean = sub.add_parser(
         "cleanup",
@@ -348,21 +371,77 @@ def _fix(args: argparse.Namespace) -> int:
     return EXIT_USAGE if result.outcome == "aborted" else EXIT_FINDINGS
 
 
+def _plural(n: int, noun: str) -> str:
+    """`1 file`, `3 files`."""
+    return f"{n} {noun}" + ("" if n == 1 else "s")
+
+
 def _pr(args: argparse.Namespace) -> int:
     import os
+    from pathlib import Path
 
+    from apifix.engine.github import GitHub, GitHubError, PullRequestPublisher
     from apifix.engine.pull_request import PullRequestError, make_pull_request
 
-    try:
-        result = make_pull_request(args.run_dir, args.repo, env=os.environ)
-    except PullRequestError as exc:
-        print(f"apifix: refusing to make a pull request: {exc}", file=sys.stderr)
+    def refuse(reason: str) -> int:
+        print(f"apifix: refusing to make a pull request: {reason}", file=sys.stderr)
         return EXIT_USAGE
+
+    user = args.github_user or os.environ.get("APIFIX_GITHUB_USER", "")
+    if not args.push:
+        used = [
+            flag
+            for flag, given in (
+                ("--github-user", args.github_user),
+                ("--upstream", args.upstream),
+                ("--ready", args.ready),
+            )
+            if given
+        ]
+        if used:
+            return refuse(f"{', '.join(used)} only apply with --push")
+    elif not user.strip():
+        return refuse(
+            "--push needs the GitHub login you expect gh to be logged in as: pass --github-user "
+            "LOGIN or set APIFIX_GITHUB_USER (a wrong account is refused)"
+        )
+    publisher = None
+    try:
+        if args.push:
+            publisher = PullRequestPublisher(
+                GitHub(),
+                Path(args.repo).resolve(),
+                expected_user=user,
+                upstream=args.upstream,
+                ready=args.ready,
+            )
+        result = make_pull_request(
+            args.run_dir,
+            args.repo,
+            env=os.environ,
+            for_push=args.push,
+            preflight=publisher.preflight if publisher else None,
+        )
+    except (PullRequestError, GitHubError) as exc:
+        return refuse(str(exc))
     print(f"{result.verdict}: branch {result.branch} ({result.commit[:12]}) in {args.repo}")
-    print(f"{len(result.files)} file(s) in one commit on {result.base[:12]}; nothing was pushed")
+    verb = "reused the branch of an unfinished push: " if result.resumed else ""
+    print(f"{verb}{_plural(len(result.files), 'file')} in one commit on {result.base[:12]}")
     if result.dirty_apifix:
         print("note: the run was made with a dirty apifix build; the PR body says so")
     print(f"wrote {', '.join(result.outputs)} to {args.run_dir}")
+    if not publisher:
+        print("nothing was pushed")
+        return EXIT_CLEAN
+    print(f"GitHub account: {publisher.user} (as gh is logged in)")
+    try:
+        done = publisher.publish(Path(args.run_dir).resolve(), result.branch)
+    except GitHubError as exc:
+        print(f"apifix: the pull request was not opened: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    where = f"{done.fork} (fork of {done.upstream})" if done.fork else done.upstream
+    print(f"pushed {result.branch} to {where}")
+    print(f"opened a {'draft ' if done.draft else ''}pull request: {done.pr_url}")
     return EXIT_CLEAN
 
 

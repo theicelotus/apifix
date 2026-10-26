@@ -1,7 +1,7 @@
 # apifix
 
 apifix automatically fixes Python code broken by API/library breaking changes, verifies each fix
-in a sandbox, and (later) opens a pull request with the evidence. v1: Python only, one migration
+in a sandbox, and opens a pull request with the evidence (`apifix pr`). v1: Python only, one migration
 (`openai-v1`: OpenAI library 0.x -> 1.x). Pipeline: scan call sites (`ast`, no LLM) -> agent
 proposes a fix -> run the repo's tests in Docker with no network -> retry with the errors (up to
 3) -> diff + verification report. Not yet: FastAPI service, job queue, GitHub App, dashboard;
@@ -36,10 +36,12 @@ src/apifix/engine/
   whole_file.py, regions.py whole-file mode; region edits for large files
   context.py, unrelated.py, code_checks.py  read-only context; rewrite checks
   local_paths.py            redact home dir / usernames in written outputs
-  pull_request.py, pr_body.py, gitops.py   `apifix pr` (dry run): branch + commit + PR text;
-                            isolated git calls
+  pull_request.py, pr_body.py, gitops.py   `apifix pr`: branch + commit + PR text; isolated
+                            git calls
+  github.py                 `apifix pr --push`: gh wrapper (fork, push, draft PR) + token scrubber
 benchmark/                  real repos + scoring
 docs/plans/                 one file per step;  docs/notes.md  reference + known limitations
+docs/pr-sandbox.md          by-hand end-to-end test of --push;  scripts/  prepare_pr_sandbox.py
 tests/                      pytest; fixtures/ holds realistic sample code
 ```
 

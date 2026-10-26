@@ -332,3 +332,90 @@ Request (verbatim):
 - Known gap: the whole-file check sees only a line that is exactly the old line behind `#`; old
   code reworded inside a comment, or a multi-line statement commented out as a block string, is
   not caught. Agent (tool-edit) mode has no such check yet.
+
+## 2b build: `--push`
+
+Request (verbatim):
+
+> Build 2b from docs/plans/pull-requests.md, with approval amendments 3-6
+> (drafts by default and --ready; --push refused for a dirty apifix
+> build; the expected login via --github-user or APIFIX_GITHUB_USER,
+> refused on a mismatch; the sandbox repo theicelotus/apifix-pr-sandbox).
+>
+> - engine/github.py: the gh wrapper and token scrubber as planned. Tests
+>   use a fake gh/git on PATH only. Don't call real GitHub, and don't run
+>   gh or git push against any real repo in this session.
+> - Also fix the CLI output's "3 file(s)" plural.
+>
+> Then prepare the end-to-end test for me to run myself, without running
+> it:
+> - A small openai 0.x project with tests (from tests/fixtures), copied to
+>   ~/apifix-pr-sandbox as a git repo whose commits use the noreply
+>   identity from APIFIX_GIT_NAME/APIFIX_GIT_EMAIL, never my git config.
+> - The exact commands for me: create theicelotus/apifix-pr-sandbox as a
+>   PRIVATE repo with gh, push it, run apifix fix on a clone, run
+>   apifix pr --push, then close the PR and delete the branch.
+>
+> Commit when the full suite and ruff pass.
+
+### Plan
+
+- `apifix pr RUN_DIR --repo CHECKOUT --push [--github-user LOGIN] [--upstream OWNER/REPO]
+  [--ready]`. `--github-user` falls back to `APIFIX_GITHUB_USER`; `--push` without either is
+  refused. `--upstream`, `--ready` and `--github-user` without `--push` are usage errors.
+- Everything that can refuse runs before the local branch is made: dirty apifix build
+  (`job.apifix.dirty`), expected login, `gh auth status`, `gh` login == expected login (case
+  insensitive), upstream (flag, else the checkout's `origin` if it is github.com), the base commit
+  exists upstream, no open PR from `<user>:<branch>`. `make_pull_request` gets `for_push` and a
+  `preflight(plan)` hook called after the run's checks and before the commit is made.
+- `engine/github.py`: `GitHub` wraps `gh` (`whoami`, `repo_info`, `commit_exists`, `fork`,
+  `find_open_pr`, `open_pr`) and pushes with `git` (isolated, credential helper
+  `!gh auth git-credential`, no remote added, never `--force`). apifix never reads a token;
+  gh gets the caller's environment (`GH_HOST=github.com`, prompts off). Every string from gh or
+  git is scrubbed before it is shown or stored (`gh[opsur]_…`, `github_pat_…`, `user:pass@`,
+  `Authorization`/`Bearer`, and the literal values of `GH_TOKEN`/`GITHUB_TOKEN`).
+- A fork is accepted only if its parent is the upstream. When the user owns upstream there is no
+  fork and the PR goes from `<user>:<branch>` to the same repo's default branch.
+- Drafts by default; `--ready` opens a ready PR. The PR title and body are the written
+  `pr-title.txt` / `pr-body.md` (so a hand edit after the dry run is what gets sent).
+- `pr.json` gains `github_user`, `upstream`, `fork`, `pushed`, `draft`, `pr_url`, written after
+  each step (pushed, then PR opened). A failure after the branch exists says which steps happened
+  and how to retry; there is no resume (a re-run refuses an existing branch, as in 2a).
+- CLI: "1 file", "3 files" in the `pr` summary line.
+- Tests: `tests/test_github.py` with fake `gh` and `git` executables as the only things on PATH.
+- End-to-end test by hand: `tests/fixtures/pr_sandbox/` (a small openai 0.x project with tests),
+  `scripts/prepare_pr_sandbox.py` copies it to `~/apifix-pr-sandbox` as a git repo with the env
+  identity; the commands to run are in `docs/pr-sandbox.md`. Not run in this session.
+- Not built: the opt-in `-m github` live test (amendment 5), a resume of a half-done push.
+
+### Built (2b)
+
+- `engine/github.py`: `GitHub` (gh: `whoami`, `repo_info`, `base_status`, `ensure_fork`,
+  `find_open_pr`, `open_pr`; `git push` with `!gh auth git-credential`, never forced, no remote
+  added), `scrub` (token patterns + the literal `GH_TOKEN`/`GITHUB_TOKEN` values), and
+  `PullRequestPublisher` (`preflight` before the branch is made, `publish` after, pr.json updated
+  after each step). Base-commit check is "ancestor of the default branch" (compare API), stricter
+  than the planned "exists upstream", so the PR cannot carry other commits.
+- `pull_request.make_pull_request(for_push=, preflight=)`: dirty apifix build refused with
+  `--push` (amendment 3); a branch from an unfinished `--push` (or a dry run) is reused when
+  pr.json, its parent, its tree (== base + fix.diff) and its author all match, so a failed push
+  or PR creation is retried by running the same command (added: a draft PR fails in a private
+  repo on GitHub Free, and the retry would otherwise be a non-fast-forward push).
+  `update_summary` writes pr.json.
+- `gitops.git`: `config=` and `timeout=`; trace variables (`GIT_TRACE*`, `GIT_CURL_VERBOSE`) are
+  dropped from git's environment.
+- CLI: `--push`, `--github-user` / `APIFIX_GITHUB_USER`, `--upstream`, `--ready` (drafts by
+  default); the three options without `--push` are a usage error; the account is shown and in
+  pr.json. "1 file" / "3 files" in the `pr` summary (the `(s)` forms in `scan`, `fix` and
+  `cleanup` output are unchanged).
+- By-hand end-to-end test, prepared and not run: `tests/fixtures/pr_sandbox/` (a support bot on
+  openai 0.28.1 with 6 passing tests; hand-migrated it passes on openai 2.x),
+  `scripts/prepare_pr_sandbox.py` (created `~/apifix-pr-sandbox`: one local commit on `main` as
+  the env noreply identity, no remote), and the commands in `docs/pr-sandbox.md`.
+- Tests: `tests/test_github.py` (fake `gh`/`git` from `tests/fake_github.py` are the only things
+  on PATH), `tests/test_prepare_pr_sandbox.py`, plus the plural test in `test_pull_request.py`.
+- Not built: the opt-in `-m github` live test (amendment 5, including refusing any other
+  upstream); resuming is only by re-running the same command, there is no `--resume`.
+- Known gaps: `gh repo fork` / `gh pr create` output formats and the fork's async creation were
+  written from gh's documented behaviour and the fake, not run against GitHub (the end-to-end
+  test is the first real run). Lockfile regeneration is still out of scope (open question 6).

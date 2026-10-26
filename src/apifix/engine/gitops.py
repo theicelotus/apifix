@@ -35,6 +35,8 @@ _IDENTITY = (
     "GIT_COMMITTER_DATE",
     "EMAIL",
 )
+# Debug output that can print request headers (and with them a token).
+_TRACE = {"GIT_TRACE", "GIT_TRACE2", "GIT_TRACE_CURL", "GIT_TRACE_PACKET", "GIT_CURL_VERBOSE"}
 
 
 class GitError(Exception):
@@ -52,7 +54,11 @@ def isolated_env(
 ) -> dict[str, str]:
     """The environment of an isolated git call: the caller's, minus anything that redirects git
     or sets an identity, plus no global/system config. `identity` is author and committer."""
-    env = {k: v for k, v in os.environ.items() if k not in _REDIRECT and k not in _IDENTITY}
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in _REDIRECT and k not in _IDENTITY and k not in _TRACE
+    }
     env["GIT_CONFIG_NOSYSTEM"] = "1"
     env["GIT_CONFIG_GLOBAL"] = os.devnull
     env["GIT_TERMINAL_PROMPT"] = "0"
@@ -75,9 +81,12 @@ def git(
     env: Mapping[str, str] | None = None,
     input: bytes | None = None,
     check: bool = True,
+    config: Sequence[str] = (),
+    timeout: float = GIT_TIMEOUT_S,
 ) -> subprocess.CompletedProcess[bytes]:
-    """Run `git -C repo <args>` with hooks, signing and global config off. With `check`, a
-    non-zero exit raises GitError carrying git's last stderr lines."""
+    """Run `git -C repo <args>` with hooks, signing and global config off. `config` is extra
+    `key=value` settings for this call (`-c`). With `check`, a non-zero exit raises GitError
+    carrying git's last stderr lines."""
     cmd = [
         "git",
         "-c",
@@ -86,6 +95,7 @@ def git(
         "commit.gpgSign=false",
         "-c",
         "core.fsmonitor=false",
+        *(part for setting in config for part in ("-c", setting)),
         "-C",
         str(repo),
         *args,
@@ -96,13 +106,13 @@ def git(
             input=input,
             capture_output=True,
             env=isolated_env(identity, env),
-            timeout=GIT_TIMEOUT_S,
+            timeout=timeout,
             check=False,
         )
     except FileNotFoundError:
         raise GitError("`git` is needed and it is not installed") from None
     except subprocess.TimeoutExpired:
-        raise GitError(f"git {args[0]} did not finish in {GIT_TIMEOUT_S} s") from None
+        raise GitError(f"git {args[0]} did not finish in {timeout:g} s") from None
     if check and done.returncode != 0:
         detail = done.stderr.decode("utf-8", "replace").strip()[-1000:]
         raise GitError(f"git {args[0]} failed: {detail or f'exit {done.returncode}'}")

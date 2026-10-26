@@ -1314,10 +1314,28 @@ Known limitations:
   model first detected mid-job gets the nudge but not the example (the system prompt is fixed
   per job). Strict mode and the Anthropic provider never get either.
 
-## Pull requests (`apifix pr`, dry run)
+## Pull requests (`apifix pr`)
 
-Plan: docs/plans/pull-requests.md. Only 2a (local branch + text) is built; 2b (fork, push, open
-the PR with gh) is not.
+Plan: docs/plans/pull-requests.md. 2a (local branch + text) and 2b (`--push`: fork, push, open
+the PR with gh) are built; the opt-in live test against the sandbox repo is not (the manual
+walkthrough is docs/pr-sandbox.md).
+
+- `--push` (`engine/github.py`): `PullRequestPublisher.preflight(base, branch)` runs inside
+  `make_pull_request` after every local check and before the branch is made (login == expected
+  login, upstream, base commit is an ancestor of the default branch, no open PR); `publish`
+  forks (unless the user owns upstream; a same-named repo that is not a fork of upstream is
+  refused), pushes with `!gh auth git-credential`, opens the PR (draft unless `--ready`) and
+  records each step in pr.json. gh gets the process environment (minus `GH_REPO`, `GH_HOST`,
+  enterprise tokens, `GH_DEBUG`; `GH_HOST=github.com`); git trace variables are dropped.
+  Everything gh/git print goes through `github.scrub` (token patterns plus the literal values of
+  `GH_TOKEN`/`GITHUB_TOKEN`).
+- A branch left by an unfinished or dry-run `pr` is reused by `--push` only when pr.json records
+  that exact commit with no PR URL, it is one commit on the run's base, its tree is base + fix.diff
+  and its author is the env identity; pr-title.txt / pr-body.md are then kept as they are.
+- GitHub Free allows draft PRs only in public repos; a private sandbox needs `--ready`.
+- Tests use a fake `gh`/`git` as the only programs on PATH (`tests/fake_github.py`): the real gh
+  and a real `git push` are unreachable. The runs record whether apifix itself was dirty, so
+  `tests/test_github.py` pins that to clean.
 
 - Runs record `job.repo_commit` / `job.repo_dirty` (HEAD of the scan root, only when that root
   is a git top-level; `null` otherwise) and `job.diff_sha256` (of fix.diff as written, set by

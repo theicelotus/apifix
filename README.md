@@ -16,6 +16,7 @@ ANTHROPIC_API_KEY=... apifix fix path/to/repo --migration openai-v1 --max-cost 5
 apifix fix path/to/repo --migration openai-v1 --provider openai-compat --model qwen2.5-coder:14b
 apifix verify path/to/repo --migration openai-v1 --diff apifix-out/<run>/fix.diff  # no LLM
 apifix pr apifix-out/<run> --repo path/to/clean/checkout   # local branch + PR text, no push
+apifix pr apifix-out/<run> --repo path/to/clean/checkout --push --github-user LOGIN  # + draft PR
 apifix cleanup [--dry-run]                              # recover after a crash
 ```
 
@@ -46,7 +47,19 @@ from a clean checkout), a checkout with uncommitted changes, an existing branch 
 and a missing identity. The commit's author and committer come from `APIFIX_GIT_NAME` and
 `APIFIX_GIT_EMAIL`, never from git config, and the email must end in
 `@users.noreply.github.com`. `APIFIX_REPO_URL` (apifix's home page) adds a "re-check it" section
-to the body. Opening the pull request on GitHub is not built yet.
+to the body.
+
+`--push` also opens the pull request, with the [`gh` CLI](https://cli.github.com) (logged in; apifix
+never reads or passes a token, and scrubs anything gh or git print). It needs the GitHub login you
+expect, `--github-user LOGIN` or `APIFIX_GITHUB_USER`, and refuses if gh is logged in as anyone
+else. It forks the upstream (`--upstream OWNER/REPO`, default the checkout's GitHub `origin`)
+unless you own it, pushes the branch to the fork over https with gh's credentials (never forced,
+no remote added to your checkout) and opens a **draft** PR from it (`--ready`: ready for review).
+It first checks, before making anything, that the run came from an apifix build with no
+uncommitted changes, that the run's base commit is in the upstream's default branch, and that no
+PR from that branch is open. If a step fails after the branch exists, running the same command
+again continues from where it stopped. To try it on a repo of your own first, see
+docs/pr-sandbox.md.
 
 If the original code's tests cannot run (its install failed or timed out), tests that fail on
 the fixed code are not counted as regressions: they may have failed before too. The verdict is

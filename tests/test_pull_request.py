@@ -493,3 +493,15 @@ def test_cli_exit_codes(made, monkeypatch, capsys):
     sh(repo, "branch", "-D", "apifix/openai-v1")
     assert cli.main(["pr", str(out), "--repo", str(repo)]) == cli.EXIT_USAGE
     assert "APIFIX_GIT_EMAIL" in capsys.readouterr().err
+
+
+def test_the_summary_line_has_singular_and_plural_forms(made, monkeypatch, capsys):
+    repo, out = made
+    for key, value in ENV.items():
+        monkeypatch.setenv(key, value)
+    assert cli._plural(1, "file") == "1 file" and cli._plural(3, "file") == "3 files"
+    assert cli._plural(0, "file") == "0 files"
+    assert cli.main(["pr", str(out), "--repo", str(repo)]) == cli.EXIT_CLEAN
+    shown = capsys.readouterr().out
+    count = len(json.loads((out / "pr.json").read_text())["files"])
+    assert f"{cli._plural(count, 'file')} in one commit" in shown and "file(s)" not in shown
