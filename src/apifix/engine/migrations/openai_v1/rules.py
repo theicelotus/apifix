@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from apifix.engine.models import CERTAIN, LIKELY, ClientKey, CompanionPin, Confidence
 
 CLIENT = "client = openai.OpenAI()"
@@ -357,6 +359,10 @@ FIRST_V1 = "1.0"
 # 2.7.2 and >= 3.10 from 2.49.0 (pip picks an older release for older Pythons). 3.0
 # (2026-08-12) replaced httpx with httpx2 and is not allowed.
 PIN_SPEC = ">=1.55.3,<3"
+PIN_REASONS: dict[str, str] = {
+    ">=1.55.3": "first release that works with httpx 0.28",
+    "<3": "openai 3 changed its HTTP client",
+}
 DEPENDENCY = f"Pin openai>=1.0 (e.g. openai{PIN_SPEC}) and migrate call sites"
 # a declaration that allows 0.x and 1.x alike: pip alone picks a new release, but a lockfile,
 # constraints file or existing environment can hold 0.x
@@ -531,3 +537,42 @@ MOCK_ATTR_DATA = (
     "1.x code reads responses with attributes, so mock data must be objects, not dicts "
     "(0.x responses allowed both): e.g. {target}{example}"
 )
+
+
+# Pull request text (Migration.pr_change): the bullets of "main changes".
+_CALL_PATTERN = re.compile(r"openai\.(\w+)\.(\w+)")
+_KWARG_PATTERN = re.compile(r"^(\w+)=")
+PR_RESPONSE_ACCESS = (
+    'dict responses (`resp["choices"][0]["message"]["content"]`) → attributes '
+    "(`resp.choices[0].message.content`)"
+)
+PR_CONFIG = (
+    "module-level settings (`openai.api_key`, `openai.api_base`) → client arguments "
+    "(`openai.OpenAI(api_key=..., base_url=...)`)"
+)
+PR_ERRORS = (
+    "`openai.error.*` exceptions → `openai.*` (`openai.error.RateLimitError` → "
+    "`openai.RateLimitError`)"
+)
+
+
+def pr_change(category: str, old_pattern: str) -> str | None:
+    """The "old -> new" bullet for a resolved finding (see Migration.pr_change)."""
+    if category == "api_call":
+        call = _CALL_PATTERN.search(old_pattern)
+        if call and call[1] in RESOURCES:
+            resource, method = call[1], call[2]
+            is_async = method not in SYNC_METHODS and method[1:] in SYNC_METHODS
+            sync = method[1:] if is_async else method
+            new = f"client.{RESOURCES[resource]}.{METHOD_RENAMES.get((resource, sync), sync)}"
+            return f"`openai.{resource}.{method}` → `{'await ' if is_async else ''}{new}`"
+        kwarg = _KWARG_PATTERN.match(old_pattern)
+        if kwarg and kwarg[1] in KWARG_RENAMES:
+            return f"`{kwarg[1]}=` → `{KWARG_RENAMES[kwarg[1]]}=`"
+    elif category == "response_access":
+        return PR_RESPONSE_ACCESS
+    elif category == "client_config":
+        return PR_CONFIG
+    elif category == "error_class" or (category == "import" and old_pattern in ERROR_CLASSES):
+        return PR_ERRORS
+    return None

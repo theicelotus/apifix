@@ -75,6 +75,14 @@ class Migration(Protocol):
     source_name: str
     # Pull request text: why the old code stops working (one or two sentences, Markdown).
     pr_why: str
+    # Why each clause of `pin_spec` is there, keyed by the clause (">=1.55.3"): shown beside the
+    # pin apifix wrote, in the pull request.
+    pin_reasons: Mapping[str, str]
+
+    def pr_change(self, category: str, old_pattern: str) -> str | None:
+        """For a resolved finding: one "old -> new" bullet (Markdown) for the pull request's
+        main changes, or None when it is not worth one. Findings with the same bullet merge."""
+        ...
 
     def job_guide(
         self, findings: list[Finding], root: Path | None = None, shared: bool = False

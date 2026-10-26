@@ -189,6 +189,12 @@ class Verification:
                 "executed": self.coverage.executed,
                 "executable": self.coverage.executable,
                 "ratio": self.coverage.ratio,
+                # file -> changed lines no test ran
+                "uncovered": {
+                    path: list(missing)
+                    for path, (_, _, missing) in sorted(self.coverage.per_file.items())
+                    if missing
+                },
             },
             "test_edits": [asdict(e) for e in self.edits],
             "findings_before": self.findings_before,

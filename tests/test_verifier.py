@@ -496,6 +496,15 @@ def test_low_changed_line_coverage_is_weak(trees):
     assert v.verdict == "verified_weak"
 
 
+def test_the_changed_lines_no_test_ran_are_recorded(trees):
+    original, fixed = trees({})
+    partial = {"app.py": FileCoverage(frozenset({1, 3, 6}), frozenset({7, 8}))}
+    after = run((T_ASK, "passed"), (T_STRIP, "passed"), coverage=partial)
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(PASSING, [after]))
+    cov = json.loads(json.dumps(v.to_dict()))["changed_line_coverage"]
+    assert cov["uncovered"] == {"app.py": [7, 8]}
+
+
 def test_threshold_is_configurable(trees):
     original, fixed = trees({})
     partial = {"app.py": FileCoverage(frozenset({1, 3, 6}), frozenset({7, 8}))}
