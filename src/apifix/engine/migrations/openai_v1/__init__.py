@@ -105,6 +105,10 @@ class OpenAIV1Migration:
     first_version = rules.FIRST_V1
     target_name = "openai 1.x"
     source_name = "openai 0.x"
+    pr_why = (
+        "openai 1.0 removed the module-level API (`openai.ChatCompletion.create`, "
+        "`openai.error`, ...), so code written for 0.x fails once `openai>=1` is installed."
+    )
 
     def job_guide(
         self, findings: list[Finding], root: Path | None = None, shared: bool = False

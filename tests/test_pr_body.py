@@ -1,0 +1,254 @@
+"""The pull request text: what a maintainer who has never heard of apifix reads."""
+
+from __future__ import annotations
+
+import copy
+import json
+from pathlib import Path
+
+import pytest
+
+from apifix.engine.migrations import get_migration
+from apifix.engine.pr_body import LIST_LIMIT, ChangedFile, build_pull_request_text
+
+MIGRATION = get_migration("openai-v1")
+RUN = {
+    "status": "passed",
+    "counts": {"total": 4, "passed": 4, "failed": 0, "errors": 0, "skipped": 0},
+}
+VERIFICATION = {
+    "verdict": "verified",
+    "reasons": [],
+    "tests": {"fixed_by_change": [], "new_tests": []},
+    "changed_line_coverage": {"available": True, "executed": 9, "executable": 9, "ratio": 1.0},
+    "test_edits": [],
+    "findings_before": 3,
+    "remaining_findings": [],
+    "review_by_hand": [],
+    "review_findings": [],
+    "runs": {
+        "baseline": {**RUN, "python": "3.11", "env_placeholders": []},
+        "fixed": {**RUN, "python": "3.11", "env_placeholders": []},
+    },
+}
+TRAJECTORY = {
+    "job": {
+        "apifix": {"version": "0.1.0", "commit": "c" * 40, "dirty": False},
+        "provider": "anthropic",
+        "model": "claude-opus-5-5",
+        "migration": "openai-v1",
+        "pin_edits": [],
+        "sandbox_env_placeholders": [],
+    },
+    "outcome": "verified",
+}
+FILES = [ChangedFile("app.py", 6, 3), ChangedFile("requirements.txt", 1, 1)]
+BASE = "b" * 40
+
+
+def build(verification=None, trajectory=None, **kw):
+    kw.setdefault("files", FILES)
+    kw.setdefault("base", BASE)
+    return build_pull_request_text(
+        verification or VERIFICATION, trajectory or TRAJECTORY, MIGRATION, **kw
+    )
+
+
+def modified(base: dict, **changes) -> dict:
+    out = copy.deepcopy(base)
+    out.update(changes)
+    return out
+
+
+def hunks(n: int, **extra) -> list[dict]:
+    return [
+        {
+            "file": f"mod{i}.py",
+            "line": 10 + i,
+            "end_line": 12 + i,
+            "old": "old",
+            "new": f"x{i} = 1",
+            **extra,
+        }
+        for i in range(n)
+    ]
+
+
+def lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line.strip()]
+
+
+def test_the_body_opens_with_the_change_and_says_an_ai_model_wrote_it():
+    text = build()
+    first = text.body.splitlines()[0]
+    assert "openai 0.x to openai 1.x" in first
+    assert "An AI model (anthropic/claude-opus-5-5) wrote the change" in first
+    assert "apifix, an automated migration tool, verified it" in first
+    assert text.title == "Migrate to the openai 1.x API"
+
+
+def test_a_verify_run_does_not_claim_a_model_wrote_it():
+    trajectory = copy.deepcopy(TRAJECTORY)
+    trajectory["job"].update(provider=None, model=None, command="verify")
+    text = build(trajectory=trajectory)
+    assert "did not record who or what wrote the diff" in text.body
+    assert "An AI model" not in text.body
+    assert "Written by: not recorded" in text.commit_message
+
+
+def test_a_typical_body_is_short():
+    assert len(lines(build().body)) <= 40
+
+
+def test_verified_weak_says_what_the_tests_did_not_cover_before_anything_else():
+    weak = modified(
+        VERIFICATION,
+        verdict="verified_weak",
+        reasons=[{"severity": "weak", "message": "3/12 changed lines ran\nmore", "code": "c"}],
+        review_by_hand=hunks(2),
+    )
+    weak["changed_line_coverage"] = {"available": True, "executed": 3, "executable": 12}
+    body = build(weak).body
+    assert body.index("What the tests did not cover") < body.index("## Why")
+    assert body.index("An AI model") < body.index("What the tests did not cover")
+    assert "> - 3/12 changed lines ran" in body
+    assert "`mod0.py:10-12`: `x0 = 1`" in body
+    assert "Please review by hand" not in body  # not listed twice
+    assert "What the tests did not cover" not in build().body
+
+
+def test_a_verified_run_lists_findings_left_for_review():
+    left = [
+        {
+            "file": "svc.py",
+            "line": 7,
+            "category": "except",
+            "confidence": "likely",
+            "old_pattern": "openai.error.APIError",
+            "suggestion": "openai.APIError",
+            "changed": False,
+        }
+    ]
+    body = build(modified(VERIFICATION, review_findings=left, findings_before=2)).body
+    assert "## Please review by hand" in body
+    assert "`svc.py:7`: except, still uses `openai.error.APIError` (line not changed)" in body
+    assert "## Please review by hand" not in build().body
+
+
+def test_long_lists_show_ten_and_fold_the_rest():
+    many = hunks(LIST_LIMIT + 5)
+    body = build(modified(VERIFICATION, verdict="verified_weak", review_by_hand=many)).body
+    assert body.count("`mod") == LIST_LIMIT  # the weak notice caps its list ...
+    assert "and 5 more" in body
+    findings = [
+        {
+            "file": f"f{i}.py",
+            "line": i + 1,
+            "category": "c",
+            "confidence": "likely",
+            "old_pattern": "old",
+            "suggestion": "new",
+            "changed": True,
+        }
+        for i in range(LIST_LIMIT + 4)
+    ]
+    body = build(modified(VERIFICATION, review_findings=findings)).body
+    assert "- and 4 more:" in body and "<details>" in body and "</details>" in body
+    assert body.count("`f") == LIST_LIMIT + 4  # ... and this one folds the rest, losing none
+    files = [ChangedFile(f"m{i}.py", 1, 0) for i in range(30)]
+    shown = build(files=files).body
+    assert "30 file(s) changed" in shown and "and 20 more" in shown
+    assert shown.count("`m") == LIST_LIMIT
+
+
+def test_the_tests_table_compares_before_and_after_with_the_counts():
+    verification = modified(VERIFICATION)
+    verification["runs"]["baseline"]["counts"] = {
+        "passed": 1,
+        "failed": 2,
+        "errors": 1,
+        "skipped": 0,
+    }
+    verification["tests"] = {"fixed_by_change": ["a", "b"], "new_tests": ["c"]}
+    body = build(verification).body
+    assert "| Before (unmodified code) | 1 | 2 | 1 | 0 |" in body
+    assert "| After (with this change) | 4 | 0 | 0 | 0 |" in body
+    assert "2 test(s) failing before now pass; 1 new test(s); changed lines executed" in body
+    assert "executed by the tests: 9/9." in body
+
+
+def test_pins_are_listed():
+    trajectory = copy.deepcopy(TRAJECTORY)
+    trajectory["job"]["pin_edits"] = [
+        {"file": "requirements.txt", "line": 1, "old": "openai==0.28.1", "new": "openai>=1.55.3,<3"}
+    ]
+    assert (
+        "`requirements.txt`: `openai==0.28.1` → `openai>=1.55.3,<3`"
+        in build(trajectory=trajectory).body
+    )
+
+
+def test_lockfiles_get_a_section_with_the_ci_warning():
+    body = build(lockfiles=["poetry.lock", "sub/uv.lock"]).body
+    assert "Not regenerated: `poetry.lock`, `sub/uv.lock`." in body
+    assert "CI may fail until they are regenerated." in body
+    assert "CI may fail until it is regenerated." in build(lockfiles=["poetry.lock"]).body
+    assert "Lockfiles" not in build().body
+
+
+def test_the_sandbox_setup_names_the_placeholders_and_the_apifix_build():
+    trajectory = copy.deepcopy(TRAJECTORY)
+    trajectory["job"]["sandbox_env_placeholders"] = ["OPENAI_API_KEY"]
+    body = build(trajectory=trajectory).body
+    assert "ran in Docker (Python 3.11)" in body
+    assert (
+        "no network and no secrets; placeholder values (not real keys) were set for OPENAI_API_KEY"
+        in body
+    )
+    assert "Checked by apifix 0.1.0 (git commit " + "c" * 12 + ")." in body
+    assert "uncommitted changes" not in body
+    dirty = copy.deepcopy(TRAJECTORY)
+    dirty["job"]["apifix"]["dirty"] = True
+    assert "That apifix build had uncommitted changes" in build(trajectory=dirty).body
+
+
+def test_the_recheck_section_needs_the_repo_url_and_the_last_line_is_the_closing_offer():
+    plain = build().body
+    assert "apifix verify" not in plain and "Re-check" not in plain
+    linked = build(repo_url="https://example.test/apifix").body
+    assert "[apifix](https://example.test/apifix)" in linked
+    assert f"git diff {BASE[:12]}..HEAD > fix.diff" in linked
+    assert "apifix verify . --migration openai-v1 --diff fix.diff" in linked
+    for body in (plain, linked):
+        assert body.endswith("Feel free to close this if it isn't useful.\n")
+
+
+def test_code_snippets_cannot_break_out_of_their_span():
+    verification = modified(VERIFICATION, verdict="verified_weak", review_by_hand=hunks(1))
+    verification["review_by_hand"][0]["new"] = "x = `evil` " + "y" * 200
+    body = build(verification).body
+    line = next(line for line in body.splitlines() if "mod0.py" in line)
+    assert "`evil`" not in line and line.endswith("…`")
+
+
+def test_the_commit_message_names_model_apifix_and_verdict():
+    message = build().commit_message
+    assert message.splitlines()[0] == "Migrate to the openai 1.x API"
+    assert "Written by: anthropic/claude-opus-5-5" in message
+    assert "Verified by: apifix 0.1.0 (git commit " in message
+    assert "Verdict: verified" in message
+
+
+def test_no_home_directory_or_username_in_the_text(tmp_path):
+    # pull_request.py redacts what it writes; the builder itself must not add any path
+    text = build(repo_url="https://example.test/apifix")
+    for value in (str(Path.home()), str(tmp_path)):
+        assert value not in text.body and value not in text.commit_message
+    assert json.dumps(text.body)  # plain text
+
+
+@pytest.mark.parametrize("status", ["error", "timeout"])
+def test_a_run_that_did_not_run_is_not_shown_as_zero_tests(status):
+    verification = modified(VERIFICATION)
+    verification["runs"]["baseline"] = {"status": status, "counts": {}, "python": "3.11"}
+    assert f"did not run ({status})" in build(verification).body

@@ -15,6 +15,7 @@ apifix scan path/to/repo --migration openai-v1 --json   # machine-readable
 ANTHROPIC_API_KEY=... apifix fix path/to/repo --migration openai-v1 --max-cost 5
 apifix fix path/to/repo --migration openai-v1 --provider openai-compat --model qwen2.5-coder:14b
 apifix verify path/to/repo --migration openai-v1 --diff apifix-out/<run>/fix.diff  # no LLM
+apifix pr apifix-out/<run> --repo path/to/clean/checkout   # local branch + PR text, no push
 apifix cleanup [--dry-run]                              # recover after a crash
 ```
 
@@ -33,6 +34,19 @@ hand) without any LLM call: it applies the diff to a copy of the repo with `git 
 the same baseline and verification as `fix`, writing the same four files. Use it when a run
 could not be judged, for example because the original code's dependency install failed on a
 slow network. Diffs that do not apply, reach outside the repo or create symlinks are refused.
+
+`apifix pr RUN_DIR --repo CHECKOUT` turns a verified (or verified-with-weak-evidence) run
+into a local branch `apifix/<migration>` with one commit holding the fix, and writes
+`pr-title.txt`, `pr-body.md` and `pr.json` to the run dir. It pushes nothing and uses no LLM or
+network; read `pr-body.md` before using the branch. The commit is built from the run's `fix.diff`
+on the commit the run started from, without touching your working tree, index or current
+branch. It refuses (exit 2, reason on stderr) a verdict other than the two above, a `fix.diff`
+edited after verification, a run that did not record its git commit (re-run `apifix verify`
+from a clean checkout), a checkout with uncommitted changes, an existing branch of that name,
+and a missing identity. The commit's author and committer come from `APIFIX_GIT_NAME` and
+`APIFIX_GIT_EMAIL`, never from git config, and the email must end in
+`@users.noreply.github.com`. `APIFIX_REPO_URL` (apifix's home page) adds a "re-check it" section
+to the body. Opening the pull request on GitHub is not built yet.
 
 If the original code's tests cannot run (its install failed or timed out), tests that fail on
 the fixed code are not counted as regressions: they may have failed before too. The verdict is

@@ -13,9 +13,15 @@ apifix fix|verify ... --sandbox-requirements FILE
                                  install FILE in the sandbox instead of the repo's detected
                                  dependencies (original code and fix; the fix's own
                                  dependency edits still apply)
+apifix pr RUN_DIR --repo CHECKOUT
+                                 dry run: a local branch with one commit holding a verified
+                                 run's fix, plus pr-title.txt, pr-body.md and pr.json in RUN_DIR
+                                 (needs APIFIX_GIT_NAME and APIFIX_GIT_EMAIL, a noreply
+                                 address; pushes nothing, no LLM)
 apifix cleanup [--dry-run]      remove containers/temp dirs left by interrupted runs
 
-Exit codes: 0 clean (fix: verified), 1 findings (fix: not verified), 2 usage error or aborted,
+Exit codes: 0 clean (fix: verified; pr: branch made), 1 findings (fix: not verified),
+2 usage error or aborted (pr: refused, with the reason on stderr),
 3 (fix) already migrated: the findings are all in test files that look out of date with code
 already on the new API; nothing was sent to an LLM or run.
 
@@ -29,6 +35,7 @@ fix and verify keep a pip cache for the sandbox's dependency installs
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from dataclasses import asdict
@@ -158,6 +165,13 @@ def main(argv: list[str] | None = None) -> int:
             "dependencies (original code and fix); names the fix's dependency edits change "
             "take the fix's version. Only requirements and --index-url / --extra-index-url",
         )
+    p_pr = sub.add_parser(
+        "pr", help="make a local branch and pull request text for a verified run (pushes nothing)"
+    )
+    p_pr.add_argument("run_dir", help="output directory of a verified `fix` or `verify` run")
+    p_pr.add_argument(
+        "--repo", required=True, help="clean checkout of the repo the run was made on"
+    )
     p_clean = sub.add_parser(
         "cleanup",
         help="remove apifix containers and temp dirs left behind by crashed or killed runs",
@@ -169,6 +183,8 @@ def main(argv: list[str] | None = None) -> int:
         return _fix(args)
     if args.command == "verify":
         return _verify(args)
+    if args.command == "pr":
+        return _pr(args)
     if args.command == "cleanup":
         report = cleanup(DockerCLI(), dry_run=args.dry_run)
         print(_cleanup_text(report))
@@ -211,6 +227,8 @@ def _write_outputs(
     from apifix.engine.local_paths import redact_local_paths
 
     # Outputs get published as evidence: home dir -> ~ (the diff stays byte-for-byte).
+    # fix.diff's digest ties a later `apifix pr` to exactly the diff that was verified.
+    trajectory["job"]["diff_sha256"] = hashlib.sha256(diff.encode("utf-8")).hexdigest()
     report, verification, trajectory = redact_local_paths((report, verification, trajectory))
     (out / "fix.diff").write_text(diff, newline="")  # CRLF lines of CRLF files stay
     (out / "report.md").write_text(report)
@@ -328,6 +346,24 @@ def _fix(args: argparse.Namespace) -> int:
     if result.outcome == "already_migrated":
         return EXIT_ALREADY_MIGRATED
     return EXIT_USAGE if result.outcome == "aborted" else EXIT_FINDINGS
+
+
+def _pr(args: argparse.Namespace) -> int:
+    import os
+
+    from apifix.engine.pull_request import PullRequestError, make_pull_request
+
+    try:
+        result = make_pull_request(args.run_dir, args.repo, env=os.environ)
+    except PullRequestError as exc:
+        print(f"apifix: refusing to make a pull request: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    print(f"{result.verdict}: branch {result.branch} ({result.commit[:12]}) in {args.repo}")
+    print(f"{len(result.files)} file(s) in one commit on {result.base[:12]}; nothing was pushed")
+    if result.dirty_apifix:
+        print("note: the run was made with a dirty apifix build; the PR body says so")
+    print(f"wrote {', '.join(result.outputs)} to {args.run_dir}")
+    return EXIT_CLEAN
 
 
 def _cleanup_text(report: CleanupReport) -> str:

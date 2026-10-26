@@ -1313,3 +1313,29 @@ Known limitations:
   directly. ..." instead of ending the turn (max 3 per attempt, `kind: "no_tool_call"`). A
   model first detected mid-job gets the nudge but not the example (the system prompt is fixed
   per job). Strict mode and the Anthropic provider never get either.
+
+## Pull requests (`apifix pr`, dry run)
+
+Plan: docs/plans/pull-requests.md. Only 2a (local branch + text) is built; 2b (fork, push, open
+the PR with gh) is not.
+
+- Runs record `job.repo_commit` / `job.repo_dirty` (HEAD of the scan root, only when that root
+  is a git top-level; `null` otherwise) and `job.diff_sha256` (of fix.diff as written, set by
+  `cli._write_outputs`). Runs from before these existed are refused: re-run `apifix verify`.
+- The commit is `base + fix.diff` through a temporary index (`read-tree`, `apply --cached`,
+  `write-tree`, `commit-tree`, `update-ref` with an empty old value), so the checkout is never
+  touched. All git calls go through `engine/gitops.py` (no global/system config, hooks, signing
+  or inherited identity).
+- Lockfiles: a lockfile is "not regenerated" when a `pin_notes` entry says so, or a changed
+  dependency file has a sibling lockfile (`pin_edits.LOCKFILES`) at the base commit that the diff
+  does not change. Only those two routes; a lockfile pinning `openai` with no dependency file
+  edit is not noticed.
+- A diff with a "Binary files differ" line does not apply (`git apply`), so the run is refused.
+- `apifix verify` runs have no model on record; the body says so instead of claiming an AI model
+  wrote the diff.
+
+Open questions for later:
+
+- Regenerating lockfiles (poetry/uv/pdm/pipenv) is out of scope; the PR body only warns that the
+  repo's CI may fail until the lockfile is regenerated. Should apifix run the lock tool in the
+  sandbox (network, installs the tool) and add the result to the same commit?

@@ -19,6 +19,7 @@ from typing import Any
 
 from apifix.engine.build_info import apifix_build, build_label
 from apifix.engine.diffing import diff_trees, unified_diff
+from apifix.engine.gitops import repo_state
 from apifix.engine.imports import (
     UndeclaredImport,
     undeclared_imports,
@@ -69,6 +70,12 @@ class VerifyResult:
     trajectory: dict[str, Any]
 
 
+def check_no_symlinks(diff: str) -> None:
+    """Raise VerifyError if the diff creates or changes a symlink."""
+    if _SYMLINK_MODE.search(diff):
+        raise VerifyError("the diff creates or changes a symlink, which apifix does not apply")
+
+
 def apply_diff(work: Path, diff: str) -> None:
     """Apply a unified diff (git format, or plain with a/ b/ prefixes) to the tree `work` with
     `git apply`. git does not look above `work` for a repository, ignores the user's git
@@ -76,8 +83,7 @@ def apply_diff(work: Path, diff: str) -> None:
     refused here."""
     if not diff.strip():
         raise VerifyError("the diff is empty")
-    if _SYMLINK_MODE.search(diff):
-        raise VerifyError("the diff creates or changes a symlink, which apifix does not apply")
+    check_no_symlinks(diff)
     redirect = {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS"}
     env = {
         **{k: v for k, v in os.environ.items() if k not in redirect},
@@ -124,6 +130,7 @@ def verify_diff(
     mig = get_migration(migration) if isinstance(migration, str) else migration
     started = datetime.now(UTC)
     start = time.monotonic()
+    repo_commit, repo_dirty = repo_state(original)
     findings = scan(original, mig).findings
     ci_env = ci_env_vars(original, mig.ci_env_placeholders)
     env = {name: mig.ci_env_placeholders[name] for name in ci_env}
@@ -160,6 +167,8 @@ def verify_diff(
             "command": "verify",
             "apifix": apifix_build(),
             "repo": str(original),
+            "repo_commit": repo_commit,
+            "repo_dirty": repo_dirty,
             "migration": mig.name,
             "diff": str(Path(diff_path).resolve()),
             "files_changed": [ch.path for ch in changes],

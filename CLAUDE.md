@@ -36,6 +36,8 @@ src/apifix/engine/
   whole_file.py, regions.py whole-file mode; region edits for large files
   context.py, unrelated.py, code_checks.py  read-only context; rewrite checks
   local_paths.py            redact home dir / usernames in written outputs
+  pull_request.py, pr_body.py, gitops.py   `apifix pr` (dry run): branch + commit + PR text;
+                            isolated git calls
 benchmark/                  real repos + scoring
 docs/plans/                 one file per step;  docs/notes.md  reference + known limitations
 tests/                      pytest; fixtures/ holds realistic sample code

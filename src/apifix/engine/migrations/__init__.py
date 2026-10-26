@@ -73,6 +73,8 @@ class Migration(Protocol):
     target_name: str
     # How check messages name the old API ("openai 0.x").
     source_name: str
+    # Pull request text: why the old code stops working (one or two sentences, Markdown).
+    pr_why: str
 
     def job_guide(
         self, findings: list[Finding], root: Path | None = None, shared: bool = False

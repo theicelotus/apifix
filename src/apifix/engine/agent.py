@@ -41,6 +41,7 @@ from apifix.engine.code_checks import (
 from apifix.engine.context import changed_statements, library_uses, reachable_modules
 from apifix.engine.dependencies import is_dependency_file
 from apifix.engine.diffing import diff_trees, read_text, unified_diff
+from apifix.engine.gitops import repo_state
 from apifix.engine.imports import (
     ImportableModules,
     UndeclaredImport,
@@ -420,6 +421,7 @@ class _Job:
         work: Path,
     ) -> None:
         self.repo, self.migration, self.llm, self.sandbox = repo, migration, llm, sandbox
+        self.repo_commit, self.repo_dirty = repo_state(repo)
         self.findings, self.config, self.work = findings, config, work
         self.ws = Workspace(work)
         self.system = system_prompt(migration)
@@ -2349,6 +2351,8 @@ class _Job:
             "job": {
                 "apifix": apifix_build(),
                 "repo": str(self.repo),
+                "repo_commit": self.repo_commit,
+                "repo_dirty": self.repo_dirty,
                 "migration": self.migration.name,
                 "provider": self.llm.provider,
                 "model": self.llm.model,
