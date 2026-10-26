@@ -106,7 +106,7 @@ def test_the_model_name_has_no_vendor_prefix_and_the_provider_is_not_named():
     text = build(trajectory=trajectory)
     assert "migration tool (using gpt-oss-120b), and verified" in text.body
     assert "openai/gpt-oss" not in text.body and "openai-compat" not in text.body
-    assert "Written by: gpt-oss-120b via api.example.com" in text.commit_message
+    assert "Written by: gpt-oss-120b\n" in text.commit_message
     assert "openai-compat" not in text.commit_message
 
 

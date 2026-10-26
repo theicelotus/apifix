@@ -431,10 +431,10 @@ def _recheck_section(migration: Migration, base: str, repo_url: str | None) -> l
 
 
 def _written_by(job: dict[str, Any]) -> str:
-    model, host = _model_name(job), _host(job)
+    model = _model_name(job)
     if not model:
         return "Written by: not recorded (the diff came from `apifix verify`)"
-    return f"Written by: {model}" + (f" via {host}" if host else "")
+    return f"Written by: {model}"
 
 
 def title_for(migration: Migration) -> str:
