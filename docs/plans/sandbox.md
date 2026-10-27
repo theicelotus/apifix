@@ -123,5 +123,5 @@ Add any new tradeoffs to Known limitations in CLAUDE.md. Then build it.
 
 ## Later changes
 
-- setuptools-scm projects get `SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0` in the test phase (commit 72e5c87).
-- Docker integration tests are opt-in (`pytest --docker` / `-m docker`) (commit 45b320c).
+- setuptools-scm projects get `SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0` in the test phase (commit 2c8c0a8).
+- Docker integration tests are opt-in (`pytest --docker` / `-m docker`) (commit b89482e).

@@ -1,6 +1,6 @@
 Code in `trajectory.json`, `fix.diff` and `report.md` comes from [stoyan-stoyanov/llmflows](https://github.com/stoyan-stoyanov/llmflows) (commit 3c9e59f), MIT-licensed: see `LICENSE.llmflows`.
 
-Run with apifix commit b91997d. the hosted provider organization IDs are redacted as `org_<redacted>`.
+Run with apifix commit 65aafae. the hosted provider organization IDs are redacted as `org_<redacted>`.
 
 ## Found in review
 

@@ -136,7 +136,7 @@ Then build it.
 
 ## Later changes
 
-Finished after a power loss (commit 356d28b). Additions beyond the plan:
+Finished after a power loss (commit c910b71). Additions beyond the plan:
 - A failed baseline run with a passing fix is `verified_weak` (`no_baseline`).
 - A changed skipif/xfail condition that skips nothing is listed as info.
 - `apifix cleanup` removes containers/temp dirs left by interrupted runs; Docker tests compare containers before/after instead of requiring none.

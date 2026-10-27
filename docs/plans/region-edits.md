@@ -521,7 +521,7 @@ Synthetic fixtures only. Don’t run live tests. After stage 3, record under “
 
 ## Built
 
-Three stages, as amended: regions.py (5917d69), whole-file integration (76b9773), then the
+Three stages, as amended: regions.py (4d087b6), whole-file integration (ee48428), then the
 context rework, steps 2 and 3, the remembered limit and regions from verifier output. Changes
 from the plan as written:
 
