@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
@@ -7,6 +7,9 @@ name = "apifix"
 version = "0.1.0"
 description = "Automatically fix Python code broken by API/library breaking changes, verified in a sandbox."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "theicelotus" }]
 requires-python = ">=3.11"
 dependencies = ["pyflakes>=3.2"]
 

@@ -1,12 +1,51 @@
 # apifix
 
-Automatically fixes Python code broken by library breaking changes, verifies each fix in a
-network-less sandbox, and reports the evidence.
+**Fixes code broken by API changes, and proves the fix works before you see it.**
 
-Current status: the scanner for the OpenAI 0.x -> 1.x migration, the Docker test sandbox
-(`apifix.engine.sandbox`), the verifier (`apifix.engine.verifier.verify`), and the fix agent
-(`apifix fix`, with Claude via the `anthropic` SDK or any OpenAI-compatible endpoint, including
-free local models).
+When a library ships a breaking change, every codebase that uses it breaks. apifix finds the
+affected code, has an LLM rewrite it, then checks the result: it runs the repo's own tests in a
+Docker sandbox with no network, before and after the change, confirms no test was removed or
+weakened, and measures how much of the changed code the tests actually ran. A fix that passes
+opens as a pull request with that evidence. One that doesn't is reported as unverified, never
+shipped.
+
+First migration: the OpenAI Python SDK, 0.x to the current API (the 1.0 rewrite that removed
+`openai.ChatCompletion.create` and broke a large share of the Python projects that used it).
+
+## Results on real repos
+
+7 open-source repos, a free open-weight model (`gpt-oss-120b` on a hosted free tier, $0), each on
+the first attempt: 4 verified and 3 verified with weak evidence (the tests pass but don't run
+all the changed code, so the PR lists those lines for review). Details: "Live results" below.
+
+## How it works
+
+1. **Scan**: find every use of the old API (Python `ast`, no LLM).
+2. **Fix**: an LLM rewrites the affected files. apifix reverts unrelated edits and rejects
+   rewrites that drop configuration, leave old calls behind or break mocks.
+3. **Verify**: run the tests in Docker before and after; compare per test; check for weakened
+   tests; measure changed-line coverage; give a verdict with reasons.
+4. **Pull request**: `apifix pr --push` opens a PR with one commit, says plainly that an AI
+   wrote the change, and puts the evidence in the description.
+
+## Quick start
+
+Needs Python 3.11+, Docker, and a free key from https://console.example.com/keys.
+
+```
+pip install -e .                                  # from a checkout of this repo
+export APIFIX_LLM_API_KEY=...                # the hosted provider; free tiers may train on requests: public code only
+export APIFIX_PRICES=prices.toml                 # [models."openai/gpt-oss-120b"] input/output/cache_read/cache_write = 0
+apifix fix path/to/repo --migration openai-v1 --provider openai-compat \
+    --base-url https://api.example.com/openai/v1 --model openai/gpt-oss-120b \
+    --edit-mode whole-file --max-output-tokens 6000
+apifix pr apifix-out/<run> --repo path/to/clean/checkout           # local branch + PR text
+```
+
+Add `--push --github-user LOGIN` to `apifix pr` to open a draft PR with `gh`. More on the
+free tier: "Fast testing with a hosted free tier" below.
+
+## Commands
 
 ```
 pip install -e '.[dev]'                                   # or '.[anthropic]' to just run fixes
