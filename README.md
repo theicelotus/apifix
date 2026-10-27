@@ -15,8 +15,8 @@ First migration: the OpenAI Python SDK, 0.x to the current API (the 1.0 rewrite 
 ## Results on real repos
 
 7 open-source repos, a free open-weight model (`gpt-oss-120b` on a hosted free tier, $0), each on
-the first attempt: 4 verified and 3 verified with weak evidence (the tests pass but don't run
-all the changed code, so the PR lists those lines for review). Details: "Live results" below.
+the first attempt: 4 verified and 3 verified with weak evidence (the tests pass but run less than
+half of the changed lines, so the PR lists those lines for review). Details: "Live results" below.
 
 ## How it works
 
@@ -33,14 +33,18 @@ all the changed code, so the PR lists those lines for review). Details: "Live re
 Needs Python 3.11+, Docker, and a free key from https://console.example.com/keys.
 
 ```
-pip install -e .                                  # from a checkout of this repo
+git clone https://github.com/theicelotus/apifix.git && cd apifix
+pip install -e .
 export APIFIX_LLM_API_KEY=...                # the hosted provider; free tiers may train on requests: public code only
-export APIFIX_PRICES=prices.toml                 # [models."openai/gpt-oss-120b"] input/output/cache_read/cache_write = 0
 apifix fix path/to/repo --migration openai-v1 --provider openai-compat \
     --base-url https://api.example.com/openai/v1 --model openai/gpt-oss-120b \
-    --edit-mode whole-file --max-output-tokens 6000
+    --edit-mode whole-file --max-output-tokens 6000 --no-cost-limit
 apifix pr apifix-out/<run> --repo path/to/clean/checkout           # local branch + PR text
 ```
+
+`--no-cost-limit` is needed because apifix has no price for the hosted provider models and refuses to run
+with a dollar limit it cannot compute. It turns the limit off for that run; token limits still
+apply. To keep the limit on, give the model a price of 0 instead (see below).
 
 Add `--push --github-user LOGIN` to `apifix pr` to open a draft PR with `gh`. More on the
 free tier: "Fast testing with a hosted free tier" below.
