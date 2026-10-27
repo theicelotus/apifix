@@ -93,3 +93,4 @@ Docker skips are not passes: fix Docker access instead of committing.
 - Keep final summaries short: what changed, test count, known gaps.
 - Never start a second full test suite while one is still running (the Docker
   tests clash). Wait for it to finish, or stop it first.
+- No Co-Authored-By or other AI attribution lines in commit messages.
