@@ -419,3 +419,48 @@ Request (verbatim):
 - Known gaps: `gh repo fork` / `gh pr create` output formats and the fork's async creation were
   written from gh's documented behaviour and the fake, not run against GitHub (the end-to-end
   test is the first real run). Lockfile regeneration is still out of scope (open question 6).
+
+## Small fixes after the first real PR (apifix-pr-sandbox#1)
+
+### Request
+
+1. PR title and commit subject: "Migrate from the openai 0.x API to the current one" (from the
+   migration's data), since the tests run on 2.x.
+2. `apifix pr --push` said "reused the branch of an unfinished push" when the branch came from a
+   dry run. Say "reused the branch from the dry run" in that case.
+3. Commit message for verify runs: "Written by: not recorded (apifix only checked this diff)"
+   instead of naming `apifix verify`.
+4. A request to a hosted API that hangs until --request-timeout should be treated like a network
+   outage (the existing 30/60/120 s waits and retries), not end the run. Keep the current
+   behaviour for local endpoints (localhost / Ollama).
+
+### Plan
+
+1. `pr_body.title_for` uses `migration.source_name`: "Migrate from the {source_name} API to the
+   current one". No new migration field. Tests in `test_pr_body.py` / `test_pull_request.py`.
+2. `PullRequestResult.from_dry_run`: set when a reused branch's pr.json has no `github_user`
+   (only `publish` writes it, so a dry run never has one). The CLI prints "reused the branch from
+   the dry run: " or keeps "reused the branch of an unfinished push: ".
+3. `_written_by` text changed. Nothing else names `apifix verify` there.
+4. Timeouts count as an outage on a hosted endpoint, with the same rules as a lost connection:
+   waits of 30/60/120 s only after the endpoint has answered earlier in the job, same job note,
+   same "apifix waited ... and tried again" ending on the final error. No quick retries first
+   (a retry would hang as long as the first try). Hosted = a non-local host for the
+   OpenAI-compatible provider; the Anthropic provider is always hosted (`APITimeoutError`). Local
+   endpoints keep failing at once with the `--request-timeout` advice.
+
+### Built
+
+- `pr_body.title_for`: "Migrate from the {source_name} API to the current one" (the title,
+  `pr-title.txt` and the commit subject); the verify-run line reads "Written by: not recorded
+  (apifix only checked this diff)".
+- `PullRequestResult.from_dry_run` (pr.json has no `github_user`); the CLI prints "reused the
+  branch from the dry run: " in that case, "of an unfinished push" otherwise.
+- `OpenAICompatLLM._call`: `RequestTimedOut` on a non-local host takes the 30/60/120 s outage
+  waits (after the first answer; same job note) and ends with the "waited ... and tried again"
+  suffix; local hosts and the first request fail at once as before. `AnthropicLLM`:
+  `APITimeoutError` is a connection error for the waits.
+- Tests: title and "Written by" in `test_pr_body.py` / `test_pull_request.py`; dry-run wording in
+  `test_github.py`; hosted timeout waits, exhaustion, first-request and local cases in
+  `test_llm_openai_compat.py`; the Claude timeout test in `test_llm.py` now expects the waits.
+- Docs: `docs/notes.md` (timeouts and outages) and the README timeout line.

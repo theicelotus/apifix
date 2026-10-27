@@ -276,13 +276,26 @@ def test_a_connection_error_mid_job_is_waited_out():
         complete(llm)
 
 
-def test_a_timeout_mid_job_is_not_waited_out():
+def test_a_timeout_mid_job_is_waited_out_like_an_outage():
     request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
     ok = sdk_message([{"type": "text", "text": "done"}])
+    hang = anthropic.APITimeoutError(request=request)
     waits: list[float] = []
-    client = FakeClient(ok, anthropic.APITimeoutError(request=request))
+    client = FakeClient(ok, hang, hang, ok, hang, hang, hang, hang)
     llm = AnthropicLLM("claude-opus-5-5", client=client, sleep=waits.append)
     complete(llm)
+    assert complete(llm).text == "done"
+    assert waits == [30.0, 60.0]
+    assert llm.notes[-1].startswith("endpoint unreachable mid-job 2 time(s); apifix waited 90 s")
+    with pytest.raises(LLMError, match=r"APITimeoutError.*waited 30, 60, 120 s and tried again\)$"):
+        complete(llm)
+
+
+def test_a_timeout_before_the_first_answer_is_not_waited_out():
+    request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+    waits: list[float] = []
+    client = FakeClient(anthropic.APITimeoutError(request=request))
+    llm = AnthropicLLM("claude-opus-5-5", client=client, sleep=waits.append)
     with pytest.raises(LLMError, match="APITimeoutError"):
         complete(llm)
     assert waits == []

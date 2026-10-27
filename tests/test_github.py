@@ -550,6 +550,8 @@ def test_push_reuses_the_branch_a_dry_run_made(made, capsys):
     code, shown, err = run_cli(push_args(out, repo), capsys)
     assert code == cli.EXIT_CLEAN, err
     assert sh(repo, "rev-parse", BRANCH) == first
+    assert "reused the branch from the dry run" in shown
+    assert "unfinished push" not in shown
     (create,) = fake.created_prs()
     assert create[create.index("--title") + 1] == "A title I edited"
 

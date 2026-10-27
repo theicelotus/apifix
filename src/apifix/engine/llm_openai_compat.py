@@ -347,12 +347,18 @@ class OpenAICompatLLM:
                     f"no server at {self.endpoint}{hint}: {self._scrub(str(exc))}{after}"
                 ) from None
             except RequestTimedOut:
-                # Not retried: the server is up but slow, and a retry would wait just as long.
+                # A hosted API that hangs is treated like one that is unreachable. A local server
+                # is up but slow, and a retry would wait just as long.
+                if outage and not self.local:
+                    waited.append(outage.pop(0))
+                    self.outage.wait(waited[-1], f"timed out after {self.timeout_s:,g} s")
+                    continue
+                after = OutageWaits.gave_up(waited) if waited else ""
                 raise LLMError(
                     f"request to {self.endpoint} timed out after {self.timeout_s:,g} s "
                     "without a complete reply (the server is reachable, but large files on a "
                     "slow or CPU-only machine can take longer). Raise the limit with "
-                    "--request-timeout SECONDS"
+                    f"--request-timeout SECONDS{after}"
                 ) from None
             self.answered = True
             try:

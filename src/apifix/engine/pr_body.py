@@ -433,12 +433,12 @@ def _recheck_section(migration: Migration, base: str, repo_url: str | None) -> l
 def _written_by(job: dict[str, Any]) -> str:
     model = _model_name(job)
     if not model:
-        return "Written by: not recorded (the diff came from `apifix verify`)"
+        return "Written by: not recorded (apifix only checked this diff)"
     return f"Written by: {model}"
 
 
 def title_for(migration: Migration) -> str:
-    return f"Migrate to the {migration.target_name} API"
+    return f"Migrate from the {migration.source_name} API to the current one"
 
 
 def build_pull_request_text(

@@ -348,6 +348,52 @@ def test_an_outage_mid_job_fails_after_three_waits():
     assert "apifix waited 210 s in total" in llm.notes[-1]
 
 
+def test_a_hosted_timeout_mid_job_is_waited_out_like_an_outage():
+    hang = RequestTimedOut("timed out")
+    llm, http, waits = make_timed(
+        reply("first"), hang, hang, reply("back"), base_url=HOSTED, timeout_s=90
+    )
+    assert complete(llm).text == "first"
+    assert complete(llm).text == "back"
+    assert waits == [30.0, 60.0]  # no quick retries: they would hang as long
+    assert len(http.requests) == 4
+    assert llm.notes[-1] == (
+        "endpoint unreachable mid-job 2 time(s); apifix waited 90 s in total and retried "
+        "(request durations include the waits; last error: timed out after 90 s)"
+    )
+
+
+def test_a_hosted_timeout_fails_after_three_waits_and_says_so():
+    hang = RequestTimedOut("timed out")
+    llm, http, waits = make_timed(reply("first"), *[hang] * 4, base_url=HOSTED)
+    complete(llm)
+    with pytest.raises(LLMError) as exc:
+        complete(llm)
+    assert waits == [30.0, 60.0, 120.0]
+    message = str(exc.value)
+    assert "timed out after 600 s" in message and "--request-timeout SECONDS" in message
+    assert message.endswith(
+        "(it answered earlier in this job; apifix waited 30, 60, 120 s and tried again)"
+    )
+
+
+def test_a_hosted_timeout_before_the_first_answer_is_not_waited_out():
+    llm, http, waits = make_timed(RequestTimedOut("timed out"), base_url=HOSTED)
+    with pytest.raises(LLMError, match="timed out after 600 s"):
+        complete(llm)
+    assert waits == [] and len(http.requests) == 1
+
+
+def test_a_local_timeout_mid_job_still_ends_the_run():
+    for url in ("http://localhost:11434/v1", "http://192.168.1.20:8000/v1"):
+        llm, http, waits = make_timed(reply("first"), RequestTimedOut("timed out"), base_url=url)
+        complete(llm)
+        with pytest.raises(LLMError, match="timed out after 3,600 s"):
+            complete(llm)
+        assert waits == [] and len(http.requests) == 2
+        assert not llm.notes
+
+
 def test_no_outage_waits_before_the_first_answer_or_without_retries():
     llm, http, waits = make_timed(REFUSED, base_url=HOSTED)
     with pytest.raises(LLMError, match="no server at"):

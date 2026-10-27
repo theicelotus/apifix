@@ -425,7 +425,11 @@ def _pr(args: argparse.Namespace) -> int:
     except (PullRequestError, GitHubError) as exc:
         return refuse(str(exc))
     print(f"{result.verdict}: branch {result.branch} ({result.commit[:12]}) in {args.repo}")
-    verb = "reused the branch of an unfinished push: " if result.resumed else ""
+    verb = ""
+    if result.resumed:
+        verb = "reused the branch " + (
+            "from the dry run: " if result.from_dry_run else "of an unfinished push: "
+        )
     print(f"{verb}{_plural(len(result.files), 'file')} in one commit on {result.base[:12]}")
     if result.dirty_apifix:
         print("note: the run was made with a dirty apifix build; the PR body says so")

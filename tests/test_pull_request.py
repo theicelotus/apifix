@@ -148,7 +148,9 @@ def test_makes_one_commit_with_the_fix_and_leaves_the_checkout_alone(made):
     ]
     info = json.loads((out / "pr.json").read_text())
     assert info["commit"] == result.commit and info["pushed"] is False and info["pr_url"] is None
-    assert (out / "pr-title.txt").read_text() == "Migrate to the openai 1.x API\n"
+    assert (
+        out / "pr-title.txt"
+    ).read_text() == "Migrate from the openai 0.x API to the current one\n"
 
 
 def test_author_and_committer_are_the_env_identity_not_the_machines(made, tmp_path, monkeypatch):
@@ -177,9 +179,9 @@ def test_the_commit_message_names_the_model_verdict_and_apifix(made):
     repo, out = made
     result = make_pull_request(out, repo, env=ENV)
     message = sh(repo, "log", "-1", "--format=%B", result.commit)
-    assert message.startswith("Migrate to the openai 1.x API\n")
+    assert message.startswith("Migrate from the openai 0.x API to the current one\n")
     assert "Verdict: verified" in message and "Verified by: apifix " in message
-    assert "Written by: not recorded" in message  # a verify run: no model
+    assert "Written by: not recorded (apifix only checked this diff)" in message  # a verify run
 
 
 def test_crlf_files_are_committed_byte_for_byte(tmp_path):

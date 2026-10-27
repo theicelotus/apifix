@@ -49,6 +49,7 @@ class PullRequestResult:
     lockfiles: list[str]
     outputs: list[str]
     resumed: bool = False  # the branch was made by an earlier `--push` run that did not finish
+    from_dry_run: bool = False  # ... or by a dry run (`resumed` is set for both)
 
 
 def identity_from_env(env: Mapping[str, str]) -> Identity:
@@ -362,6 +363,8 @@ def make_pull_request(
         lockfiles=lockfiles,
         outputs=outputs,
         resumed=resumed,
+        # only `publish` records the GitHub account, so a branch without one is a dry run's
+        from_dry_run=resumed and _load_json(run_path / "pr.json").get("github_user") is None,
     )
 
 

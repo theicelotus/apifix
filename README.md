@@ -201,7 +201,8 @@ apifix fix ... --provider openai-compat --base-url http://gpu-box.local:8000/v1 
   stops with instructions if the conversation would not fit, and detects truncation on other
   servers where it can.
 - Each request may take up to an hour on a local endpoint (10 minutes on a hosted one) before
-  apifix gives up with a timeout error. On a CPU-only machine a large file can need longer:
+  apifix gives up with a timeout error (on a hosted one, a hang after the endpoint has answered
+  is waited out and retried first, like a network outage). On a CPU-only machine a large file can need longer:
   raise it with `--request-timeout SECONDS`.
 - Local models are slower and less reliable than Claude at multi-step edits: expect more
   retries and `rejected` results. The verifier is the same, so a wrong fix is reported as such,

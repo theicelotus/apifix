@@ -1261,7 +1261,8 @@ Known limitations:
   (`--request-timeout`, older spelling `--timeout`): 3,600 s for local endpoints, 600 s for
   hosted ones and for Claude. It is a socket timeout, so it bounds the wait for the reply, not
   the request's total time. A timeout is reported as one ("timed out after N s ... Raise the
-  limit with --request-timeout") and is not retried; refused/reset connections are "no
+  limit with --request-timeout"). On a local endpoint it is not retried; on a hosted one (and
+  for Claude) it is an outage, see below. Refused/reset connections are "no
   server" (resets and DNS failures retried twice, after 1 and 4 s).
 - Outages mid-job (`llm.OUTAGE_WAITS_S`): once the endpoint has sent any HTTP response in the
   job, a connection that fails (DNS, refused, reset; after the quick retries) is waited out
@@ -1270,7 +1271,9 @@ Known limitations:
   unreachable mid-job N time(s) ..."); waits count in `duration_s`. Before the first response
   (preflight, a server that is not running) nothing is waited. Requests that do not retry
   (model list, `/api/ps`) do not wait. Claude: the SDK's own retries first, then the same
-  waits for an `APIConnectionError` that is not a timeout, after a first response.
+  waits for an `APIConnectionError`, after a first response. A hosted request that hangs until
+  `--request-timeout` (a non-local host; Claude's `APITimeoutError`) counts as an outage too,
+  without the quick retries; a local endpoint (localhost, private network) still fails at once.
 - HTTP 429: waited out inside the provider (the agent sees one slow request): `retry-after-ms`,
   `Retry-After` (seconds or HTTP date), or "try again in <Go duration>" in the message, at
   least 1 s; else backoff 2, 4, 8, 16, 32, 60 s. At most 6 waits per request, each at most

@@ -166,14 +166,13 @@ class AnthropicLLM:
 
 
 def _is_connection_error(exc: Exception) -> bool:
-    """The API could not be reached (not a timeout: then it was reached, and is slow)."""
+    """The API could not be reached, or did not reply within the timeout (a hosted API that
+    hangs is handled like one that is down)."""
     try:
         import anthropic
     except ImportError:
         return False
-    return isinstance(exc, anthropic.APIConnectionError) and not isinstance(
-        exc, anthropic.APITimeoutError
-    )
+    return isinstance(exc, anthropic.APIConnectionError)
 
 
 def _is_sdk_error(exc: Exception) -> bool:
