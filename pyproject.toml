@@ -17,6 +17,9 @@ dependencies = ["pyflakes>=3.2"]
 anthropic = ["anthropic>=1.11"]
 dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.6", "anthropic>=1.11"]
 
+[project.urls]
+Repository = "https://github.com/theicelotus/apifix"
+
 [project.scripts]
 apifix = "apifix.cli:main"
 

@@ -76,7 +76,9 @@ def test_refuses_an_existing_destination_and_a_private_email(tmp_path):
     assert not (tmp_path / "other").exists()
 
 
-def test_main_reports_a_refusal_without_a_traceback(tmp_path, capsys):
+def test_main_reports_a_refusal_without_a_traceback(tmp_path, capsys, monkeypatch):
+    for name, value in ENV.items():
+        monkeypatch.setenv(name, value)
     (tmp_path / "x").mkdir()
     assert prepare_pr_sandbox.main([str(tmp_path / "x")]) == 2
     assert "already exists" in capsys.readouterr().err

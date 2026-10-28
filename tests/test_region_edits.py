@@ -640,7 +640,7 @@ def test_a_single_region_cut_off_at_the_most_reply_tokens_fails_the_file(big):
 
 
 def test_a_region_request_refused_again_after_lowering_is_split(big):
-    # genai-gptoss20b-1: the hosted provider counted the request at 9,125 both at max_tokens 6,000 and at the
+    # genai-gptoss20b-1: the provider counted it at 9,125 both at max_tokens 6,000 and at the
     # lowered 4,619, while apifix's estimate said all four regions fit 8,000
     llm = FakeLLM(
         [

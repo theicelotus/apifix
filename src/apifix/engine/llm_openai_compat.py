@@ -55,7 +55,7 @@ from apifix.engine.llm import (
 DEFAULT_BASE_URL = "http://localhost:11434/v1"  # Ollama
 BASE_URL_ENV = "APIFIX_BASE_URL"
 API_KEY_ENV = "APIFIX_LLM_API_KEY"
-# --reasoning-effort: sent as `reasoning_effort` (gpt-oss on a hosted endpoint, OpenAI reasoning models);
+# --reasoning-effort: sent as `reasoning_effort` (gpt-oss on hosted APIs, OpenAI reasoning models);
 # omitted when not set.
 REASONING_EFFORTS = ("low", "medium", "high")
 # Sent on every request: some hosted endpoints' firewalls block urllib's default
@@ -72,7 +72,7 @@ RATE_LIMIT_NOTE = "rate limited by the server"
 _DAILY_LIMIT = re.compile(
     r"per day|\b(?:RPD|TPD)\b|daily|insufficient_quota|exceeded your current quota", re.I
 )
-# A per-minute token limit that one request exceeds on its own, e.g. the hosted provider's "tokens per minute
+# A per-minute token limit that one request exceeds on its own, e.g. a provider's "tokens per minute
 # (TPM): Limit 8000, Requested 9265" (429s may also say "Used 5000, ").
 _PER_MINUTE = re.compile(r"per minute|\bTPM\b", re.I)
 _LIMIT_REQUESTED = re.compile(r"Limit:? (\d+),\s*(?:Used:? \d+,\s*)?Requested:? (\d+)", re.I)

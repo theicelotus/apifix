@@ -481,7 +481,7 @@ class _Job:
         self.token_limit: int | None = None
         self.chars_per_token: float | None = None
         # How much more than apifix's estimate (prompt / chars_per_token + the reply estimate)
-        # the server counted a request it refused even after max_tokens was lowered (the hosted provider
+        # the server counted a request it refused even after max_tokens was lowered (the provider
         # counted genai's 9,125 both at max_tokens 6,000 and 4,619): estimates against the
         # limit are scaled by it for the rest of the job. 1.0 until such a refusal.
         self.server_ratio = 1.0

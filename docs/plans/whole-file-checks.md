@@ -5,7 +5,7 @@ Requested 2026-10-14, to be built directly (no separate review). The request is 
 ## Request
 
 Context: This is apifix. Read CLAUDE.md and docs/plans/whole-file-mode.md first. Whole-file mode
-was committed in 375dd0f. A live run of test_local_whole_file_fix_completes against
+was committed in 0d40b63. A live run of test_local_whole_file_fix_completes against
 qwen2.5-coder-7b was rejected in all 3 attempts. Its trajectory is at
 ~/apifix-runs/wholefile-7b.json; read it to get the model's exact app.py and tests/test_app.py
 from the last attempt.

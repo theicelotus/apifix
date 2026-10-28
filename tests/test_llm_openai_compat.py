@@ -438,9 +438,7 @@ def _opener_raising(monkeypatch, exc):
     def open_(*args, **kwargs):
         raise exc
 
-    monkeypatch.setattr(
-        "apifix.engine.llm_openai_compat._OPENER", type("O", (), {"open": open_})()
-    )
+    monkeypatch.setattr("apifix.engine.llm_openai_compat._OPENER", type("O", (), {"open": open_})())
 
 
 def test_transport_tells_read_timeouts_from_connect_failures(monkeypatch):
@@ -645,7 +643,9 @@ def test_hosted_403_without_an_api_error_points_at_a_block_not_the_key(monkeypat
     with pytest.raises(LLMError) as exc:
         complete(llm)
     text = str(exc.value)
-    assert text.startswith("HTTP 403 from https://api.example.com/openai/v1 with an empty or non-JSON")
+    assert text.startswith(
+        "HTTP 403 from https://api.example.com/openai/v1 with an empty or non-JSON"
+    )
     assert "probably blocked before it reached the API" in text
     assert "firewall, a region restriction or a blocked client" in text
     assert "check the API key" not in text and "gsk_fine" not in text
@@ -1045,7 +1045,7 @@ def test_docs_and_error_suggest_the_same_models():
     root = Path(__file__).parent.parent
     suggested = re.findall(r"(?:qwen2\.5-coder|llama3\.3):\d+b", MODEL_SUGGESTIONS)
     assert len(suggested) == 4
-    for doc in ("README.md", "docs/notes.md"):
+    for doc in ("docs/guide.md", "docs/notes.md"):
         text = (root / doc).read_text()
         assert all(f"`{m}`" in text for m in suggested), doc
 

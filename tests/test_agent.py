@@ -2168,10 +2168,10 @@ def test_token_limit_margin_is_proportional_with_a_floor():
 @pytest.mark.parametrize(
     ("requested", "max_tokens", "recounted_prompt", "need"),
     [
-        # Refusals from the 2026-10-22 the hosted provider runs (8,000 tokens per minute), worked back from
+        # Refusals from the 2026-10-22 hosted runs (8,000 tokens per minute), worked back from
         # the recorded max_tokens figures: the resume-analyzer test file (prompt 3,265, before
         # the retry existed), a djgpt check retry (prompt 2,237; the old retry was accepted)
-        # and the next djgpt file, whose resend the hosted provider counted 79 tokens higher (refused at
+        # and the next djgpt file, whose resend the provider counted 79 tokens higher (refused at
         # 8,015 with the old 64-token slack).
         (9_265, 6_000, 3_265, 1_843),
         (8_237, 6_000, 2_237, 2_660),
