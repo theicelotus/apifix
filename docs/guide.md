@@ -369,6 +369,7 @@ their code, the diff and the trajectory are copied here only when the repo's lic
 | 2026-10-23 | [openai/bugbounty-gpt](https://github.com/openai/bugbounty-gpt) | `openai/gpt-oss-120b` (hosted free tier, $0) | whole-file | hosted | 1 | 317 s | 13,972 | verified | [folder](../benchmark/live/2026-10-23-bugbounty-gpt-gptoss/) |
 | 2026-10-24 | [rgbkrk/genai](https://github.com/rgbkrk/genai) | `openai/gpt-oss-120b` (hosted free tier, $0) | whole-file | hosted | 1 | 579 s | 43,599 | verified | [folder](../benchmark/live/2026-10-24-genai-gptoss/) |
 | 2026-10-25 | [stoyan-stoyanov/llmflows](https://github.com/stoyan-stoyanov/llmflows) | `openai/gpt-oss-120b` (hosted free tier, $0) | whole-file | hosted | 1 | 411 s | 51,095 | verified_weak | [folder](../benchmark/live/2026-10-25-llmflows-gptoss/) |
+| 2026-10-30 | [saulpw/aipl](https://github.com/saulpw/aipl) | `openai/gpt-oss-120b` (hosted free tier, $0) | whole-file | hosted | 1 | 104 s | 10,544 | verified_weak | [folder](../benchmark/live/2026-10-30-aipl-gptoss/) |
 
 2026-10-22: a Flask app on openai 0.28.1, CRLF line endings, tests in `backend/testapp.py`.
 Time: LLM 57 s, sandbox 82 s with the pip cache warm. All 8 findings resolved, 100%
@@ -426,6 +427,8 @@ whole file was sent as regions. apifix set `openai==0.28.1` -> `openai>=1.55.3,<
 `pyproject.toml` and `requirements.txt` itself and reverted three stray test edits the model made.
 Review notes, including a retry behavior change, are in the
 [folder README](../benchmark/live/2026-10-25-llmflows-gptoss/README.md).
+
+2026-10-30 (aipl): an MIT-licensed language for LLM pipelines, on openai 0.27. 53 tests pass before and after the fix (2 were already failing), but none of them calls the LLM, so the tests run 0 of the 10 changed lines and the fix counts as weak evidence. All 11 findings are resolved.
 
 `verified_weak` means the tests pass but do not exercise the migrated code, so the fix still
 needs a human review.

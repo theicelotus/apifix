@@ -1,0 +1,91 @@
+diff --git a/aipl/clients.py b/aipl/clients.py
+--- a/aipl/clients.py
++++ b/aipl/clients.py
+@@ -57,9 +57,10 @@
+ class StandardClient:
+     def compute_cost(self, aipl, resp, model):
+         if self.client_type == 'openai':
+-            used = resp['usage']['total_tokens']
+-            result = resp['choices'][0]['message']['content']
+-            cost = openai_pricing[model]*used/1000
++            usage = getattr(resp, "usage", None)
++            used = usage.total_tokens if usage else 0
++            result = resp.choices[0].message.content
++            cost = openai_pricing[model] * used / 1000
+             if aipl: # makes it easier to run unit tests
+                 aipl.cost_usd += cost
+ 
+@@ -104,12 +105,12 @@
+             else:
+                 msgs.append(dict(role=role, content=msg))
+ 
+-        resp = openai.ChatCompletion.create(
++        resp = openai.chat.completions.create(
+             messages=msgs,
+             **params
+         )
+         try:
+-            result = resp['choices'][0]['message']['content']
++            result = resp.choices[0].message.content
+         except:
+             raise AIPLException(resp)
+         self.compute_cost(aipl, resp, model)
+@@ -124,7 +125,7 @@
+         self.client_type = 'gooseai'
+         self.default_model = 'gpt-neo-20b'
+         openai.api_key = os.environ['GOOSE_AI_KEY']
+-        openai.api_base = "https://api.goose.ai/v1"
++        openai.base_url = "https://api.goose.ai/v1"
+ 
+     def completion(self, aipl, v, **kwargs):
+         import requests
+@@ -170,7 +171,7 @@
+     def __init__(self):
+         if 'LLM_CLIENT_ENDPOINT' not in os.environ:
+             raise AIPLException('''LLM_CLIENT_ENDPOINT envvar must be set for selfhosted client type''')
+-        openai.api_base = os.environ['LLM_CLIENT_ENDPOINT']
++        openai.base_url = os.environ['LLM_CLIENT_ENDPOINT']
+         self.client_type = 'selfhosted'
+         if 'DEFAULT_SELFHOSTED_MODEL' in os.environ:
+             self.default_model = os.environ['DEFAULT_SELFHOSTED_MODEL']
+diff --git a/aipl/ops/llm.py b/aipl/ops/llm.py
+--- a/aipl/ops/llm.py
++++ b/aipl/ops/llm.py
+@@ -71,11 +71,11 @@
+     if 'OPENAI_API_KEY' not in os.environ or 'OPENAI_API_ORG' not in os.environ:
+         raise AIPLException('''OPENAI_API_KEY and OPENAI_API_ORG envvars must be set for !llm''')
+ 
+-    resp = openai.Embedding.create(input=v, **kwargs)
++    resp = openai.embeddings.create(input=v, **kwargs)
+ 
+-    used = resp['usage']['total_tokens']
++    used = resp.usage.total_tokens if resp.usage else None
+     stderr(f'Used {used} tokens')
+ 
+     return dict(model=kwargs.get('model'),
+                 used_tokens=used,
+-                embedding=resp['data'][0]['embedding'])
+\ No newline at end of file
++                embedding=resp.data[0].embedding)
+\ No newline at end of file
+diff --git a/pyproject.toml b/pyproject.toml
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -8,7 +8,7 @@
+ 
+ [tool.poetry.dependencies]
+ python = "^3.8"
+-openai = "^0.27.6"
++openai = ">=1.55.3,<3"
+ scikit-learn = "^1.2.2"
+ numpy = "^1.24.3"
+ trafilatura = "^1.6.0"
+diff --git a/requirements.txt b/requirements.txt
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,4 +1,4 @@
+-openai
++openai>=1.55.3,<3
+ scikit-learn
+ numpy
+ trafilatura  # for html extraction
