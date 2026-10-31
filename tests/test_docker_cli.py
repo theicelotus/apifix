@@ -60,6 +60,19 @@ def test_run_timeout_kills_client(fake_docker):
     assert result.duration_s < 10
 
 
+def test_pull_passes_the_image_and_minimal_env(fake_docker, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-should-not-leak")
+    result = DockerCLI(fake_docker).pull("python:3.11-slim", timeout_s=10)
+    assert result.exit_code == 3 and not result.timed_out
+    assert "args: pull python:3.11-slim" in result.stdout
+    assert "sk-should-not-leak" not in result.stdout
+
+
+def test_pull_timeout_kills_client(fake_docker):
+    result = DockerCLI(fake_docker).pull("sleep", timeout_s=0.5)
+    assert result.timed_out and result.exit_code is None
+
+
 def test_unavailable_binary(tmp_path):
     ok, why = DockerCLI(str(tmp_path / "no-docker")).available()
     assert not ok and "docker not usable" in why

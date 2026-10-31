@@ -96,15 +96,21 @@ class FakeDocker:
     test: Callable[[Call], ProcResult] | None = None
     smoke: Callable[[Call], ProcResult] = lambda call: smoke_output()
     usable: bool = True
+    pull_result: ProcResult = field(default_factory=ok)
     calls: list[Call] = field(default_factory=list)
     removed: list[str] = field(default_factory=list)
     seen_dirs: set[Path] = field(default_factory=set)
     # container name -> {mount point: files in it when the container started}
     snapshots: dict[str, dict[str, list[str]]] = field(default_factory=dict)
     requirements: list[str] = field(default_factory=list)  # manifest seen by each install
+    pulled: list[str] = field(default_factory=list)  # images docker.pull() was called with
 
     def available(self) -> tuple[bool, str]:
         return self.usable, "" if self.usable else "docker not usable: permission denied"
+
+    def pull(self, image: str, timeout_s: float) -> ProcResult:
+        self.pulled.append(image)
+        return self.pull_result
 
     def run(self, args, timeout_s):
         call = Call(list(args), timeout_s)
@@ -366,6 +372,34 @@ def test_install_timeout_skips_tests(repo):
     assert_cleaned_up(docker)
 
 
+# --- image pull -------------------------------------------------------------------------------
+
+
+def test_image_is_pulled_before_the_install_phase(repo):
+    docker = FakeDocker(test=pytest_run(passed=1))
+    result = run_sandbox(repo, docker=docker)
+    assert result.status == "passed"
+    assert docker.pulled == ["python:3.11-slim"]
+    assert result.image_pull_s == pytest.approx(0.1)  # ok()'s duration_s
+    assert result.duration_s > result.image_pull_s
+
+
+def test_a_failed_or_slow_pull_is_not_fatal(repo):
+    docker = FakeDocker(test=pytest_run(passed=1), pull_result=TIMED_OUT)
+    result = run_sandbox(repo, docker=docker)
+    assert result.status == "passed"
+    assert result.image_pull_s == pytest.approx(5.0)
+    assert any("pulling python:3.11-slim exceeded" in n for n in result.notes)
+
+
+def test_switching_images_on_a_build_error_pulls_the_new_one(repo):
+    build_error = exited(1, stderr="error: command 'gcc' failed: No such file or directory")
+    docker = FakeDocker(install=[build_error, ok()], test=pytest_run(passed=1))
+    result = run_sandbox(repo, docker=docker)
+    assert result.status == "passed"
+    assert docker.pulled == ["python:3.11-slim", "python:3.11"]
+
+
 # --- install retries ------------------------------------------------------------------------
 
 
@@ -433,7 +467,7 @@ def test_transient_install_failure_is_retried_once(repo, stderr):
     result = run_sandbox(repo, docker=docker)
     assert result.status == "passed" and result.install_retried is True
     assert [p.status for p in result.install_attempts] == ["failed", "ok"]
-    assert "dependency install failed (network or unknown cause); retried once" in result.notes
+    assert "dependency install failed (network or unknown cause); retried 1 time(s)" in result.notes
 
 
 def test_no_release_found_counts_as_a_network_failure(repo):
@@ -456,12 +490,22 @@ def test_a_version_that_does_not_exist_is_not_retried(repo):
     assert result.status == "error" and result.install_retried is False
 
 
-def test_transient_install_failure_is_retried_only_once(repo):
+def test_transient_install_failure_is_retried_up_to_three_times(repo):
     flaky = exited(1, stderr="ReadTimeoutError: HTTPSConnectionPool(host='pypi.org')")
-    docker = FakeDocker(install=[flaky, flaky])
+    docker = FakeDocker(install=[flaky, flaky, flaky, flaky])
     result = run_sandbox(repo, docker=docker)
     assert (result.status, result.reason) == ("error", "dependency install failed")
-    assert len(result.install_attempts) == 2 and result.install_retried is True
+    assert len(result.install_attempts) == 4 and result.install_retried is True
+    assert "dependency install failed (network or unknown cause); retried 3 time(s)" in result.notes
+
+
+def test_transient_install_failure_succeeds_on_a_later_retry(repo):
+    flaky = exited(1, stderr="ReadTimeoutError: HTTPSConnectionPool(host='pypi.org')")
+    docker = FakeDocker(install=[flaky, flaky, flaky, ok()], test=pytest_run(passed=1))
+    result = run_sandbox(repo, docker=docker)
+    assert result.status == "passed"
+    assert len(result.install_attempts) == 4 and result.install_retried is True
+    assert "dependency install failed (network or unknown cause); retried 3 time(s)" in result.notes
 
 
 def test_env_placeholders_reach_the_test_phase_only(repo):

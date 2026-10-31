@@ -38,6 +38,10 @@ _FILE_LINE = re.compile(
     r"^\s*(Downloading|Using cached) (\S+) \((\d+(?:\.\d+)?) ?(bytes|kB|MB|GB)\)"
 )
 _UNITS = {"bytes": 1, "kB": 1000, "MB": 1000**2, "GB": 1000**3}
+# pip's own per-connection timeout and retry count (its default: 15s, 5 retries), raised so a
+# slow or flaky index does not need the whole install retried just to get past one connection.
+PIP_TIMEOUT_S = "60"
+PIP_RETRIES = "10"
 
 
 def _site_dirs(python):
@@ -58,7 +62,15 @@ def install(use_constraints):
     env = dict(os.environ, TMPDIR=tmp)
     venv = os.path.join(DEPS, "venv")
     subprocess.check_call([sys.executable, "-m", "venv", venv])
-    cmd = [_venv_python(venv), "-m", "pip", "install", "-r", MANIFEST + "/requirements.txt"]
+    cmd = [
+        _venv_python(venv),
+        "-m",
+        "pip",
+        "install",
+        "--timeout", PIP_TIMEOUT_S,
+        "--retries", PIP_RETRIES,
+        "-r", MANIFEST + "/requirements.txt",
+    ]  # fmt: skip
     if use_constraints:
         cmd += ["-c", MANIFEST + "/constraints.txt"]
     print("[apifix] " + " ".join(cmd), file=sys.stderr, flush=True)

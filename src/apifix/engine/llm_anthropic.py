@@ -33,6 +33,9 @@ from apifix.engine.llm import (
 
 API_KEY_ENV = "ANTHROPIC_API_KEY"
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
+# Gateway/edge errors (a CDN or load balancer in front of the API, not the API itself) are
+# waited out like an unreachable endpoint rather than failing the job outright.
+OUTAGE_STATUS_CODES = frozenset({502, 503, 504, 520, 521, 522, 523, 524})
 _STOP_REASONS: dict[str, StopReason] = {
     "end_turn": "end_turn",
     "tool_use": "tool_use",
@@ -153,7 +156,7 @@ class AnthropicLLM:
                 response = create(**kwargs)
                 break
             except Exception as exc:
-                if outage and _is_connection_error(exc):
+                if outage and (_is_connection_error(exc) or _is_outage_status(exc)):
                     waited.append(outage.pop(0))
                     self.outage.wait(waited[-1], f"{type(exc).__name__}: {exc}")
                     continue
@@ -173,6 +176,17 @@ def _is_connection_error(exc: Exception) -> bool:
     except ImportError:
         return False
     return isinstance(exc, anthropic.APIConnectionError)
+
+
+def _is_outage_status(exc: Exception) -> bool:
+    """A gateway/edge HTTP status (502/503/504/520-524), reported as an APIStatusError
+    (InternalServerError for 5xx) rather than a connection failure, but treated the same way:
+    the API itself may well be fine behind a flaky edge."""
+    try:
+        import anthropic
+    except ImportError:
+        return False
+    return isinstance(exc, anthropic.APIStatusError) and exc.status_code in OUTAGE_STATUS_CODES
 
 
 def _is_sdk_error(exc: Exception) -> bool:

@@ -64,6 +64,10 @@ USER_AGENT = f"apifix/{__version__}"
 MAX_RESPONSE_BYTES = 20_000_000
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 RETRY_DELAYS_S = (1.0, 4.0)
+# Gateway/edge errors (a CDN or load balancer in front of the server, not the server itself):
+# once the short retries above are spent, waited out like an unreachable endpoint rather than
+# failing the job outright.
+OUTAGE_STATUSES = {502, 503, 504, 520, 521, 522, 523, 524}
 # HTTP 429: waits per request when the server gives no hint; the longest single wait accepted.
 RATE_LIMIT_BACKOFF_S = (2.0, 4.0, 8.0, 16.0, 32.0, 60.0)
 RATE_LIMIT_MAX_WAIT_S = 120.0
@@ -370,6 +374,10 @@ class OpenAICompatLLM:
                 continue
             if resp.status in RETRY_STATUSES and delays:
                 self.sleep(delays.pop(0))
+                continue
+            if resp.status in OUTAGE_STATUSES and outage:
+                waited.append(outage.pop(0))
+                self.outage.wait(waited[-1], self._server_message(data) or f"HTTP {resp.status}")
                 continue
             return resp.status, data
 

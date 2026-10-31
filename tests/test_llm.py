@@ -291,6 +291,44 @@ def test_a_timeout_mid_job_is_waited_out_like_an_outage():
         complete(llm)
 
 
+def test_a_gateway_error_mid_job_is_waited_out_like_an_outage():
+    request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+    ok = sdk_message([{"type": "text", "text": "done"}])
+
+    def gateway_error(status):
+        response = httpx2.Response(status, request=request)
+        return anthropic.InternalServerError(f"Error code: {status}", response=response, body=None)
+
+    lost = gateway_error(522)
+    waits: list[float] = []
+    client = FakeClient(ok, lost, lost, ok, lost, lost, lost, lost)
+    llm = AnthropicLLM("claude-opus-5-5", client=client, sleep=waits.append)
+    complete(llm)
+    assert complete(llm).text == "done"
+    assert waits == [30.0, 60.0]
+    assert llm.notes[-1].startswith("endpoint unreachable mid-job 2 time(s); apifix waited 90 s")
+    with pytest.raises(
+        LLMError, match=r"InternalServerError.*waited 30, 60, 120 s and tried again\)$"
+    ):
+        complete(llm)
+
+
+@pytest.mark.parametrize("status", [500, 501, 529])
+def test_other_server_errors_are_not_waited_out(status):
+    request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+    response = httpx2.Response(status, request=request)
+    error_cls = anthropic.OverloadedError if status == 529 else anthropic.InternalServerError
+    error = error_cls(f"Error code: {status}", response=response, body=None)
+    waits: list[float] = []
+    ok = sdk_message([{"type": "text", "text": "done"}])
+    client = FakeClient(ok, error)
+    llm = AnthropicLLM("claude-opus-5-5", client=client, sleep=waits.append)
+    complete(llm)
+    with pytest.raises(LLMError, match=f"Error code: {status}"):
+        complete(llm)
+    assert waits == []
+
+
 def test_a_timeout_before_the_first_answer_is_not_waited_out():
     request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
     waits: list[float] = []

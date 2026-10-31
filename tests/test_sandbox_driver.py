@@ -289,7 +289,17 @@ def test_install_passes_pip_output_through_and_reports_figures(tmp_path, monkeyp
         (bin_dir / "python").chmod(0o755)
 
     monkeypatch.setattr(driver.subprocess, "check_call", fake_venv)
+
+    seen = {}
+    real_popen = driver.subprocess.Popen
+
+    def spying_popen(cmd, **kw):
+        seen["cmd"] = cmd
+        return real_popen(cmd, **kw)
+
+    monkeypatch.setattr(driver.subprocess, "Popen", spying_popen)
     assert driver.install(False) == 3
+    assert "--timeout" in seen["cmd"] and "--retries" in seen["cmd"]
     out = capsys.readouterr().out
     assert "  Downloading six-1.16.0-py2.py3-none-any.whl (11 kB)\n" in out  # unchanged
     marker = out.strip().splitlines()[-1]

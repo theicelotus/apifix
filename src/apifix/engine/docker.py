@@ -61,6 +61,10 @@ class DockerClient(Protocol):
         """Run `docker run <args>` in the foreground, killing the client at the timeout."""
         ...
 
+    def pull(self, image: str, timeout_s: float) -> ProcResult:
+        """Run `docker pull <image>` in the foreground, killing the client at the timeout."""
+        ...
+
     def remove_container(self, name: str) -> None:
         """Force-remove a container if it exists. Must not raise."""
         ...
@@ -127,9 +131,15 @@ class DockerCLI:
         return True, ""
 
     def run(self, args: Sequence[str], timeout_s: float) -> ProcResult:
+        return self._exec(["run", *args], timeout_s)
+
+    def pull(self, image: str, timeout_s: float) -> ProcResult:
+        return self._exec(["pull", image], timeout_s)
+
+    def _exec(self, args: Sequence[str], timeout_s: float) -> ProcResult:
         start = time.monotonic()
         proc = subprocess.Popen(
-            [self.binary, "run", *args],
+            [self.binary, *args],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,

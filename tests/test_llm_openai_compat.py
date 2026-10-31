@@ -413,6 +413,40 @@ def test_retries_are_bounded():
     assert len(http.requests) == 3
 
 
+def test_a_gateway_error_mid_job_is_waited_out_like_an_outage():
+    llm, http, waits = make_timed(
+        reply("first"), error(502, "x"), error(502, "x"), error(502, "x"), reply("back"),
+        base_url=HOSTED,
+    )  # fmt: skip
+    assert complete(llm).text == "first"
+    assert complete(llm).text == "back"
+    assert waits == [1.0, 4.0, 30.0]  # the two short retries, then one outage wait
+    assert llm.notes[-1].startswith("endpoint unreachable mid-job 1 time(s); apifix waited 30 s")
+
+
+def test_a_gateway_error_fails_after_the_outage_waits_are_spent():
+    # 522 isn't one of the short-retry statuses, so only the outage waits apply here.
+    llm, http, waits = make_timed(reply("first"), *[error(522, "x")] * 4, base_url=HOSTED)
+    complete(llm)
+    with pytest.raises(LLMError, match="HTTP 522"):
+        complete(llm)
+    assert waits == [30.0, 60.0, 120.0]
+
+
+def test_a_gateway_error_before_the_first_answer_gets_only_the_short_retries():
+    llm, http, waits = make_timed(*[error(503, "x")] * 3, base_url=HOSTED)
+    with pytest.raises(LLMError, match="HTTP 503"):
+        complete(llm)
+    assert waits == [1.0, 4.0] and len(http.requests) == 3
+
+
+def test_a_gateway_error_before_the_first_answer_is_not_waited_out_as_an_outage():
+    llm, http, waits = make_timed(error(522, "x"), base_url=HOSTED)
+    with pytest.raises(LLMError, match="HTTP 522"):
+        complete(llm)
+    assert waits == [] and len(http.requests) == 1
+
+
 def test_default_timeout_depends_on_the_endpoint(monkeypatch):
     monkeypatch.delenv("APIFIX_BASE_URL", raising=False)
     assert make()[0].timeout_s == 3600.0

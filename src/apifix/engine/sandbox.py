@@ -134,6 +134,10 @@ NETWORK_ERROR_MARKERS = (
     # printed for a misspelt name, which then costs one retry)
     "(from versions: none)",
 )
+# A network-looking install failure is retried up to this many times (so at most this many
+# attempts beyond the first), independently of the resolution/build-error retries below.
+MAX_NETWORK_INSTALL_RETRIES = 3
+NETWORK_RETRY_NOTE = "dependency install failed (network or unknown cause)"
 # pip output that means the requirements themselves are wrong: never retried as transient.
 REQUIREMENT_ERROR_MARKERS = (
     "Invalid requirement",
@@ -209,11 +213,16 @@ class SandboxConfig:
     tmpfs_size: str = "512m"
     install_timeout_s: float = 900
     test_timeout_s: float = 600
+    # Pulling the image, outside install_timeout_s (a slow or first pull must not eat the
+    # install phase's own budget; see Sandbox._pull_image).
+    image_pull_timeout_s: float = 300
     output_head_bytes: int = 4_000
     output_tail_bytes: int = 16_000
     default_python: str = DEFAULT_PYTHON
     image_repo: str = "python"
-    max_install_attempts: int = 4
+    # 1 initial attempt + up to MAX_NETWORK_INSTALL_RETRIES network retries, with room left for
+    # an image switch or a lockfile-conflict retry in the same run.
+    max_install_attempts: int = 6
     # Persistent pip cache shared by install phases (None: off). See default_pip_cache_dir().
     pip_cache_dir: Path | None = None
     # A user's requirements file that replaces dependency detection (--sandbox-requirements).
@@ -318,6 +327,9 @@ class SandboxResult:
     lockfile_applied: bool = False
     notes: list[str] = field(default_factory=list)
     install_attempts: list[PhaseResult] = field(default_factory=list)
+    # Time spent pulling the install image(s), outside install_timeout_s. 0 if the image was
+    # already present or no pull was needed.
+    image_pull_s: float = 0.0
     test: PhaseResult | None = None
     counts: TestCounts = field(default_factory=TestCounts)
     tests: list[TestCaseResult] = field(default_factory=list)
@@ -596,12 +608,29 @@ class Sandbox:
 
     # phases
 
+    def _pull_image(self, image: str, result: SandboxResult) -> None:
+        """Pull `image` ahead of the install phase, outside install_timeout_s: pulling a large
+        base image for the first time must not eat the install's own time budget. Not fatal if
+        it fails or times out; the install phase falls back to docker run's implicit pull."""
+        proc = self.docker.pull(image, self.config.image_pull_timeout_s)
+        result.image_pull_s += proc.duration_s
+        if proc.timed_out:
+            result.notes.append(
+                f"pulling {image} exceeded {self.config.image_pull_timeout_s:,.0f}s; "
+                "continuing (the install phase will pull it as needed)"
+            )
+        elif proc.exit_code != 0:
+            result.notes.append(
+                f"docker pull {image} failed; continuing (the install phase will pull it as needed)"
+            )
+
     def _install(self, ws: _Workspace, plan: InstallPlan, result: SandboxResult) -> str | None:
         """Install dependencies; return the image that worked, or None (result is filled in)."""
         image = f"{self.config.image_repo}:{result.python_version}-slim"
         use_constraints = bool(plan.constraints)
         known = (*BUILD_ERROR_MARKERS, *RESOLUTION_ERROR_MARKERS, *REQUIREMENT_ERROR_MARKERS)
         cache, env = None, None
+        network_retries = 0
         if self.config.pip_cache_dir is not None:
             cache, why = prepare_pip_cache(self.config.pip_cache_dir)
             if cache is None:
@@ -609,6 +638,7 @@ class Sandbox:
             else:
                 env = {"PIP_CACHE_DIR": PIP_CACHE_MOUNT}
                 result.pip_cache = True
+        self._pull_image(image, result)
         for _ in range(self.config.max_install_attempts):
             ws.reset_deps()
             command = ["python", "/apifix/driver.py", "install"]
@@ -641,18 +671,19 @@ class Sandbox:
             if conflict:
                 result.install_conflict = install_conflict(phase.stdout + "\n" + phase.stderr, plan)
             if (
-                not result.install_retried
+                network_retries < MAX_NETWORK_INSTALL_RETRIES
                 and not conflict
                 and (_has_marker(phase, NETWORK_ERROR_MARKERS) or not _has_marker(phase, known))
             ):
+                network_retries += 1
                 result.install_retried = True
-                result.notes.append(
-                    "dependency install failed (network or unknown cause); retried once"
-                )
+                result.notes[:] = [n for n in result.notes if not n.startswith(NETWORK_RETRY_NOTE)]
+                result.notes.append(f"{NETWORK_RETRY_NOTE}; retried {network_retries} time(s)")
                 continue
             if image.endswith("-slim") and _has_marker(phase, BUILD_ERROR_MARKERS):
                 image = image.removesuffix("-slim")
                 result.notes.append(f"build error on the slim image; retrying with {image}")
+                self._pull_image(image, result)
                 continue
             if use_constraints and _has_marker(phase, RESOLUTION_ERROR_MARKERS):
                 causes = [line for line in result.install_conflict if line.startswith("    ")]
@@ -1033,6 +1064,6 @@ class SandboxSession:
                 result = self._retry_without_import_paths(result, measure)
             return result
         finally:
-            # This run's cost: the (shared) install plus its own test phase.
+            # This run's cost: the (shared) image pull and install plus its own test phase.
             phases = [*result.install_attempts, *([result.test] if result.test else [])]
-            result.duration_s = sum(p.duration_s for p in phases)
+            result.duration_s = result.image_pull_s + sum(p.duration_s for p in phases)
