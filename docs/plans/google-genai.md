@@ -647,6 +647,8 @@ main, then stop.
     one extra), `test_google_genai_already_migrated.py` (4). `tests/test_migrations.py`'s
     registry test updated for the second migration. Full suite (no `--docker`/`--llm`): 2052
     passed. `ruff check .` and `ruff format --check .`: clean.
+  - Final replay of `benchmark/live/2026-10-30-aipl-gptoss` with `apifix verify`, after E6 and
+    the migration package: identical to the E1-E4 replay (object addresses and timings aside).
   - **Not built in this session** (narrower than the plan's section 7, by necessity of scope —
     see docs/notes.md "Known limitations (google-genai migration)" for the specifics): no
     string-reference (`mock.patch("...")`) scanner findings; the `key`/`settings`/`safety`/
