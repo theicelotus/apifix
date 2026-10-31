@@ -1,9 +1,11 @@
 """Is a repo already on the new API, with only its tests left behind?
 
 Three things together say so: every declaration of the library requires the new version
-(`Migration.first_version` or later), every finding is in a test file, and non-test code uses
-names only the new API has (`Migration.new_api_uses`). Then the findings are stale tests, not a
-migration, and `fix` stops before any LLM call or sandbox run. Pure stdlib, no LLM.
+(`Migration.first_version` or later) and none of the old distribution is left (for a migration
+that renames it, `Migration.source_package`), every finding is in a test file, and non-test
+code uses names only the new API has (`Migration.new_api_uses`). Then the findings are stale
+tests, not a migration, and `fix` stops before any LLM call or sandbox run. Pure stdlib, no
+LLM.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from pathlib import Path
 from apifix.engine.dependencies import (
     entirely_at_or_above,
     is_dependency_file,
+    normalize_name,
     parse_dependency_file,
 )
 from apifix.engine.migrations import Migration
@@ -67,7 +70,10 @@ def detect_already_migrated(
             deps = parse_dependency_file(rel, file.read_text(encoding="utf-8"))
         except (OSError, SyntaxError, UnicodeDecodeError, ValueError, configparser.Error):
             return None
+        old_name = normalize_name(getattr(migration, "source_package", "") or "")
         for dep in deps:
+            if old_name and dep.name == old_name:
+                return None  # still declares the old distribution
             if dep.name != migration.package:
                 continue
             if not entirely_at_or_above(dep.clauses, first):

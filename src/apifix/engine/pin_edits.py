@@ -3,7 +3,10 @@
 For every dependency finding, the migrated library's pin gets the migration's `pin_spec`; in
 the same file, pins of the library's own requirements that allow none of what it needs
 (`Migration.companion_pins`) are raised. Only the version-spec characters change: names,
-extras, markers, comments, quoting and line endings stay byte-for-byte.
+extras, markers, comments, quoting and line endings stay byte-for-byte. A migration to a
+distribution with another name (`Migration.source_package`) also gets the name replaced, or,
+where the file already declares the new distribution, the old entry's line removed (and that
+declaration raised to the pin when it allows releases below its floor).
 
 Every file's edits are checked by parsing it again: the result may differ from the original
 only in the intended entries, which must now carry the intended versions. An entry apifix
@@ -18,6 +21,7 @@ from __future__ import annotations
 
 import ast
 import configparser
+import copy
 import re
 import tomllib
 from collections import Counter
@@ -32,6 +36,7 @@ from apifix.engine.dependencies import (
     DeclaredDependency,
     conda_package_name,
     dependency_file_problem,
+    entirely_at_or_above,
     excludes_range,
     normalize_name,
     parse_conda_environment,
@@ -60,9 +65,9 @@ class PinEdit:
     file: str
     line: int
     old: str  # the entry's source text before the edit, e.g. `openai==0.27.6`
-    new: str  # ... and after, e.g. `openai>=1.55.3,<3`
+    new: str  # ... and after, e.g. `openai>=1.55.3,<3`; "" when the entry was removed
     kind: EditKind
-    why: str = ""  # companion edits: what the migrated library needs
+    why: str = ""  # companion edits: what the migrated library needs; removals: why
 
 
 @dataclass(frozen=True)
@@ -150,8 +155,11 @@ def plan_pin_edits(root: Path, findings: list[Finding], migration: Migration) ->
 
 
 def pin_line(edit: PinEdit) -> str:
-    """`environment.yml:158 openai==0.27.6 -> openai>=1.55.3,<3` (plus why, for companions)."""
+    """`environment.yml:158 openai==0.27.6 -> openai>=1.55.3,<3` (plus why, for companions);
+    `requirements.txt:3 google-generativeai removed (...)` for a removed entry."""
     why = f" ({edit.why})" if edit.why else ""
+    if not edit.new:
+        return f"{edit.file}:{edit.line} {edit.old} removed{why}"
     return f"{edit.file}:{edit.line} {edit.old} -> {edit.new}{why}"
 
 
@@ -180,6 +188,14 @@ class _Entry:
     path: tuple[Any, ...] = ()
     value: str = ""  # TOML: the string's value before the edit
     value_spec: tuple[int, int] = (0, 0)  # TOML: the spec's position within `value`
+    # The package name's characters in the text (None: not located, so it cannot be renamed),
+    # and, for a PEP 508 string in TOML, within `value`.
+    name_span: tuple[int, int] | None = None
+    value_name: tuple[int, int] | None = None
+    # The whole entry in the text (requirement with markers, or `key = "spec"`): with nothing
+    # else on its line but quotes, a list's comma, a YAML dash and a comment, the line can be
+    # removed. None: it cannot.
+    item: tuple[int, int] | None = None
 
 
 @dataclass
@@ -188,6 +204,9 @@ class _Target:
     spec: str
     kind: EditKind
     why: str = ""
+    name: str = ""  # the new package name ("": the name stays)
+    remove: bool = False  # remove the entry's line (`removal`)
+    removal: tuple[int, int] = (0, 0)
 
 
 def _plan_file(root: Path, path: str, findings: list[Finding], migration: Migration) -> PinFile:
@@ -213,16 +232,33 @@ def _plan_file(root: Path, path: str, findings: list[Finding], migration: Migrat
         return result
 
     flagged = [d for d in declared if migration.check_dependency(path, d)]
+    source = normalize_name(migration.source_package) if migration.source_package else ""
+    package = normalize_name(migration.package)
+    declares_package = source and any(d.name == package for d in declared)
     targets: list[_Target] = []
     for e in entries:
         if migration.check_dependency(path, _declared(e)) is None:
             continue
-        if e.problem:
-            result.fallbacks.append(
-                PinFallback(path, _line(e, declared), _label(text, e), e.problem)
-            )
+        problem = e.problem
+        target = _Target(e, migration.pin_spec, "migration")
+        if not problem and source and e.name == source:
+            if declares_package:
+                removal = _removal(text, e)
+                why = f"{migration.package} is declared in the same file"
+                if removal is None:
+                    problem = f"{why}, and the entry shares its line, so apifix cannot remove it"
+                else:
+                    target = _Target(e, "", "migration", why, remove=True, removal=removal)
+            elif e.name_span is None:
+                problem = f"could not locate the package name to replace with {migration.package}"
+            else:
+                target.name = migration.package
+        if problem:
+            result.fallbacks.append(PinFallback(path, _line(e, declared), _label(text, e), problem))
         else:
-            targets.append(_Target(e, migration.pin_spec, "migration"))
+            targets.append(target)
+    if any(t.remove for t in targets):
+        targets += _raised_package(path, entries, targets, migration)
     # entries the parser flags but no locator found (an unusual layout)
     located = Counter((e.name, e.clauses) for e in entries)
     for d in flagged:
@@ -267,7 +303,14 @@ def _plan_file(root: Path, path: str, findings: list[Finding], migration: Migrat
         return result
     result.text = new_text
     result.edits = [
-        PinEdit(path, t.entry.line, _shown(text, t.entry), _shown_after(text, t), t.kind, t.why)
+        PinEdit(
+            path,
+            t.entry.line,
+            _shown(text, t.entry),
+            "" if t.remove else _shown_after(text, t),
+            t.kind,
+            t.why,
+        )
         for t in sorted(targets, key=lambda t: t.entry.start)
     ]
     result.notes += _conda_notes(path, text, migration) + _lockfile_notes(root, path)
@@ -295,14 +338,63 @@ def _line(e: _Entry, declared: list[DeclaredDependency]) -> int:
 
 
 def _shown_after(text: str, t: _Target) -> str:
-    e = t.entry
-    return text[e.shown[0] : e.start] + t.spec + text[e.end : e.shown[1]]
+    lo, hi = t.entry.shown
+    after = _splice(text, [t])
+    return after[lo : hi + len(after) - len(text)]
+
+
+def _replacements(t: _Target) -> list[tuple[int, int, str]]:
+    """(start, end, new text) of one target's edit, last first."""
+    if t.remove:
+        return [(*t.removal, "")]
+    out = [(t.entry.start, t.entry.end, t.spec)]
+    if t.name and t.entry.name_span is not None:
+        out.append((*t.entry.name_span, t.name))
+    return out
 
 
 def _splice(text: str, targets: list[_Target]) -> str:
-    for t in sorted(targets, key=lambda t: t.entry.start, reverse=True):
-        text = text[: t.entry.start] + t.spec + text[t.entry.end :]
+    edits = sorted((r for t in targets for r in _replacements(t)), reverse=True)
+    for start, end, new in edits:
+        text = text[:start] + new + text[end:]
     return text
+
+
+_REMOVABLE_REST = re.compile(r"\s*(?:-\s+)?(?:([\"'])\1)?\s*,?\s*(?:#.*)?")
+
+
+def _removal(text: str, e: _Entry) -> tuple[int, int] | None:
+    """The span of the entry's whole line (with its line ending) when nothing else is on it
+    (see `_Entry.item`), else None."""
+    if e.item is None:
+        return None
+    lo, hi = e.item
+    start = text.rfind("\n", 0, lo) + 1
+    nl = text.find("\n", hi)
+    end = len(text) if nl == -1 else nl + 1
+    rest = text[start:lo] + text[hi:end].rstrip("\r\n")
+    return (start, end) if _REMOVABLE_REST.fullmatch(rest) else None
+
+
+def _raised_package(
+    path: str, entries: list[_Entry], targets: list[_Target], migration: Migration
+) -> list[_Target]:
+    """The new distribution's own declarations in a file whose old entries are removed: each
+    gets the pin when it allows releases below the pin's floor (`>=` clause) and is not a
+    target already."""
+    floor = next((v for op, v in pep440_clauses(migration.pin_spec) if op == ">="), None)
+    package = normalize_name(migration.package)
+    taken = {id(t.entry) for t in targets}
+    if floor is None:
+        return []
+    return [
+        _Target(e, migration.pin_spec, "migration", f"it allowed releases below {floor}")
+        for e in entries
+        if e.name == package
+        and not e.problem
+        and id(e) not in taken
+        and not entirely_at_or_above(e.clauses, floor)
+    ]
 
 
 # --- which pins, and to what --------------------------------------------------------------------
@@ -343,6 +435,7 @@ class _Req:
     clauses: Clauses
     spec: tuple[int, int]  # offsets within the requirement string
     end: int  # where the name, extras and spec end (the shown part)
+    name_span: tuple[int, int] = (0, 0)  # the name's offsets within the requirement string
 
 
 def _requirement(req: str) -> _Req | None:
@@ -358,11 +451,11 @@ def _requirement(req: str) -> _Req | None:
     name = normalize_name(m.group("name"))
     if not m.group("spec"):
         at = m.end("extras") if m.group("extras") else m.end("name")
-        return _Req(name, (), (at, at), at)
+        return _Req(name, (), (at, at), at, m.span("name"))
     clauses = pep440_clauses(m.group("spec"))
     if not clauses:
         return None
-    return _Req(name, clauses, m.span("spec"), m.end("spec"))
+    return _Req(name, clauses, m.span("spec"), m.end("spec"), m.span("name"))
 
 
 def _req_entry(text: str, base: int, req: str, line: int, problem: str = "") -> _Entry | None:
@@ -378,6 +471,8 @@ def _req_entry(text: str, base: int, req: str, line: int, problem: str = "") -> 
         base + r.spec[1],
         (base + lead, base + r.end),
         problem,
+        name_span=(base + r.name_span[0], base + r.name_span[1]),
+        item=(base + lead, base + len(req.rstrip())),
     )
 
 
@@ -535,6 +630,7 @@ def _setup_py_entries(text: str) -> list[_Entry]:
                 if entry and not plain:  # positions are only meaningful for plain literals
                     entry.start = entry.end = base
                     entry.shown = (starts[n] + col, starts[n] + col + len(segment))
+                    entry.name_span = entry.item = None
                 if entry:
                     out.append(entry)
     return out
@@ -687,11 +783,13 @@ def _toml_entries(name: str, text: str) -> list[_Entry]:
     out = []
     for path, value, key in _toml_values(name, doc):
         pep508 = key is None
+        value_name = None
         if pep508:
             r = _requirement(value)
             if r is None:
                 continue
             req_name, clauses, spec, shown_end = r.name, r.clauses, r.spec, r.end
+            value_name = r.name_span
         else:
             # no clauses: `*`, "" or a range the parser does not read (`^0.27 || ^1.0`); the
             # whole string is the spec either way
@@ -716,22 +814,55 @@ def _toml_entries(name: str, text: str) -> list[_Entry]:
             problem = "could not locate the entry as a plain one-line TOML string"
             out.append(_Entry(req_name, clauses, 0, 0, 0, (0, 0), problem, path, value, spec))
             continue
-        lo, _ = found.inner
+        lo, hi = found.inner
         line = text.count("\n", 0, found.start) + 1
         line_start = text.rfind("\n", 0, found.start) + 1
         if pep508:
             shown = (lo, lo + shown_end)
+            assert value_name is not None
+            name_span: tuple[int, int] | None = (lo + value_name[0], lo + value_name[1])
+            item: tuple[int, int] | None = (lo, hi)
         else:
             indent = len(text[line_start : found.start]) - len(
                 text[line_start : found.start].lstrip()
             )
             shown = (line_start + indent, found.end)
+            name_span = _toml_key(text, line_start, req_name)
+            # `name = "spec"` (not `name = { version = "spec" }` or a sub-table's `version`)
+            item = shown if name_span is not None and path[-1] == key else None
         out.append(
             _Entry(
-                req_name, clauses, line, lo + spec[0], lo + spec[1], shown, "", path, value, spec
+                req_name,
+                clauses,
+                line,
+                lo + spec[0],
+                lo + spec[1],
+                shown,
+                "",
+                path,
+                value,
+                spec,
+                name_span,
+                value_name,
+                item,
             )
         )
     return out
+
+
+_TOML_KEY = re.compile(r"[ \t]*(?:\"([^\"\\\n]*)\"|'([^'\n]*)'|([A-Za-z0-9_-]+))[ \t]*=")
+
+
+def _toml_key(text: str, line_start: int, name: str) -> tuple[int, int] | None:
+    """The characters of the table key `name` (inside its quotes, if quoted) when the line at
+    `line_start` begins with it, else None (a dotted key, or a sub-table's `version`)."""
+    m = _TOML_KEY.match(text, line_start)
+    if not m:
+        return None
+    group = next(i for i in (1, 2, 3) if m.group(i) is not None)
+    if normalize_name(m.group(group)) != name:
+        return None
+    return m.span(group)
 
 
 # --- applying and checking ----------------------------------------------------------------------
@@ -753,18 +884,33 @@ def _check(
     path: str, old: str, new: str, targets: list[_Target], migration: Migration
 ) -> str | None:
     before, after = parse_dependency_file(path, old), parse_dependency_file(path, new)
-    if [d.name for d in before] != [d.name for d in after]:
+    renamed = [t for t in targets if t.name or t.remove]
+    if renamed:
+        # names change where entries are renamed or removed: compare as multisets
+        names = Counter(d.name for d in before)
+        names.subtract(t.entry.name for t in renamed)
+        names.update(normalize_name(t.name) for t in renamed if not t.remove)
+        if +names != Counter(d.name for d in after):
+            return "the declared package names changed"
+    elif [d.name for d in before] != [d.name for d in after]:
         return "the declared package names changed"
-    changed = Counter(
-        (b.name, b.clauses) for a, b in zip(before, after, strict=True) if a.clauses != b.clauses
+    expected = Counter((d.name, d.clauses) for d in before)
+    expected.subtract((t.entry.name, t.entry.clauses) for t in targets)
+    expected.update(
+        (normalize_name(t.name) if t.name else t.entry.name, pep440_clauses(t.spec))
+        for t in targets
+        if not t.remove
     )
-    expected = Counter((t.entry.name, pep440_clauses(t.spec)) for t in targets)
-    if changed != expected:
+    if +expected != Counter((d.name, d.clauses) for d in after):
         return "the edit did not change exactly the intended entries"
     flagged = [
         sum(migration.check_dependency(path, d) is not None for d in ds) for ds in (before, after)
     ]
-    if flagged[1] != flagged[0] - sum(t.kind == "migration" for t in targets):
+    resolved = sum(
+        t.kind == "migration" and migration.check_dependency(path, _declared(t.entry)) is not None
+        for t in targets
+    )
+    if flagged[1] != flagged[0] - resolved:
         return f"{migration.package} is still pinned below the migration's version"
     if dependency_file_problem(path, old) is None and (
         problem := dependency_file_problem(path, new)
@@ -779,27 +925,71 @@ def _check(
         return _check_setup_cfg(old, new)
     if name in CONDA_ENVIRONMENT_FILES:
         a, b = parse_conda_environment(old), parse_conda_environment(new)
-        if a.conda != b.conda or a.exported != b.exported or len(a.pip) != len(b.pip):
+        removed = sum(t.remove for t in targets)
+        if a.conda != b.conda or a.exported != b.exported or len(a.pip) - removed != len(b.pip):
             return "the environment changed beyond the pip entries"
     return None
 
 
 def _check_toml(old: str, new: str, targets: list[_Target]) -> str | None:
     a, b = tomllib.loads(old), tomllib.loads(new)
-    expected = {}
+    if not any(t.name or t.remove for t in targets):
+        expected = {}
+        for t in targets:
+            e = t.entry
+            expected[e.path] = e.value[: e.value_spec[0]] + t.spec + e.value[e.value_spec[1] :]
+        changed = _changed_paths(a, b)
+        if set(changed) != set(expected):
+            return "the document changed outside the intended values"
+        for p, value in expected.items():
+            node: Any = b
+            for part in p:
+                node = node[part]
+            if node != value:
+                return f"{'.'.join(map(str, p))} is {node!r}, expected {value!r}"
+        return None
+    # renamed keys and removed list items move other paths: build the expected document
+    want: Any = copy.deepcopy(a)
+    removed: list[tuple[Any, ...]] = []
     for t in targets:
         e = t.entry
-        expected[e.path] = e.value[: e.value_spec[0]] + t.spec + e.value[e.value_spec[1] :]
-    changed = _changed_paths(a, b)
-    if set(changed) != set(expected):
+        table_key = e.value_name is None
+        where = e.path[:-2] if table_key and e.path[-1] == "version" else e.path[:-1]
+        parent: Any = want
+        for part in where:
+            parent = parent[part]
+        if t.remove:
+            removed.append(e.path)
+            continue
+        value = _value_after(t)
+        if not table_key:
+            parent[e.path[-1]] = value
+            continue
+        key = e.path[len(where)]
+        entry = parent.pop(key) if t.name else parent[key]
+        if isinstance(entry, dict):
+            entry["version"] = value
+        else:
+            entry = value
+        parent[t.name or key] = entry
+    for p in sorted(removed, key=lambda p: p[-1] if isinstance(p[-1], int) else 0, reverse=True):
+        parent = want
+        for part in p[:-1]:
+            parent = parent[part]
+        del parent[p[-1]]  # list index (highest first) or table key
+    if b != want:
         return "the document changed outside the intended values"
-    for p, value in expected.items():
-        node: Any = b
-        for part in p:
-            node = node[part]
-        if node != value:
-            return f"{'.'.join(map(str, p))} is {node!r}, expected {value!r}"
     return None
+
+
+def _value_after(t: _Target) -> str:
+    """A TOML target's string value after the edit."""
+    e = t.entry
+    value = e.value[: e.value_spec[0]] + t.spec + e.value[e.value_spec[1] :]
+    if t.name and e.value_name is not None:
+        lo, hi = e.value_name  # before the spec, so its offsets still hold
+        value = value[:lo] + t.name + value[hi:]
+    return value
 
 
 def _check_setup_py(old: str, new: str, targets: list[_Target]) -> str | None:
@@ -808,15 +998,26 @@ def _check_setup_py(old: str, new: str, targets: list[_Target]) -> str | None:
     wanted = {(t.entry.line, t.entry.start): t for t in targets}
     starts = {n: offset for n, offset, _ in _lines(old)}
     lines = old.splitlines()
+    gone: set[int] = set()
     for node in ast.walk(a):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             col = len(lines[node.lineno - 1].encode("utf-8")[: node.col_offset].decode("utf-8"))
             base = starts[node.lineno] + col + 1
             for (line, start), t in wanted.items():
                 if line == node.lineno and base <= start <= base + len(node.value):
+                    if t.remove:
+                        gone.add(id(node))
+                        continue
                     lo = start - base
                     length = t.entry.end - t.entry.start
-                    node.value = node.value[:lo] + t.spec + node.value[lo + length :]
+                    value = node.value[:lo] + t.spec + node.value[lo + length :]
+                    if t.name and t.entry.name_span is not None:
+                        n_lo, n_hi = (i - base for i in t.entry.name_span)
+                        value = value[:n_lo] + t.name + value[n_hi:]
+                    node.value = value
+    for node in ast.walk(a):
+        if isinstance(node, ast.List | ast.Tuple | ast.Set):
+            node.elts = [e for e in node.elts if id(e) not in gone]
     if ast.dump(a) != ast.dump(b):
         return "the code changed outside the edited strings"
     return None

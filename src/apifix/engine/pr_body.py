@@ -306,7 +306,12 @@ def _what_changed(
     pins = job.get("pin_edits") or []
     if pins:
         lines.append(f"- Dependency {'pin' if len(pins) == 1 else 'pins'} set:")
-        lines += [f"  - `{p['file']}`: {_code(p['old'])} → {_code(p['new'])}" for p in pins[:5]]
+        lines += [
+            f"  - `{p['file']}`: {_code(p['old'])} → {_code(p['new'])}"
+            if p["new"]
+            else f"  - `{p['file']}`: {_code(p['old'])} removed ({p.get('why') or 'replaced'})"
+            for p in pins[:5]
+        ]
         if len(pins) > 5:
             lines.append(f"  - and {len(pins) - 5} more")
         why = _pin_why(pins, migration)

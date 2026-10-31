@@ -610,3 +610,22 @@ def test_the_pin_line_says_why_from_the_migrations_data():
     assert "`<3`" not in build(trajectory=trajectory).body
     trajectory["job"]["pin_edits"][0].update(new="openai>=1.55.3,<3", kind="companion")
     assert "Why this range" not in build(trajectory=trajectory).body
+
+
+def test_a_removed_pin_says_why():
+    trajectory = copy.deepcopy(TRAJECTORY)
+    trajectory["job"]["pin_edits"] = [
+        {
+            "file": "requirements.txt",
+            "line": 2,
+            "old": "google-generativeai==0.8.3",
+            "new": "",
+            "kind": "migration",
+            "why": "google-genai is declared in the same file",
+        }
+    ]
+    body = build(trajectory=trajectory).body
+    assert (
+        "  - `requirements.txt`: `google-generativeai==0.8.3` removed (google-genai is declared "
+        "in the same file)"
+    ) in body

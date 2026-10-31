@@ -569,3 +569,17 @@ main, then stop.
   the library in tampering. Replay of `benchmark/live/2026-10-30-aipl-gptoss` with
   `apifix verify`: verification.json (without timings and object addresses) and report.md
   (without timings) identical to the run before the change.
+- **E2 distribution rename in pin edits** (`Migration.source_package`, `""` for openai-v1):
+  a flagged `google-generativeai` entry becomes `google-genai<pin_spec>` in every format
+  pin_edits handles; only the name and spec characters change (extras, markers, comments and
+  quoting stay). Where the same file already declares google-genai, the old entry's line is
+  removed instead, when nothing else is on it (quotes, a list comma, a YAML dash and a comment
+  aside), and a google-genai declaration that allows releases below the pin's `>=` floor is
+  raised to the pin. Falls back to the model: an old entry sharing its line with others
+  (`deps = ["a", "google-generativeai"]`) when it must be removed, and a name apifix cannot
+  locate (a Poetry sub-table `[tool.poetry.dependencies.google-generativeai]`, a dotted key).
+  The re-parse checks compare the expected multiset of (name, clauses), the expected TOML
+  document, setup.py AST (removed list items dropped) and the conda pip count. Report and PR
+  lines say `removed (google-genai is declared in the same file)`. `already_migrated.py`: a
+  repo that still declares the old distribution is not migrated. Replay of the aipl result:
+  identical.

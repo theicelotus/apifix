@@ -7,7 +7,9 @@ from pathlib import Path
 
 import pytest
 
+from apifix.engine.dependencies import entirely_at_or_above, parse_dependency_file
 from apifix.engine.migrations import get_migration
+from apifix.engine.models import Finding
 from apifix.engine.pin_edits import (
     HASH_PINNED,
     PinFile,
@@ -594,3 +596,194 @@ def test_unpinned_fixture_gets_the_pin_and_a_lockfile_note():
     (f,) = plan_pin_edits(root, findings, MIG).files
     assert changed_lines(f) == [('    "openai",', '    "openai>=1.55.3,<3",')]
     assert f.complete and f.notes == ["not updated: uv.lock; regenerate it"]
+
+
+# --- a distribution that changes its name (google-generativeai -> google-genai) ----------------
+
+
+class _Renaming:
+    """openai-v1 with another distribution: flags every google-generativeai declaration and
+    google-genai ones that allow 0.x, like a migration that renames the package would."""
+
+    package = "google-genai"
+    source_package = "google-generativeai"
+    pin_spec = ">=1.19.0,<3"
+    companion_pins: dict = {}
+
+    def check_dependency(self, file, dep):
+        old = dep.name == "google-generativeai"
+        if not old and (dep.name != "google-genai" or entirely_at_or_above(dep.clauses, "1.0.0")):
+            return None
+        return Finding(file, dep.line, dep.col, dep.line, dep.col + 1, "dependency", dep.raw, "")
+
+
+RENAMING = _Renaming()
+
+
+def renamed(tmp_path: Path, rel: str, content: str) -> PinFile:
+    root = tmp_path / "repo"
+    (root / rel).parent.mkdir(parents=True, exist_ok=True)
+    (root / rel).write_text(textwrap.dedent(content))
+    deps = parse_dependency_file(rel, (root / rel).read_text())
+    findings = [f for d in deps if (f := RENAMING.check_dependency(rel, d))]
+    (pin_file,) = plan_pin_edits(root, findings, RENAMING).files  # type: ignore[arg-type]
+    return pin_file
+
+
+@pytest.mark.parametrize(
+    ("rel", "content", "old", "new"),
+    [
+        (
+            "requirements.txt",
+            "google-generativeai[x]==0.8.3 ; python_version >= '3.9'  # gemini\n",
+            "google-generativeai[x]==0.8.3 ; python_version >= '3.9'  # gemini",
+            "google-genai[x]>=1.19.0,<3 ; python_version >= '3.9'  # gemini",
+        ),
+        (
+            "requirements.txt",
+            "Google_GenerativeAI\n",
+            "Google_GenerativeAI",
+            "google-genai>=1.19.0,<3",
+        ),
+        (
+            "environment.yml",
+            "dependencies:\n  - pip:\n    - 'google-generativeai>=0.5'\n",
+            "    - 'google-generativeai>=0.5'",
+            "    - 'google-genai>=1.19.0,<3'",
+        ),
+        (
+            "setup.cfg",
+            "[options]\ninstall_requires =\n    google-generativeai~=0.8\n",
+            "    google-generativeai~=0.8",
+            "    google-genai>=1.19.0,<3",
+        ),
+        (
+            "setup.py",
+            "setup(install_requires=['rich', 'google-generativeai>=0.3'])\n",
+            "setup(install_requires=['rich', 'google-generativeai>=0.3'])",
+            "setup(install_requires=['rich', 'google-genai>=1.19.0,<3'])",
+        ),
+        (
+            "pyproject.toml",
+            '[project]\nname = "x"\ndependencies = ["google-generativeai>=0.7", "rich"]\n',
+            'dependencies = ["google-generativeai>=0.7", "rich"]',
+            'dependencies = ["google-genai>=1.19.0,<3", "rich"]',
+        ),
+        (
+            "pyproject.toml",
+            '[tool.poetry.dependencies]\npython = "^3.9"\ngoogle-generativeai = "^0.8.3"\n',
+            'google-generativeai = "^0.8.3"',
+            'google-genai = ">=1.19.0,<3"',
+        ),
+        (
+            "pyproject.toml",
+            "[tool.poetry.dependencies]\n"
+            '"google-generativeai" = { version = "^0.8", optional = true }\n',
+            '"google-generativeai" = { version = "^0.8", optional = true }',
+            '"google-genai" = { version = ">=1.19.0,<3", optional = true }',
+        ),
+        (
+            "Pipfile",
+            '[packages]\ngoogle-generativeai = "*"\n',
+            'google-generativeai = "*"',
+            'google-genai = ">=1.19.0,<3"',
+        ),
+        (
+            "pixi.toml",
+            '[pypi-dependencies]\ngoogle-generativeai = ">=0.8"\n',
+            'google-generativeai = ">=0.8"',
+            'google-genai = ">=1.19.0,<3"',
+        ),
+    ],
+)
+def test_the_old_distribution_is_renamed_in_every_format(tmp_path, rel, content, old, new):
+    f = renamed(tmp_path, rel, content)
+    assert f.fallbacks == []
+    assert changed_lines(f) == [(old, new)]
+    (edit,) = f.edits
+    assert edit.new.startswith(("google-genai", '"google-genai"', "'google-genai"))
+
+
+def test_the_rename_report_line(tmp_path):
+    f = renamed(tmp_path, "requirements.txt", "rich\ngoogle-generativeai==0.8.3\n")
+    assert [pin_line(e) for e in f.edits] == [
+        "requirements.txt:2 google-generativeai==0.8.3 -> google-genai>=1.19.0,<3"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("rel", "content", "left"),
+    [
+        (
+            "requirements.txt",
+            "google-generativeai==0.8.3  # old\ngoogle-genai>=1.20\nrich\n",
+            "google-genai>=1.20\nrich\n",
+        ),
+        (
+            "environment.yml",
+            'dependencies:\n  - pip:\n    - google-genai>=1.20\n    - "google-generativeai"\n',
+            "dependencies:\n  - pip:\n    - google-genai>=1.20\n",
+        ),
+        (
+            "setup.py",
+            "setup(\n    install_requires=[\n        'google-genai>=1.20',\n"
+            "        'google-generativeai>=0.3',\n    ],\n)\n",
+            "setup(\n    install_requires=[\n        'google-genai>=1.20',\n    ],\n)\n",
+        ),
+        (
+            "pyproject.toml",
+            '[project]\nname = "x"\ndependencies = [\n    "google-generativeai>=0.7",\n'
+            '    "google-genai>=1.20",\n]\n',
+            '[project]\nname = "x"\ndependencies = [\n    "google-genai>=1.20",\n]\n',
+        ),
+        (
+            "pyproject.toml",
+            '[tool.poetry.dependencies]\ngoogle-genai = "^1.20"\ngoogle-generativeai = "^0.8"\n',
+            '[tool.poetry.dependencies]\ngoogle-genai = "^1.20"\n',
+        ),
+    ],
+)
+def test_the_old_entry_is_removed_where_the_new_one_is_declared(tmp_path, rel, content, left):
+    f = renamed(tmp_path, rel, content)
+    assert f.fallbacks == []
+    assert f.text == left
+    (edit,) = f.edits
+    assert edit.new == ""
+    assert pin_line(edit).endswith(" removed (google-genai is declared in the same file)")
+
+
+def test_a_new_declaration_below_the_floor_is_raised_when_the_old_one_goes(tmp_path):
+    f = renamed(tmp_path, "requirements.txt", "google-genai>=1.0\ngoogle-generativeai\n")
+    assert f.text == "google-genai>=1.19.0,<3\n"
+    assert [pin_line(e) for e in f.edits] == [
+        "requirements.txt:1 google-genai>=1.0 -> google-genai>=1.19.0,<3 "
+        "(it allowed releases below 1.19.0)",
+        "requirements.txt:2 google-generativeai removed (google-genai is declared in the same "
+        "file)",
+    ]
+    # a declaration the migration flags itself is set once
+    f = renamed(tmp_path, "requirements.txt", "google-genai==0.3\ngoogle-generativeai\n")
+    assert f.text == "google-genai>=1.19.0,<3\n"
+    assert len(f.edits) == 2
+
+
+@pytest.mark.parametrize(
+    ("rel", "content", "reason"),
+    [
+        (
+            "pyproject.toml",
+            '[project]\nname = "x"\ndependencies = ["google-generativeai", "google-genai>=1.20"]\n',
+            "google-genai is declared in the same file, and the entry shares its line, so "
+            "apifix cannot remove it",
+        ),
+        (
+            "pyproject.toml",
+            '[tool.poetry.dependencies.google-generativeai]\nversion = "^0.8"\n',
+            "could not locate the package name to replace with google-genai",
+        ),
+    ],
+)
+def test_renames_and_removals_apifix_cannot_make_fall_back(tmp_path, rel, content, reason):
+    f = renamed(tmp_path, rel, content)
+    assert [b.reason for b in f.fallbacks] == [reason]
+    assert f.edits == [] and f.text == f.original

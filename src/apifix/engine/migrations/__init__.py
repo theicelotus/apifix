@@ -65,6 +65,10 @@ class Migration(Protocol):
     # requirements whose pins apifix raises in the same files when they allow none of the range.
     package: str
     pin_spec: str
+    # The old library's distribution when the new one has another name (google-generativeai ->
+    # google-genai): apifix replaces its declarations with `package` + `pin_spec`, or removes
+    # them where the same file already declares `package`. "" when the name stays.
+    source_package: str
     companion_pins: Mapping[str, CompanionPin]
     # The library's first version with the new API, and how reports name it ("openai 1.x"):
     # a repo whose declarations all require `first_version` or later, with findings only in

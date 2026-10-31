@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import json
 import shutil
 import textwrap
@@ -74,6 +75,15 @@ def test_a_declaration_allowing_0x_is_not_migrated(stale, spec):
 def test_every_declaration_must_require_1x(stale):
     (stale / "Pipfile").write_text('[packages]\nopenai = "*"\n')
     assert scan(stale, "openai-v1").already_migrated is None
+
+
+def test_the_old_distribution_left_declared_is_not_migrated(stale):
+    renaming = copy.copy(MIGRATION)
+    renaming.source_package = "Old_OpenAI"  # a migration that renames the distribution
+    findings = scan(stale, "openai-v1").findings
+    assert detect_already_migrated(stale, renaming, findings) is not None
+    (stale / "requirements.txt").write_text("openai==1.12.0\nold-openai==2.0\n")
+    assert detect_already_migrated(stale, renaming, findings) is None
 
 
 def test_no_declaration_is_not_migrated(stale):

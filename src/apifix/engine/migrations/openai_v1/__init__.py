@@ -101,6 +101,7 @@ class OpenAIV1Migration:
     keyword_renames = rules.KWARG_RENAMES
     package = rules.PACKAGE
     pin_spec = rules.PIN_SPEC
+    source_package = ""
     companion_pins = rules.COMPANION_PINS
     first_version = rules.FIRST_V1
     target_name = "openai 1.x"

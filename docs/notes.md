@@ -139,7 +139,9 @@ src/apifix/
                       verify() as fix, no LLM; same output files
     pin_edits.py      dependency pins apifix sets itself (no LLM): the migration's pin_spec and
                       raised companion pins, every format, byte-for-byte, checked by re-parsing;
-                      fallbacks with reasons; report lines; conda/lockfile notes
+                      a renamed distribution (source_package) gets its name replaced, or its
+                      line removed where the file declares the new one; fallbacks with
+                      reasons; report lines; conda/lockfile notes
     whole_file.py     whole-file mode (no tools, one file per request): file selection, prompts
                       (whole file or regions), code-block parsing, pre-apply checks (syntax,
                       dependency file, changed, abbreviation, undefined names, mock targets)
