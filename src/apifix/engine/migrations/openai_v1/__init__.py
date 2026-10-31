@@ -108,6 +108,7 @@ class OpenAIV1Migration:
     target_name = "openai 1.x"
     source_name = "openai 0.x"
     pin_reasons = rules.PIN_REASONS
+    min_python = "3.8"
     pr_why = (
         "openai 1.0 removed the module-level API (`openai.ChatCompletion.create`, "
         "`openai.error`, ...), so code written for 0.x fails once `openai>=1` is installed."

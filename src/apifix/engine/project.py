@@ -58,6 +58,11 @@ def _key(version: str) -> tuple[int, ...]:
     return tuple(int(x) for x in version.split("."))
 
 
+def python_at_least(version: str, minimum: str) -> bool:
+    """`version` ("3.9") is `minimum` or later."""
+    return _key(version) >= _key(minimum)
+
+
 # --- Python version -------------------------------------------------------------------------
 
 

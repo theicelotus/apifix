@@ -68,7 +68,13 @@ from apifix.engine.pin_edits import (
     pin_line,
     plan_pin_edits,
 )
-from apifix.engine.project import ci_env_vars, is_test_file
+from apifix.engine.project import (
+    DEFAULT_PYTHON,
+    ci_env_vars,
+    detect_python_version,
+    is_test_file,
+    python_at_least,
+)
 from apifix.engine.regions import (
     IMPORTS,
     RegionPlan,
@@ -2123,6 +2129,14 @@ class _Job:
             return "no_findings", "the scanner found nothing to migrate"
         if self.already_migrated:
             return "already_migrated", self.already_migrated.message
+        default_python = getattr(getattr(self.sandbox, "config", None), "default_python", None)
+        python = detect_python_version(self.repo, default_python or DEFAULT_PYTHON)
+        if not python_at_least(python.version, self.migration.min_python):
+            return "aborted", (
+                f"python: {self.migration.target_name} needs Python {self.migration.min_python} "
+                f"or later; the repo's detected interpreter is Python {python.version} "
+                f"({python.source})"
+            )
         if not self.price_known and self.config.max_cost_usd is not None:
             raise ValueError(
                 f"no price for model {self.llm.model}: add it to the price table "

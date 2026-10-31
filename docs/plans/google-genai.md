@@ -602,3 +602,14 @@ main, then stop.
   `GEMINI_API_KEY`. Replay of the aipl result: identical.
 - Not built in this session (by request): E5 minimum Python, E6 registry and docs, and the
   migration package itself.
+
+### Next session
+
+- **E5 minimum Python** (`Migration.min_python`; openai-v1: `"3.8"`, `project.python_at_least`):
+  `_Job.run()` detects the repo's Python (`detect_python_version`, the sandbox's
+  `default_python` as the default when the fake sandboxes in tests have no `config`) right
+  after the `already_migrated` check, before the preflight check or any LLM call, and aborts
+  with `python: {target_name} needs Python {min_python} or later; the repo's detected
+  interpreter is Python {version} ({source})` when it is older. Replay of
+  `benchmark/live/2026-10-30-aipl-gptoss` with `apifix verify`: identical (object addresses and
+  timings aside) — `apifix verify` never calls the agent loop, so this change cannot affect it.

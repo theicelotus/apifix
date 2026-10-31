@@ -6,6 +6,7 @@ consequences of the agent's actual edits.
 
 from __future__ import annotations
 
+import copy
 import itertools
 import json
 import re
@@ -344,6 +345,20 @@ def test_unusable_docker_aborts_before_any_llm_call(repo):
     result = go(repo, llm, JudgingSandbox(baseline=down))
     assert result.outcome == "aborted"
     assert "sandbox unavailable" in result.reason and llm.requests == []
+
+
+def test_a_repo_below_the_migrations_minimum_python_aborts_before_any_llm_call(repo):
+    (repo / ".python-version").write_text("3.8\n")
+    migration = copy.copy(get_migration("openai-v1"))
+    migration.min_python = "3.12"
+    llm = FakeLLM([])
+    result = fix(repo, migration, llm=llm, sandbox=JudgingSandbox())
+    assert result.outcome == "aborted"
+    assert result.reason == (
+        "python: openai 1.x needs Python 3.12 or later; the repo's detected interpreter is "
+        "Python 3.8 (.python-version)"
+    )
+    assert llm.requests == []
 
 
 # --- edit policy --------------------------------------------------------------------------------

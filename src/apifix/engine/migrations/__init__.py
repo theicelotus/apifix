@@ -85,6 +85,10 @@ class Migration(Protocol):
     # Why each clause of `pin_spec` is there, keyed by the clause (">=1.55.3"): shown beside the
     # pin apifix wrote, in the pull request.
     pin_reasons: Mapping[str, str]
+    # The lowest Python the target library's first version with the new API supports: a repo
+    # whose detected interpreter is older fails installing it, so the fix job stops before any
+    # LLM call instead of letting pip fail in the sandbox (agent.py).
+    min_python: str
 
     def pr_change(
         self, category: str, old_pattern: str, new_code: str, file_code: str
