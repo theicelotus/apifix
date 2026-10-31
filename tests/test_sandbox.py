@@ -467,7 +467,8 @@ def test_transient_install_failure_is_retried_once(repo, stderr):
     result = run_sandbox(repo, docker=docker)
     assert result.status == "passed" and result.install_retried is True
     assert [p.status for p in result.install_attempts] == ["failed", "ok"]
-    assert "dependency install failed (network or unknown cause); retried 1 time(s)" in result.notes
+    kind = "network error" if "NewConnectionError" in stderr else "unknown cause"
+    assert f"dependency install failed ({kind}); retried 1 time(s)" in result.notes
 
 
 def test_no_release_found_counts_as_a_network_failure(repo):
@@ -496,7 +497,33 @@ def test_transient_install_failure_is_retried_up_to_three_times(repo):
     result = run_sandbox(repo, docker=docker)
     assert (result.status, result.reason) == ("error", "dependency install failed")
     assert len(result.install_attempts) == 4 and result.install_retried is True
-    assert "dependency install failed (network or unknown cause); retried 3 time(s)" in result.notes
+    assert "dependency install failed (network error); retried 3 time(s)" in result.notes
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "ERROR: Could not install packages due to an OSError: Connection refused",
+        "urllib3.exceptions.NameResolutionError: Temporary failure in name resolution",
+        "ConnectionResetError(104, 'Connection reset by peer')",
+    ],
+)
+def test_clear_network_errors_get_three_retries(repo, stderr):
+    flaky = exited(1, stderr=stderr)
+    docker = FakeDocker(install=[flaky, flaky, flaky, ok()], test=pytest_run(passed=1))
+    result = run_sandbox(repo, docker=docker)
+    assert result.status == "passed" and len(result.install_attempts) == 4
+    assert "dependency install failed (network error); retried 3 time(s)" in result.notes
+
+
+@pytest.mark.parametrize(
+    "stderr", ["Killed", "ERROR: HTTP error 503 while getting https://x/", "SSLError(...)"]
+)
+def test_unknown_or_ambiguous_failures_get_one_retry_only(repo, stderr):
+    bad = exited(1, stderr=stderr)
+    result = run_sandbox(repo, docker=FakeDocker(install=[bad, bad, bad, bad]))
+    assert result.status == "error" and len(result.install_attempts) == 2
+    assert "dependency install failed (unknown cause); retried 1 time(s)" in result.notes
 
 
 def test_transient_install_failure_succeeds_on_a_later_retry(repo):
@@ -505,7 +532,7 @@ def test_transient_install_failure_succeeds_on_a_later_retry(repo):
     result = run_sandbox(repo, docker=docker)
     assert result.status == "passed"
     assert len(result.install_attempts) == 4 and result.install_retried is True
-    assert "dependency install failed (network or unknown cause); retried 3 time(s)" in result.notes
+    assert "dependency install failed (network error); retried 3 time(s)" in result.notes
 
 
 def test_env_placeholders_reach_the_test_phase_only(repo):

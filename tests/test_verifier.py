@@ -566,7 +566,7 @@ def test_run_summary_keeps_pip_output_of_failed_installs():
     result = run(status="error", reason="dependency install failed")
     result.install_retried = True
     result.env_placeholders = ["OPENAI_API_KEY"]
-    result.notes = ["dependency install failed (network or unknown cause); retried once"]
+    result.notes = ["dependency install failed (network error); retried 1 time(s)"]
     failed = PhaseResult("install", "failed", "python:3.11-slim", "bridge", [], exit_code=1)
     failed.stdout, failed.stderr = "Collecting openai\n" + "x" * 5000, "ERROR: ReadTimeoutError"
     result.install_attempts = [

@@ -111,22 +111,28 @@ BUILD_ERROR_MARKERS = (
     "pg_config",
     "command 'cc' failed",
 )
-# pip output that means the network or the index failed, not the requirements: the install is
-# retried once. A failure with no recognised marker at all is retried once too.
-NETWORK_ERROR_MARKERS = (
+# pip output that clearly means the network failed (a timeout, a dropped or refused connection,
+# DNS): retried up to MAX_NETWORK_INSTALL_RETRIES times.
+CLEAR_NETWORK_MARKERS = (
     "NewConnectionError",
     "ConnectTimeoutError",
     "ReadTimeoutError",
     "Read timed out",
     "ConnectionResetError",
     "Connection reset by peer",
+    "ConnectionRefusedError",
+    "Connection refused",
     "RemoteDisconnected",
     "IncompleteRead",
     "ProtocolError",
-    "Max retries exceeded",
     "Temporary failure in name resolution",
     "Name or service not known",
     "Network is unreachable",
+)
+# pip output that may be the network or the index but may be something else: retried like a
+# failure of unknown cause, at most MAX_UNKNOWN_INSTALL_RETRIES times.
+AMBIGUOUS_NETWORK_MARKERS = (
+    "Max retries exceeded",
     "SSLError",
     "HTTP error 429",
     "HTTP error 5",
@@ -134,10 +140,13 @@ NETWORK_ERROR_MARKERS = (
     # printed for a misspelt name, which then costs one retry)
     "(from versions: none)",
 )
-# A network-looking install failure is retried up to this many times (so at most this many
-# attempts beyond the first), independently of the resolution/build-error retries below.
+NETWORK_ERROR_MARKERS = (*CLEAR_NETWORK_MARKERS, *AMBIGUOUS_NETWORK_MARKERS)
+# A clearly network-caused install failure is retried up to this many times (so at most this
+# many attempts beyond the first), independently of the resolution/build-error retries below.
 MAX_NETWORK_INSTALL_RETRIES = 3
-NETWORK_RETRY_NOTE = "dependency install failed (network or unknown cause)"
+# A failure of unknown cause (or an ambiguous marker) gets at most this many.
+MAX_UNKNOWN_INSTALL_RETRIES = 1
+NETWORK_RETRY_NOTE = "dependency install failed"
 # pip output that means the requirements themselves are wrong: never retried as transient.
 REQUIREMENT_ERROR_MARKERS = (
     "Invalid requirement",
@@ -670,15 +679,21 @@ class Sandbox:
             conflict = _has_marker(phase, CONFLICT_MARKERS)
             if conflict:
                 result.install_conflict = install_conflict(phase.stdout + "\n" + phase.stderr, plan)
-            if (
-                network_retries < MAX_NETWORK_INSTALL_RETRIES
-                and not conflict
-                and (_has_marker(phase, NETWORK_ERROR_MARKERS) or not _has_marker(phase, known))
-            ):
+            clear = _has_marker(phase, CLEAR_NETWORK_MARKERS)
+            transient = (
+                clear
+                or _has_marker(phase, AMBIGUOUS_NETWORK_MARKERS)
+                or not _has_marker(phase, known)
+            )
+            limit = MAX_NETWORK_INSTALL_RETRIES if clear else MAX_UNKNOWN_INSTALL_RETRIES
+            if transient and not conflict and network_retries < limit:
                 network_retries += 1
                 result.install_retried = True
+                kind = "network error" if clear else "unknown cause"
                 result.notes[:] = [n for n in result.notes if not n.startswith(NETWORK_RETRY_NOTE)]
-                result.notes.append(f"{NETWORK_RETRY_NOTE}; retried {network_retries} time(s)")
+                result.notes.append(
+                    f"{NETWORK_RETRY_NOTE} ({kind}); retried {network_retries} time(s)"
+                )
                 continue
             if image.endswith("-slim") and _has_marker(phase, BUILD_ERROR_MARKERS):
                 image = image.removesuffix("-slim")
