@@ -19,6 +19,12 @@ removed `openai.ChatCompletion.create`), apifix:
    states it was written by an AI model.
 
 
+## Supported migrations
+
+- `openai-v1`: OpenAI Python library 0.x -> 1.x
+- `google-genai`: google-generativeai (support ended 2025-11-30) -> the Google Gen AI SDK
+  (`google-genai`)
+
 ## Installation
 
 Requirements: Python 3.11+, Docker, git. The GitHub CLI (`gh`) is needed only

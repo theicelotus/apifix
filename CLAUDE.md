@@ -1,11 +1,12 @@
 # apifix
 
 apifix automatically fixes Python code broken by API/library breaking changes, verifies each fix
-in a sandbox, and opens a pull request with the evidence (`apifix pr`). v1: Python only, one migration
-(`openai-v1`: OpenAI library 0.x -> 1.x). Pipeline: scan call sites (`ast`, no LLM) -> agent
-proposes a fix -> run the repo's tests in Docker with no network -> retry with the errors (up to
-3) -> diff + verification report. Not yet: FastAPI service, job queue, GitHub App, dashboard;
-don't build these until asked.
+in a sandbox, and opens a pull request with the evidence (`apifix pr`). v1: Python only, two
+migrations (`openai-v1`: OpenAI library 0.x -> 1.x; `google-genai`: google-generativeai -> the
+Google Gen AI SDK). Pipeline: scan call sites (`ast`, no LLM) -> agent proposes a fix -> run the
+repo's tests in Docker with no network -> retry with the errors (up to 3) -> diff + verification
+report. Not yet: FastAPI service, job queue, GitHub App, dashboard; don't build these until
+asked.
 
 History and past decisions: docs/notes.md, read only the part you need.
 
@@ -19,7 +20,8 @@ src/apifix/engine/
   dependencies.py           parse every dependency file format; import -> distribution names
   scanner.py                affected call sites + dependency pins (pure ast, no LLM)
   already_migrated.py       repo already on the new API with only stale tests (exit 3)
-  migrations/               one package per migration (openai_v1/: rules, guide.md, checks)
+  migrations/               one package per migration (openai_v1/, google_genai/: rules,
+                            guide.md, checks)
   project.py                target repo facts: Python version, test files, test/install plans
   sandbox.py                two-phase Docker run (install with network, test without)
   sandbox_driver.py         runs inside containers (Python 3.8+, stdlib only)

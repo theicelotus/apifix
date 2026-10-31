@@ -149,9 +149,9 @@ class Migration(Protocol):
 
 
 def _registry() -> dict[str, Migration]:
-    from apifix.engine.migrations import openai_v1
+    from apifix.engine.migrations import google_genai, openai_v1
 
-    return {m.name: m for m in (openai_v1.MIGRATION,)}
+    return {m.name: m for m in (openai_v1.MIGRATION, google_genai.MIGRATION)}
 
 
 def available_migrations() -> list[str]:

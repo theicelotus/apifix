@@ -1386,3 +1386,46 @@ Open questions for later:
 - Regenerating lockfiles (poetry/uv/pdm/pipenv) is out of scope; the PR body only warns that the
   repo's CI may fail until the lockfile is regenerated. Should apifix run the lock tool in the
   sandbox (network, installs the tool) and add the result to the same commit?
+
+## Known limitations (google-genai migration)
+
+- `migrations/google_genai/`: google-generativeai (support ended 2025-11-30, archived) ->
+  google-genai, the Gemini Developer API only (no Vertex AI, Files API, caching, tuning,
+  operations, or automatic function calling with Python callables; the scanner still reports
+  these so they show up in the summary, but the guide says to leave them alone).
+- Instance tracking (which names hold a `GenerativeModel` or a `ChatSession`) is whole-file and
+  flow-insensitive (`python_checks._Instances`), unlike openai_v1's per-scope `_Clients`: a
+  model name bound in one function is treated as a model everywhere else in the file too. This
+  can over-associate in a file that reuses a plain name (`model`, `chat`) for two unrelated
+  things; real code rarely does.
+- No string-reference resolution yet (openai_v1's `visit_Constant`/`_local_module`): a
+  `mock.patch("pkg.mod.genai.GenerativeModel")` string is not turned into a scanner finding by
+  itself, only caught later by the `patches` rewrite check once the file has another finding
+  that brings it into the job. A test file whose only old-SDK trace is such a string (no import,
+  no direct call) scans clean.
+- The `key`/`settings`/`safety` rewrite checks (`config_checks.py`) are presence/substring
+  heuristics, not full dataflow like openai_v1's `ConfigChecker`: `settings` checks that each
+  dropped `GenerativeModel`/`GenerationConfig` keyword name appears *somewhere* in the candidate
+  file, not that it reached the specific call it came from; `safety` compares the same
+  category/threshold tokens, not that they ended up on the right call. False negatives are more
+  likely than in openai_v1; false positives should be rare.
+- `key` does not enforce the GEMINI_API_KEY/GOOGLE_API_KEY precedence swap (guide.md "Client"
+  section describes it in prose): when old code relied on the environment with no explicit
+  `api_key=`, the check accepts a bare `genai.Client()` even though the two SDKs disagree on
+  which variable wins when both are set.
+- `patches` (`test_checks.py`) only catches two concrete cases (a patch target ending in a name
+  removed from the module - `configure`, `GenerativeModel`, `embed_content`, `list_models` - and
+  `autospec=True` on a target ending in `Client`), not a check against the full generated API
+  surface the plan described (`rules.py`, built from the downloaded wheel).
+- `response_access` findings for `.resolve()` / `.to_dict()` / `supported_generation_methods`
+  and the `.text`-in-`except ValueError` check are gated on "the file imports the old SDK",
+  not on tracking that the specific object is a Gemini response: a file that imports
+  google.generativeai and also has an unrelated `.to_dict()` call on something else gets a
+  (likely) finding for it too.
+- Dependency findings use `Migration.first_version` (`"1.0.0"`, the API's first release) as the
+  cutoff for "does this declaration still allow the old SDK", matching openai_v1's own pattern;
+  the pin's stricter floor (`>=1.19.0`, for GEMINI_API_KEY fallback parity) is only what apifix
+  *writes* once a finding is already flagged, so a declaration like `google-genai>=1.0,<1.10`
+  is not flagged even though it excludes the floor.
+- No Docker sandbox test, live `-m llm` run, or benchmark-repo runs yet for this migration (not
+  built in the google-genai session; see docs/plans/google-genai.md).

@@ -613,3 +613,47 @@ main, then stop.
   interpreter is Python {version} ({source})` when it is older. Replay of
   `benchmark/live/2026-10-30-aipl-gptoss` with `apifix verify`: identical (object addresses and
   timings aside) — `apifix verify` never calls the agent loop, so this change cannot affect it.
+- **E6 registry and docs**: `google_genai.MIGRATION` registered in `migrations/__init__._registry`
+  (`available_migrations()` now `["google-genai", "openai-v1"]`); CLAUDE.md's layout line and
+  README's new "Supported migrations" section updated; docs/notes.md gained "Known limitations
+  (google-genai migration)" (see below for what it lists).
+- **Migration package** `src/apifix/engine/migrations/google_genai/`: `rules.py` (data tables:
+  `PACKAGE`/`SOURCE_PACKAGE`/`PIN_SPEC`/`FIRST_VERSION`/`CLIENT_KEY`/error and module-call
+  tables/guide selectors), `python_checks.py` (the scanner: import, `configure()` ->
+  `client_config`, `GenerativeModel`/`generate_content`/`generate_content_stream`/
+  `count_tokens`/`start_chat`/`send_message`/`embed_content` -> `api_call` with whole-file
+  flow-insensitive instance tracking for which names hold a model or a chat, `.text` in
+  `except ValueError`/`chat.history`/`embedding["embedding"]`/`.resolve()`/`.to_dict()`/
+  `supported_generation_methods` -> `response_access`, removed error classes and
+  `google.api_core.exceptions.*` -> `error_class`, `genai.protos` -> `removed_module`),
+  `streaming.py` (the `streaming` rewrite check: leftover `stream=`, an un-awaited
+  `async for` over `..._stream(...)`, unguarded `chunk.text` concatenation),
+  `config_checks.py` (`key`/`settings`/`safety` rewrite checks, presence heuristics rather
+  than openai_v1's full dataflow — see docs/notes.md), `test_checks.py` (the `patches` rewrite
+  check: a patch target ending in a name google.genai dropped, or `autospec=True` on a
+  `Client` target), `repo_findings.py` (`adjust_findings`: names the files with api_call
+  findings on a `client_config` finding when they are in another file), `guide_parts.py` +
+  `guide.md` (the same part-selector mechanism as openai_v1, no resources-table filtering),
+  `__init__.py` (the `Migration` object: `min_python = "3.9"`, `check_dependency` handling both
+  `source_package` at any version and a loose/old `package` declaration, failure hints for the
+  new SDK's error texts).
+  - Fixtures (`tests/fixtures/google_genai/`): `basic_generate.py`, `provider_class.py` (self
+    attribute tracking, `google.api_core.exceptions`), `chat_stream.py`, `embeddings.py`,
+    `aliases.py` (bare `import google.generativeai`, `from google import generativeai as gg`),
+    `new_sdk.py` (no findings), `out_of_scope.py`, `tests_mock.py`.
+  - Tests: `test_google_genai_scanner.py` (8), `test_google_genai_dependencies.py` (11,
+    including the rename and the already-declared-google-genai raise-to-floor case),
+    `test_google_genai_guide.py` (8), `test_google_genai_checks.py` (15, three per check plus
+    one extra), `test_google_genai_already_migrated.py` (4). `tests/test_migrations.py`'s
+    registry test updated for the second migration. Full suite (no `--docker`/`--llm`): 2052
+    passed. `ruff check .` and `ruff format --check .`: clean.
+  - **Not built in this session** (narrower than the plan's section 7, by necessity of scope —
+    see docs/notes.md "Known limitations (google-genai migration)" for the specifics): no
+    string-reference (`mock.patch("...")`) scanner findings; the `key`/`settings`/`safety`/
+    `patches` checks are heuristics, not openai_v1-grade dataflow; no safety-settings scanner
+    row (handled only through the generic `GenerativeModel` finding plus the `safety` rewrite
+    check); no dedicated PaLM-era/semantic-retrieval scanner rows beyond the `MODULE_CALLS`
+    entries already covering `generate_text`/`chat`/`generate_embeddings`; no Docker sandbox
+    test of the smoke check or a fixture-repo fix; no live `-m llm` run; no benchmark-repo runs
+    (`agentic-tictactoe`, `ailabel`, `kaizen-agent`) — these were explicitly out of scope for
+    this session.
