@@ -76,12 +76,45 @@ def _source(node: ast.AST, text: str) -> str:
     return " ".join((ast.get_source_segment(text, node) or ast.unparse(node)).split())
 
 
+def _carries(
+    value: ast.expr, expr: str, assigned: dict[str, list[ast.expr]], seen: set[str]
+) -> bool:
+    """True when `value` is, or has among its operands (`or`, a conditional, a call's
+    arguments...), the key expression `expr` (an `ast.dump`), or a local name assigned from
+    something that does."""
+    for node in ast.walk(value):
+        if isinstance(node, ast.expr) and ast.dump(node) == expr:
+            return True
+        if isinstance(node, ast.Name) and node.id not in seen:
+            seen.add(node.id)
+            if any(_carries(v, expr, assigned, seen) for v in assigned.get(node.id, [])):
+                return True
+    return False
+
+
+def _assignments(tree: ast.Module) -> dict[str, list[ast.expr]]:
+    out: dict[str, list[ast.expr]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = [t for t in node.targets if isinstance(t, ast.Name)]
+        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and isinstance(node.target, ast.Name):
+            targets = [node.target]
+        else:
+            continue
+        value = getattr(node, "value", None)
+        if value is not None:
+            for t in targets:
+                out.setdefault(t.id, []).append(value)
+    return out
+
+
 def _key_errors(original: str, candidate: str) -> list[str]:
     old = _parse(original)
     new = _parse(candidate)
     if old is None or new is None:
         return []
     errors = []
+    assigned = _assignments(new)
     for call in _calls(old, "configure"):
         key = _kwarg(call, "api_key")
         if key is None:
@@ -89,7 +122,9 @@ def _key_errors(original: str, candidate: str) -> list[str]:
         expr = ast.dump(key)
         clients = _calls(new, "Client")
         if any(
-            c for c in clients if (v := _kwarg(c, "api_key")) is not None and ast.dump(v) == expr
+            _carries(v, expr, assigned, set())
+            for c in clients
+            if (v := _kwarg(c, "api_key")) is not None
         ):
             continue
         text = _source(key, original)

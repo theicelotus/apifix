@@ -1088,18 +1088,32 @@ def unrelated_edits(
     return errors
 
 
+_ATTRIBUTE_BUILTINS = ("getattr", "hasattr", "setattr", "delattr")
+
+
 def _string_constants(tree: ast.Module) -> list[ast.Constant]:
     return [n for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
 
 
 def _key_constants(tree: ast.Module) -> set[int]:
-    """ids of the string constants used as dict keys or subscript keys."""
+    """ids of the string constants used as dict keys, subscript keys, or attribute names
+    (`getattr(x, "name")`, `hasattr(x, "name")`, `d.get("name")`): each is a name that the
+    old API's response carried as a key or attribute."""
     out = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Dict):
             out.update(id(k) for k in node.keys if isinstance(k, ast.Constant))
         elif isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant):
             out.add(id(node.slice))
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name) and func.id in _ATTRIBUTE_BUILTINS:
+                named = node.args[1:2]
+            elif isinstance(func, ast.Attribute) and func.attr == "get":
+                named = node.args[:1]
+            else:
+                continue
+            out.update(id(a) for a in named if isinstance(a, ast.Constant))
     return out
 
 
@@ -1117,7 +1131,8 @@ def _attribute_names(tree: ast.Module) -> set[str]:
 
 def _missing_strings(diff: _Diff, skipped: Sequence[Hunk]) -> list[str]:
     """Non-exempt string constants of the original that the candidate lacks (multiset). Exempt
-    besides those on finding lines: keys that became attribute or keyword names, and strings a
+    besides those on finding lines: keys and `getattr`/`hasattr` names that became attribute or
+    keyword names (`getattr(c, "finish_reason", None)` -> `c.finish_reason`), and strings a
     kept rename hunk renamed (`kwargs["engine"]` -> `kwargs["model"]`). Strings in the
     `skipped` hunks (rejected or text-only) are reported by those hunks' own errors."""
     have = Counter(n.value for n in _string_constants(diff.new.tree))
