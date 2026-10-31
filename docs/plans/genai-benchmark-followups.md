@@ -101,3 +101,10 @@ when one must change, say so in a comment and update the callers and tests that 
   it is declared. Chose rejecting over adding a pin (see the plan above). Guide: errors and
   tests parts. Fixtures `tests/fixtures/google_genai_repos/{ailabel_like,agentic_like}`; tests
   in `tests/test_google_genai_followups.py`.
+- **6** `contracts.py` (`contract_tests`, `ContractPatch`); `whole_file.py` (`send_order`, the
+  `contract` section of `file_prompt`); `agent.py` (`_add_contract_tests`, `_own_findings`,
+  `wf_contract`, `contract_patches` on the file's trajectory entry and `contract_tests` at the
+  top of the trajectory). Guide: "keep the repo's own function signatures and return shapes"
+  in the always-sent client part. Tests: `tests/test_contracts.py` (patch forms, where-used and
+  relative imports, src layout, prompt section, end to end with the fake LLM).
+- Known gaps: see `docs/notes.md` (google-genai migration; whole-file mode).

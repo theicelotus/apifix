@@ -11,7 +11,7 @@ from __future__ import annotations
 import ast
 import difflib
 import re
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -27,6 +27,7 @@ from apifix.engine.code_checks import (
     mock_target_problems,
     undefined_names,
 )
+from apifix.engine.contracts import ContractPatch
 from apifix.engine.dependencies import dependency_file_problem, is_dependency_file
 from apifix.engine.migrations import Migration
 from apifix.engine.models import CERTAIN, ClientKey, Finding
@@ -90,6 +91,11 @@ def _group(path: str, repo: Path) -> int:
     return 2 if is_test_file(path, root=repo) else 1
 
 
+def send_order(paths: Iterable[str], repo: Path) -> list[str]:
+    """`paths` in send order: dependency files, other Python files, test files."""
+    return sorted(paths, key=lambda p: (_group(p, repo), p))
+
+
 def select_files(
     repo: Path, findings: list[Finding], max_bytes: int, *, regions: bool = False
 ) -> FileSelection:
@@ -113,8 +119,7 @@ def select_files(
             skipped.append({"path": path, "bytes": len(data), "reason": reason})
         else:
             files.append(path)
-    files.sort(key=lambda p: (_group(p, repo), p))
-    return FileSelection(files, skipped)
+    return FileSelection(send_order(files, repo), skipped)
 
 
 def must_change(path: str, findings: list[Finding]) -> bool:
@@ -219,24 +224,31 @@ def file_prompt(
     feedback: str = "",
     previous: str = "",
     guide: str = "",
+    contract: Sequence[ContractPatch] = (),
 ) -> str:
     """One file's request. `text` is the original file. `feedback` (the attempt's verifier
     feedback, the same text for every file of a kind) comes first, so that consecutive
     requests share a prefix a server can cache; `previous` (previous_version_note) follows
-    the file. `guide`: guide parts this file needs that the system prompt does not have."""
+    the file. `guide`: guide parts this file needs that the system prompt does not have.
+    `contract`: for a test file with no findings of its own, the patches of rewritten code that
+    got it sent (contracts.contract_tests)."""
     fence = fence_for(text, *(t for _, t in context))
     lines = [feedback, ""] if feedback else []
     if guide:
         lines += ["Migration guide for this file:", "", guide.rstrip(), ""]
     lines += [f"Migrate this file: {path}", f"Breaking change: {summary}", ""]
-    lines.append("Scanner findings in this file (line: category [confidence]):")
-    for f in findings:
-        if f.file == path:
-            lines += [
-                f"- {f.line}: {f.category} [{f.confidence}]",
-                f"    old: {f.old_pattern}",
-                f"    fix: {f.suggestion}",
-            ]
+    own = [f for f in findings if f.file == path]
+    if own or not contract:
+        lines.append("Scanner findings in this file (line: category [confidence]):")
+    for f in own:
+        lines += [
+            f"- {f.line}: {f.category} [{f.confidence}]",
+            f"    old: {f.old_pattern}",
+            f"    fix: {f.suggestion}",
+        ]
+    if contract:
+        lines += CONTRACT_INTRO
+        lines += [f"- {c.describe()}" for c in contract]
     lines += ["", f"Original contents of {path}:", f"{fence}{_language(path)}", text.rstrip("\n")]
     lines += [fence, ""]
     if previous:
@@ -258,6 +270,14 @@ def file_prompt(
         instruction += " If the file needs no change, return it unchanged."
     lines.append(instruction)
     return "\n".join(lines)
+
+
+CONTRACT_INTRO = [
+    "This test has no scanner findings, but it patches code in a file this migration rewrites "
+    "(the rewritten file may be shown below). If the rewrite changed what that code accepts or "
+    "returns, update this test's mock setup, return values and patch targets to match it. Keep "
+    "every assertion and test as it is, and change nothing else:",
+]
 
 
 def _findings_lines(findings: Sequence[Finding]) -> list[str]:

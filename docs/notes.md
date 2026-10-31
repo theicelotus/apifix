@@ -773,7 +773,14 @@ both the baseline and the fixed run crashed at collection. aipl's CI runs `pytes
 
 - Recommended for small local models (7B-14B) that cannot drive the tool loop; agent mode stays
   the default and the better choice for capable models.
-- Only files with scanner findings are sent, one per request, each in a fresh conversation.
+- Only files with scanner findings are sent, one per request, each in a fresh conversation,
+  plus test files that patch a function or class a sent file defines (`contracts.py`: by the
+  patch target's module, or a repo module that imports the name from it). Those get a section
+  naming each patch, `required=False`, and no unrelated-edit check (their changes follow a
+  changed return shape and are not near any finding); the verifier's tampering checks still
+  apply. A contract test too large for the size limit that cannot be sent as regions is
+  skipped, and one sent as regions gets no contract section. Names a rewritten file re-exports
+  by assignment (`get = _get`), `patch.multiple` and a target built at run time are not found.
   Edits the migration needs elsewhere (a helper module, a conftest) cannot be made. Dependency
   files apifix set completely (pin edits) are not sent; the system prompt says which pins it
   set, and the job guide leaves out the Dependencies part when no dependency file is sent (a
@@ -1398,11 +1405,25 @@ Open questions for later:
   model name bound in one function is treated as a model everywhere else in the file too. This
   can over-associate in a file that reuses a plain name (`model`, `chat`) for two unrelated
   things; real code rarely does.
-- No string-reference resolution yet (openai_v1's `visit_Constant`/`_local_module`): a
-  `mock.patch("pkg.mod.genai.GenerativeModel")` string is not turned into a scanner finding by
-  itself, only caught later by the `patches` rewrite check once the file has another finding
-  that brings it into the job. A test file whose only old-SDK trace is such a string (no import,
-  no direct call) scans clean.
+- String patch targets are findings in test files only (`python_checks._patch_target`): the
+  first string of `patch(...)` / `monkeypatch.setattr(...)`, and `patch.object(module, "name")`
+  when the module is the old SDK's alias or an expression ending in `.genai`. A target is
+  matched through `genai.<removed name>` (`MODULE_CALLS`) or `google.generativeai.*`; one that
+  reaches the SDK through a variable, a helper or a `mock.patch.multiple` is not seen. They are
+  `likely`, as openai-v1's string references are.
+- `google.api_core` (`python_checks`, `repo_findings._api_core`): every import of it and every
+  use of an exception under `google.api_core.exceptions` is a finding in any file, tests
+  included. Whether that is right depends on the repo, so the repo-level pass decides: none
+  unless the repo has a Gemini signal (another finding, or google-generativeai / google-genai
+  declared); `certain` when google-api-core, or a distribution known to depend on it
+  (`google-cloud-*`, `google-api-python-client`), is not declared, so a rewrite that keeps the
+  import is rejected by the completeness check (apifix does not add the pin: that is the repo's
+  decision); `likely` exception findings only when it is declared. "Declared" means a literal
+  entry in a dependency file; a distribution that brings api-core in without being on that list
+  (firebase-admin, say) is treated as not declaring it, which can reject a rewrite that was
+  right to keep the import. The new error classes' constructor in the suggestion
+  (`errors.ClientError(code, response_json)`) is written from the SDK as of 1.x, not checked
+  against an installed wheel.
 - The `key`/`settings`/`safety` rewrite checks (`config_checks.py`) are presence/substring
   heuristics, not full dataflow like openai_v1's `ConfigChecker`: `settings` checks that each
   dropped `GenerativeModel`/`GenerationConfig` keyword name appears *somewhere* in the candidate

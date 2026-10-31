@@ -39,6 +39,7 @@ from apifix.engine.code_checks import (
     patches_client_class,
 )
 from apifix.engine.context import changed_statements, library_uses, reachable_modules
+from apifix.engine.contracts import ContractPatch, contract_tests
 from apifix.engine.dependencies import is_dependency_file
 from apifix.engine.diffing import diff_trees, read_text, unified_diff
 from apifix.engine.gitops import repo_state
@@ -139,6 +140,7 @@ from apifix.engine.whole_file import (
     reply_budget,
     select_context,
     select_files,
+    send_order,
     verification_feedback,
 )
 from apifix.engine.whole_file import system_prompt as whole_file_system_prompt
@@ -449,6 +451,9 @@ class _Job:
         # its previous version (None: no usable reply) with the check error that rejected it
         # ("" when the verification feedback says why)
         self.wf_files: list[str] = []
+        # test files sent only because they patch code a sent file defines (no findings of their
+        # own), with those patches (contracts.contract_tests)
+        self.wf_contract: dict[str, list[ContractPatch]] = {}
         self.wf_skipped: list[dict[str, object]] = []
         self.wf_pending: list[str] = []
         self.wf_verification: tuple[int, Verification] | None = None  # the last rejection
@@ -1156,6 +1161,7 @@ class _Job:
                 feedback=feedback,
                 previous=previous,
                 guide=guide,
+                contract=self.wf_contract.get(path, ()),
             )
             parts = {
                 "rules": len(system) - len(system_guide),
@@ -1201,6 +1207,8 @@ class _Job:
         }
         if sections is not None:
             entry["guide_sections"] = sections
+        if path in self.wf_contract:
+            entry["contract_patches"] = [c.describe() for c in self.wf_contract[path]]
         if repeated and previous:
             entry["repeated_errors"] = repeated
         attempt.files.append(entry)
@@ -1346,7 +1354,7 @@ class _Job:
             module_roots=module_roots(path, self.baseline.import_paths if self.baseline else ()),
             python_modules=self.wf_python_modules,
             test_files=self.wf_test_files,
-            findings=[f for f in self.findings if f.file == path],
+            findings=self._own_findings(path),
             rewrite_checks=self.rewrite_checks,
             unmigrated_modules={f.file for f in self.open_findings} - self.wf_accepted - {path},
             client_classes=self.migration.client_classes,
@@ -1358,6 +1366,13 @@ class _Job:
             remaining=self._rescan if complete else None,
             old_api=getattr(self.migration, "source_name", "old"),
         )
+
+    def _own_findings(self, path: str) -> list[Finding] | None:
+        """The file's findings, for the unrelated-edit check. None for a test sent only because
+        it patches rewritten code: its changes (mock setup that follows a changed return shape)
+        are not near any finding, so that check would revert all of them."""
+        own = [f for f in self.findings if f.file == path]
+        return own if own or path not in self.wf_contract else None
 
     def _rescan(self, path: str, text: str) -> list[Finding]:
         """The scanner's findings for `path` holding `text`, as the verifier's scan of the
@@ -1452,6 +1467,20 @@ class _Job:
             for p in context_candidates(path, self.wf_files, self.repo)
             if self._read(self.work, p) != self._read(self.repo, p)
         ]
+
+    def _add_contract_tests(self) -> None:
+        """Add the test files that patch a function or class a file being sent defines (they
+        have no findings, so the scanner never selected them): the rewrite may change what that
+        code returns, and the test's mocks must follow. They go last, after the rewritten files."""
+        found = contract_tests(self.repo, self.wf_files, skip=self.wf_files)
+        for path in list(found):
+            try:
+                self._read(self.repo, path).encode("utf-8")
+            except (OSError, UnicodeError):
+                del found[path]
+        if found:
+            self.wf_contract = found
+            self.wf_files = send_order([*self.wf_files, *found], self.repo)
 
     # --- region edits -----------------------------------------------------------------------
 
@@ -2151,6 +2180,7 @@ class _Job:
                 regions=self.config.file_edits != "whole",
             )
             self.wf_files, self.wf_skipped = selection.files, selection.skipped
+            self._add_contract_tests()
             self._plan_regions()
             self.wf_pending = list(self.wf_files)
             deps = sorted(p for p in (*self.wf_pinned, *self.wf_files) if is_dependency_file(p))
@@ -2400,6 +2430,7 @@ class _Job:
                 "finished_at": datetime.now(UTC).isoformat(),
             },
             "findings": [asdict(f) for f in self.findings],
+            "contract_tests": {p: [asdict(c) for c in cs] for p, cs in self.wf_contract.items()},
             "baseline": run_summary(self.baseline) if self.baseline else None,
             "baseline_duration_s": round(self.baseline_seconds, 3),
             "system_prompt": self.system,

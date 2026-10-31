@@ -18,6 +18,13 @@ it is used, not at import time: the old `configure()` could be called with no ke
 was only needed later, at the first call); `genai.Client()` raises immediately if no key is
 available, so building one at import time breaks code that used to defer this.
 
+Keep the repo's own function signatures and return shapes where you can: if a function used to
+return a `GenerativeModel` (or a response, or a dict), its callers and the tests that patch it
+depend on that. Where the new SDK has no equivalent object, return the least different thing
+(for example a small wrapper holding the client and the model name, with the methods the callers
+use) rather than changing what callers receive; when a signature or return shape must change,
+update every caller you were given and say so in the summary.
+
 Never drop a key value. If the old code called `configure()` with an explicit key
 (`configure(api_key=my_key)`), pass that same expression to `Client(api_key=my_key)`. If the old
 code called `configure()` with no key at all, relying on the environment, `genai.Client()` reads

@@ -69,3 +69,10 @@ def test_full_guide_has_every_section_heading():
     for heading in ("Client", "Models and calls", "Chat", "Embeddings", "Errors", "Tests"):
         assert f"## {heading}" in MIGRATION.guide
     assert "google-genai" in MIGRATION.guide
+
+
+def test_guide_tells_the_model_to_keep_the_repos_signatures_and_return_shapes():
+    assert "Keep the repo's own function signatures and return shapes" in guide_parts.parts_text(
+        ["client"]
+    )
+    assert "return shapes" in get_migration("google-genai").guide
