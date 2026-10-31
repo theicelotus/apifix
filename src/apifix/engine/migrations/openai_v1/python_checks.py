@@ -39,6 +39,7 @@ def check_python(
     aliases = _collect_aliases(tree)
     visitor = _Visitor(file, source, aliases, _targets_azure(tree, aliases), repo_modules, tree)
     visitor.visit(tree)
+    visitor.findings = _without_read_config(tree, visitor.findings)
     if visitor.findings:  # 0.x code: a lone APIError in a catch is 0.x's too
         for node, suggestion in visitor.catch_apierror:
             visitor._report(node, "error_class", suggestion, LIKELY)
@@ -47,6 +48,23 @@ def check_python(
             message = rules.STREAM_CONTENT_CHECK.format(check=c.check, delta=c.delta)
             visitor._report(c.node, "response_access", message, LIKELY)
     return visitor.findings
+
+
+def _without_read_config(tree: ast.Module, findings: list[Finding]) -> list[Finding]:
+    """A kept `openai.api_key = ...` is no finding in a file whose calls are the module-level
+    client's (`openai.chat.completions.create`), which reads it, and that has nothing else to
+    migrate and builds no client of its own (an `OpenAI()` ignores the setting)."""
+    keeps = [
+        f
+        for f in findings
+        if f.category == "client_config" and f.suggestion.startswith(rules.CONFIG_KEEP_PREFIX)
+    ]
+    if not keeps or len(keeps) != len(findings):
+        return findings
+    names = [name for _, name in v1_api_uses(tree)]
+    own_client = any(n.rsplit(".", 1)[-1] in rules.CLIENT_CLASSES for n in names)
+    module_client = any(n.split(".")[1] in rules.V1_MODULE_RESOURCES for n in names)
+    return findings if own_client or not module_client else []
 
 
 def stream_check_errors(path: str, original: str, candidate: str) -> list[str]:

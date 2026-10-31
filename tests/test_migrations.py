@@ -366,3 +366,9 @@ def test_guide_says_to_delete_replaced_code_not_comment_it_out():
     client = get_migration("openai-v1").guide.split("## Client")[1].split("##")[0]
     assert "Delete code you replace" in client and "never leave" in client
     assert "as a comment" in client
+
+
+def test_guide_says_to_change_only_what_the_migration_needs():
+    client = get_migration("openai-v1").guide.split("## Client")[1].split("##")[0]
+    assert "Change only what the migration needs" in client
+    assert "bare `except:` stays `except:`" in client and "formatting" in client

@@ -192,7 +192,7 @@ def test_whole_file_returned_to_a_region_request_is_accepted(big):
 
 
 def test_later_attempt_resends_every_region_with_its_previous_version(big):
-    broken = APP_NEW + "# BREAK\n"
+    broken = APP_NEW + "BREAK = 1  # BREAK\n"
     llm = FakeLLM([block(broken), GOOD_REGIONS, block(APP_NEW), GOOD_REGIONS])
     result = wf(big, llm)
     assert result.outcome == "verified"
@@ -376,7 +376,7 @@ def test_a_known_limit_trims_later_requests(repo):
 
 
 def test_non_test_files_get_no_tests_guide_part_once_a_limit_is_known(repo):
-    broken = APP_NEW + "# BREAK\n"
+    broken = APP_NEW + "BREAK = 1  # BREAK\n"
     app_budget = 2 * -(-len(APP_OLD) // 3) + 2048
     script = [lowered(9_000, app_budget), block(broken), block(TESTS_NEW), block(APP_NEW)]
     llm = FakeLLM([*script, block(TESTS_NEW)])
@@ -568,7 +568,7 @@ def test_a_cut_off_whole_file_is_sent_again_with_more_reply_tokens(repo):
         {"response": 0, "max_tokens": budget(APP_OLD), "then": "more_reply_tokens"}
     ]
     # later attempts of the file keep the most reply tokens (the file needed them)
-    llm = FakeLLM([cut(), block(APP_NEW + "# BREAK\n"), block(TESTS_NEW)] + list(GOOD))
+    llm = FakeLLM([cut(), block(APP_NEW + "BREAK = 1  # BREAK\n"), block(TESTS_NEW)] + list(GOOD))
     result = wf(repo, llm, JudgingSandbox())
     assert result.outcome == "verified" and llm.max_tokens_seen[3] == 16_000
 

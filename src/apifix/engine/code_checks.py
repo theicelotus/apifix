@@ -22,7 +22,10 @@ from __future__ import annotations
 
 import ast
 import difflib
+import io
 import re
+import tokenize
+from collections import Counter
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import PurePosixPath
@@ -1799,11 +1802,8 @@ def _without_comment(line: str) -> str:
     return line.strip()
 
 
-def commented_out_code(original: str, candidate: str) -> list[str]:
-    """Changed lines that are only an old line commented out, with or without an explanation
-    after it (`# x = f()` or `# x = f()  # Removed: ...`), one error each. The line an edit
-    replaced must be deleted: a commented-out copy of the old code stays in the file for good
-    and tells a reviewer nothing the diff does not."""
+def _commented_out(original: str, candidate: str) -> list[tuple[int, str]]:
+    """(0-based line, error) of each changed line that is an old line commented out."""
     old, new = original.splitlines(), candidate.splitlines()
     regions = opcodes(original, candidate)
     removed = {
@@ -1822,8 +1822,59 @@ def commented_out_code(original: str, candidate: str) -> list[str]:
                 rest = text[len(line) :]
                 if text.startswith(line) and (not rest.strip() or rest.lstrip().startswith("#")):
                     problems.append(
-                        f"line {n + 1}: `{line}` is commented out instead of deleted; delete "
-                        "the line and leave no comment in its place"
+                        (
+                            n,
+                            f"line {n + 1}: `{line}` is commented out instead of deleted; delete "
+                            "the line and leave no comment in its place",
+                        )
                     )
                     break
     return problems
+
+
+def commented_out_code(original: str, candidate: str) -> list[str]:
+    """Changed lines that are only an old line commented out, with or without an explanation
+    after it (`# x = f()` or `# x = f()  # Removed: ...`), one error each. The line an edit
+    replaced must be deleted: a commented-out copy of the old code stays in the file for good
+    and tells a reviewer nothing the diff does not."""
+    return [message for _, message in _commented_out(original, candidate)]
+
+
+def _comment_lines(text: str) -> list[int]:
+    """0-based lines that hold only a comment (a `#` inside a string does not count)."""
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
+    except (tokenize.TokenError, SyntaxError, IndentationError):
+        return []
+    return [
+        t.start[0] - 1 for t in tokens if t.type == tokenize.COMMENT and t.line.strip() == t.string
+    ]
+
+
+def drop_added_comments(original: str, candidate: str) -> str:
+    """The candidate without the comment-only lines the original does not have (compared by
+    text, as a multiset, so moved and re-indented comments stay). The migration needs no new
+    comments, and next to a finding they are as unwanted as anywhere. A comment that is an old
+    line commented out stays, for commented_out_code to report. Unchanged when the result would
+    not parse."""
+    try:
+        have = Counter(original.splitlines()[n].strip() for n in _comment_lines(original))
+    except IndexError:
+        return candidate
+    lines = candidate.splitlines(keepends=True)
+    keep = {n for n, _ in _commented_out(original, candidate)}
+    drop = set()
+    for n in _comment_lines(candidate):
+        text = lines[n].strip()
+        if have[text] > 0:
+            have[text] -= 1
+        elif n not in keep:
+            drop.add(n)
+    if not drop:
+        return candidate
+    text = "".join(line for n, line in enumerate(lines) if n not in drop)
+    try:
+        ast.parse(text)
+    except SyntaxError:
+        return candidate
+    return text

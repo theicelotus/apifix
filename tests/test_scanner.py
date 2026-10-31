@@ -1257,3 +1257,31 @@ def test_scan_text_agrees_with_a_scan_of_the_repo(repo):
 def test_scan_text_of_a_file_that_does_not_parse_has_no_findings():
     source = "import openai\nopenai.Completion.create(\n"
     assert scan_text("app.py", source, get_migration("openai-v1")) == []
+
+
+# --- a kept key read by the module-level client is no finding ---------------------------------
+
+
+def _config_findings(tmp_path, source):
+    (tmp_path / "app.py").write_text(source)
+    return [f for f in scan(tmp_path, "openai-v1").findings if f.category == "client_config"]
+
+
+KEPT = "import os\nimport openai\n\nopenai.api_key = os.environ['K']\n"
+
+
+def test_a_kept_key_is_a_finding_while_the_calls_are_0x(tmp_path):
+    source = KEPT + "r = openai.ChatCompletion.create(model='m', messages=[])\n"
+    assert len(_config_findings(tmp_path, source)) == 1
+
+
+def test_a_kept_key_is_resolved_when_the_calls_use_the_module_level_client(tmp_path):
+    source = KEPT + "r = openai.chat.completions.create(model='m', messages=[])\n"
+    assert _config_findings(tmp_path, source) == []
+
+
+def test_a_kept_key_still_matters_beside_a_client_of_the_files_own(tmp_path):
+    source = (
+        KEPT + "c = openai.OpenAI()\nr = openai.chat.completions.create(model='m', messages=[])\n"
+    )
+    assert len(_config_findings(tmp_path, source)) == 1

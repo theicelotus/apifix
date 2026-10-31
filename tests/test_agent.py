@@ -1490,7 +1490,8 @@ def test_unchanged_likely_only_file_is_accepted(repo):
 
 def test_failed_verification_resends_python_files_with_the_failure_output(repo):
     llm = FakeLLM(
-        [block(APP_NEW + "# BREAK\n"), block(TESTS_NEW)] + [block(APP_NEW), block(TESTS_NEW)]
+        [block(APP_NEW + "BREAK = 1  # BREAK\n"), block(TESTS_NEW)]
+        + [block(APP_NEW), block(TESTS_NEW)]
     )
     sandbox = JudgingSandbox()
     result = wf(repo, llm, sandbox)
@@ -1512,7 +1513,7 @@ def test_failed_verification_resends_python_files_with_the_failure_output(repo):
     # the original again, plus the previous version as a diff
     assert f"Original contents of app.py:\n```python\n{APP_OLD}```" in app_text
     assert "Your previous version of app.py did not pass verification (see above)." in app_text
-    assert "\n+# BREAK\n" in app_text
+    assert "\n+BREAK = 1  # BREAK\n" in app_text
     assert (
         "- Attempt 2 (verified): `app.py` ok, `tests/test_app.py` ok; kept: `requirements.txt`"
         in (result.report_markdown)
@@ -1521,7 +1522,7 @@ def test_failed_verification_resends_python_files_with_the_failure_output(repo):
 
 
 def test_rejections_stop_at_the_attempt_limit(repo):
-    bad = [block(APP_NEW + "# BREAK\n"), block(TESTS_NEW)]
+    bad = [block(APP_NEW + "BREAK = 1  # BREAK\n"), block(TESTS_NEW)]
     llm = FakeLLM(bad * 2)
     result = wf(repo, llm, max_retries=1)
     assert result.outcome == "rejected" and len(result.trajectory["attempts"]) == 2
@@ -2106,7 +2107,7 @@ def test_whole_file_reply_budget_follows_the_file(repo):
 
 
 def test_whole_file_reply_budget_counts_the_previous_version(repo):
-    grown = APP_NEW + "\n".join(f"# note {i}" for i in range(400)) + "\n"
+    grown = APP_NEW + "\n".join(f"note_{i} = {i}  # note" for i in range(400)) + "\n"
     llm = FakeLLM(
         [block(grown), GOOD[1], block(APP_NEW), GOOD[1]],
     )
@@ -2917,12 +2918,12 @@ def test_a_failure_that_names_only_the_test_resends_the_test_then_the_code(repo)
     wrong = "AssertionError: assert 'x\\n' == 'x'"
 
     def judge_tree(tree: Path) -> SandboxResult:
-        if "# WRONG" in (tree / "app.py").read_text():
+        if "WRONG = 1" in (tree / "app.py").read_text():
             return run((T_ASK, "passed"), (T_STRIP, "failed", wrong))
         return judge(tree)
 
     llm = FakeLLM(
-        [block(APP_NEW + "# WRONG\n"), block(TESTS_NEW)]
+        [block(APP_NEW + "WRONG = 1\n"), block(TESTS_NEW)]
         + [block(TESTS_NEW)]
         + [block(APP_NEW), block(TESTS_NEW)]
     )

@@ -23,6 +23,7 @@ from apifix.engine.code_checks import (
     add_missing_imports,
     added_call_assertions,
     commented_out_code,
+    drop_added_comments,
     mock_target_problems,
     undefined_names,
 )
@@ -690,6 +691,7 @@ def check_candidate(
             syntax = f"SyntaxError: {exc.msg}{where}{text}"
     record("syntax", syntax, path.endswith(".py"))
     unrelated = findings is not None and path.endswith(".py") and not syntax
+    replied = candidate
     reverted: list[Revert] = []
     reverts: list[dict[str, object]] = []
     revert_errors: list[str] = []
@@ -699,6 +701,8 @@ def check_candidate(
             original, candidate, findings or (), library_modules, env_names, renames
         )
         candidate, reverted, revert_errors = result.text, result.reverted, result.errors
+        replied = candidate  # a placeholder comment ("# ... rest unchanged") is judged as sent
+        candidate = drop_added_comments(original, candidate)
     added: list[str] = []
     if path.endswith(".py") and not syntax:
         before = candidate
@@ -719,7 +723,7 @@ def check_candidate(
         required,
     )
 
-    abbreviated = placeholder_problem(candidate, original) or too_short(candidate, original)
+    abbreviated = placeholder_problem(replied, original) or too_short(replied, original)
     if abbreviated:
         abbreviated += "; return every line of the file"
     record("abbreviation", abbreviated)

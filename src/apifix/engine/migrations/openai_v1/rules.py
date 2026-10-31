@@ -570,19 +570,28 @@ def _argument(code: str, name: str) -> str | None:
     return code[start.start() : end].strip() or None
 
 
-def _config_change(old_pattern: str, new_code: str) -> str | None:
-    """What the diff did with a module-level setting: moved it to a client argument, renamed
-    it, or dropped it (1.x reads the environment variable itself). Only what is in the diff."""
+def _config_change(old_pattern: str, new_code: str, file_code: str) -> str | None:
+    """What the diff did with a module-level setting: kept it (renamed), moved it to a client
+    argument, or dropped it (1.x reads the environment variable itself). Only what is in the
+    diff: a kept assignment is looked for in the lines that replaced this one (the file's other
+    assignments are other findings'), a client argument elsewhere in the file only when it is
+    the one such argument."""
     old = _ASSIGNMENT.match(old_pattern)
     if not old or old[1] not in _CONFIG_NAMES:
         return None
     attr, new_name = old[1], _CONFIG_NAMES[old[1]]
-    new_code = "\n".join(x for x in new_code.splitlines() if not x.lstrip().startswith("#"))
+
+    def code(text: str) -> str:
+        return "\n".join(x for x in text.splitlines() if not x.lstrip().startswith("#"))
+
+    here, anywhere = code(new_code), code(file_code)
     before = _inline(old_pattern)
-    kept = re.search(rf"^[^#\n]*\.{new_name}\s*=(?!=).*$", new_code, re.MULTILINE)
+    kept = re.search(rf"^[^#\n]*\.{new_name}\s*=(?!=).*$", here, re.MULTILINE)
     if kept:
         return f"{before} → {_inline(kept[0].strip())}"
-    argument = _argument(new_code, new_name)
+    argument = _argument(here, new_name)
+    if not argument and len(re.findall(rf"\b{new_name}\s*=(?!=)", anywhere)) == 1:
+        argument = _argument(anywhere, new_name)
     if argument:
         return f"{before} → client argument {_inline(argument)}"
     env = ENV_READ_BY_V1.get(new_name)
@@ -601,9 +610,15 @@ def pr_change(category: str, old_pattern: str, new_code: str, file_code: str) ->
             is_async = method not in SYNC_METHODS and method[1:] in SYNC_METHODS
             sync = method[1:] if is_async else method
             new = f"{RESOURCES[resource]}.{METHOD_RENAMES.get((resource, sync), sync)}"
-            if new not in new_code:
+            written = re.search(rf"([A-Za-z_][\w.]*)\.{re.escape(new)}\b", new_code)
+            if not written:
                 return None
-            return f"`openai.{resource}.{method}` → `{'await ' if is_async else ''}client.{new}`"
+            receiver = written[1]
+            if written.start() and new_code[written.start() - 1] in "\"'":
+                receiver = receiver.rsplit(".", 1)[-1]  # a mock target string: "pkg.client.chat..."
+            return (
+                f"`openai.{resource}.{method}` → `{'await ' if is_async else ''}{receiver}.{new}`"
+            )
         kwarg = _KWARG_PATTERN.match(old_pattern)
         if kwarg and kwarg[1] in KWARG_RENAMES and f"{KWARG_RENAMES[kwarg[1]]}=" in new_code:
             return f"`{kwarg[1]}=` → `{KWARG_RENAMES[kwarg[1]]}=`"
@@ -611,7 +626,7 @@ def pr_change(category: str, old_pattern: str, new_code: str, file_code: str) ->
         if old_pattern not in new_code:
             return f"dict responses ({_inline(old_pattern)}) → attributes"
     elif category == "client_config":
-        return _config_change(old_pattern, file_code)
+        return _config_change(old_pattern, new_code, file_code)
     elif category == "error_class" or (category == "import" and old_pattern in ERROR_CLASSES):
         name = old_pattern.rsplit(".", 1)[-1]
         new = ERROR_CLASSES.get(name, (None,))[0]

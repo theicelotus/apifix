@@ -909,3 +909,21 @@ def test_comments_the_original_already_had_are_not_commented_out_code():
         check_candidate("notes.txt", "a = 1\n", "# a = 1\n", required=True).checks["commented_out"]
         == "n/a"
     )
+
+
+def test_comments_the_model_added_are_dropped_even_next_to_a_finding():
+    original = "import openai\n\n\ndef f(x):\n    return openai.Embedding.create(input=x)\n"
+    candidate = (
+        "import openai\n\n\ndef f(x):\n    # Use the module-level client\n"
+        "    return openai.embeddings.create(input=x)\n"
+    )
+    r = check_candidate(
+        "app.py",
+        original,
+        candidate,
+        required=True,
+        library_modules=MIGRATION.api_modules,
+        findings=scan_text("app.py", original, MIGRATION),
+    )
+    assert "Use the module-level client" not in r.text
+    assert "openai.embeddings.create" in r.text and r.ok

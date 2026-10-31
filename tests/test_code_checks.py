@@ -14,6 +14,8 @@ import pytest
 from apifix.engine.code_checks import (
     STDLIB_IMPORTS,
     add_missing_imports,
+    commented_out_code,
+    drop_added_comments,
     import_table,
     mock_target_problems,
     mock_targets,
@@ -1738,3 +1740,34 @@ def test_autospec_on_the_client_fails_and_the_suggested_fixes_pass(tmp_path):
     assert autospec_problems(AUTOSPEC_METHOD) == []
     result = _autospec_pytest(tmp_path / "method", AUTOSPEC_METHOD)
     assert result.returncode == 0, result.stdout
+
+
+# --- added comments -------------------------------------------------------------------------
+
+
+def test_comment_lines_the_original_lacks_are_dropped():
+    original = "import openai\n# keep me\nr = openai.Embedding.create(x)\n"
+    candidate = (
+        "import openai\n# keep me\n# Use the module-level client\n"
+        "    # indented note\nr = openai.embeddings.create(x)  # trailing stays\n"
+    )
+    assert drop_added_comments(original, candidate) == (
+        "import openai\n# keep me\nr = openai.embeddings.create(x)  # trailing stays\n"
+    )
+
+
+def test_original_comments_and_hashes_in_strings_are_not_touched():
+    original = "def f():\n    # why\n    return 1\n"
+    moved = "def f():\n    x = '# not a comment'\n    # why\n    return x\n"
+    assert drop_added_comments(original, moved) == moved
+    twice = "def f():\n    # why\n    # why\n    return 1\n"
+    assert drop_added_comments(original, twice) == original
+
+
+def test_an_old_line_commented_out_stays_for_its_own_check():
+    original = "import openai\nopenai.api_key = 'k'\nx = 1\n"
+    candidate = "import openai\n# openai.api_key = 'k'\n# a new note\nx = 1\n"
+    assert (
+        drop_added_comments(original, candidate) == "import openai\n# openai.api_key = 'k'\nx = 1\n"
+    )
+    assert commented_out_code(original, drop_added_comments(original, candidate))

@@ -20,6 +20,7 @@ LIST_LIMIT = 10
 MAIN_CHANGES = 5
 UNCOVERED_LIMIT = 40
 CODE_WIDTH = 80
+WEAK_LEAD = "No test runs these changed lines; please read them carefully:"
 DISCLOSURE_CLOSING = "Feel free to close this if it isn't useful."
 
 
@@ -135,22 +136,57 @@ def _opening(v: dict[str, Any], job: dict[str, Any], migration: Migration) -> li
     ]
 
 
-def _weak_section(v: dict[str, Any]) -> list[str]:
-    weak = [r["message"].splitlines()[0] for r in v["reasons"] if r["severity"] == "weak"]
-    cov = v["changed_line_coverage"]
-    if cov["available"] and cov["executable"] and not any("coverage" in m.lower() for m in weak):
-        weak.append(f"only {cov['executed']}/{cov['executable']} changed lines ran in the tests")
-    lines = [
-        "> **What the tests did not cover.** This change is only weakly verified: part of it "
-        "is code that no test runs, so it needs a careful read.",
-        *[f"> - {m}" for m in weak[:LIST_LIMIT]],
+def _uncovered_spans(cov: dict[str, Any]) -> list[str]:
+    """`path:a-b` for each run of changed lines no test ran, as recorded in the run."""
+    return [
+        f"{path}:{a}" + (f"-{b}" if b != a else "")
+        for path, nums in sorted((cov.get("uncovered") or {}).items())
+        for a, b in _spans(nums)
     ]
+
+
+def _lists_uncovered(v: dict[str, Any]) -> bool:
+    return bool(v["review_by_hand"] or _uncovered_spans(v["changed_line_coverage"]))
+
+
+def _weak_section(v: dict[str, Any]) -> list[str]:
+    """The notice for a weakly verified change. The lines no test ran are listed once, here;
+    a run that recorded none (older runs) gets the verifier's counts instead."""
+    cov = v["changed_line_coverage"]
+    listed = _lists_uncovered(v)
+    weak = [
+        r["message"].splitlines()[0]
+        for r in v["reasons"]
+        if r["severity"] == "weak" and not (listed and r["code"] == "low_changed_line_coverage")
+    ]
+    if (
+        not listed
+        and cov["available"]
+        and cov["executable"]
+        and not any("coverage" in m.lower() for m in weak)
+    ):
+        weak.append(f"only {cov['executed']}/{cov['executable']} changed lines ran in the tests")
+    lead = "> **What the tests did not cover.**"
+    if not listed:
+        return [
+            f"{lead} This change is only weakly verified: part of it is code that no test "
+            "runs, so it needs a careful read.",
+            *[f"> - {m}" for m in weak[:LIST_LIMIT]],
+            "",
+        ]
+    lines = [f"{lead} {WEAK_LEAD}"]
     if v["review_by_hand"]:
-        lines.append("> - Not run by any test:")
         shown = v["review_by_hand"][:LIST_LIMIT]
-        lines += [f">   - {_hunk_line(h)}" for h in shown]
+        lines += [f"> - {_hunk_line(h)}" for h in shown]
         if len(v["review_by_hand"]) > len(shown):
-            lines.append(f">   - and {len(v['review_by_hand']) - len(shown)} more")
+            lines.append(f"> - and {len(v['review_by_hand']) - len(shown)} more")
+    else:
+        spans = _uncovered_spans(cov)
+        lines += [f"> - `{span}`" for span in spans[:LIST_LIMIT]]
+        if len(spans) > LIST_LIMIT:
+            lines.append(f"> - and {len(spans) - LIST_LIMIT} more")
+    if weak:
+        lines += [">", *[f"> {m}" for m in weak[:LIST_LIMIT]]]
     return lines + [""]
 
 
@@ -293,11 +329,7 @@ def _spans(lines: Sequence[int]) -> list[tuple[int, int]]:
 def _uncovered_section(cov: dict[str, Any]) -> list[str]:
     """The changed lines no test ran, collapsed. Runs made before apifix recorded them have
     none (only the counts)."""
-    spans = [
-        f"{path}:{a}" + (f"-{b}" if b != a else "")
-        for path, nums in sorted((cov.get("uncovered") or {}).items())
-        for a, b in _spans(nums)
-    ]
+    spans = _uncovered_spans(cov)
     if not spans:
         return []
     total = sum(len(n) for n in cov["uncovered"].values())
@@ -357,7 +389,8 @@ def _tests_section(v: dict[str, Any]) -> list[str]:
         facts.append("changed-line coverage was not available")
     text = "; ".join(facts)
     lines.append(text[:1].upper() + text[1:] + ".")
-    if cov["available"] and cov["executed"] < cov["executable"]:
+    listed_above = v["verdict"] == "verified_weak" and _lists_uncovered(v)  # the notice has them
+    if cov["available"] and cov["executed"] < cov["executable"] and not listed_above:
         lines += _uncovered_section(cov)
     return lines + _test_edits_section(v)
 

@@ -5,6 +5,10 @@
 
 0.x configured the module; 1.x uses a client object.
 
+Change only what the migration needs. Keep the original formatting, and leave all other code as
+it is, including code you would write differently (a bare `except:` stays `except:`) and
+comments (add none).
+
 ```python
 # 0.x
 openai.api_key = os.getenv("OPENAI_API_KEY")
