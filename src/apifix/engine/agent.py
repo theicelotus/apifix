@@ -1430,13 +1430,13 @@ class _Job:
     def _env_names(self) -> tuple[str, ...]:
         """The library's environment variables (its client key's), which a rewrite may set."""
         key = getattr(self.migration, "client_key", None)
-        return (key.env,) if key is not None else ()
+        return tuple(key.envs) if key is not None else ()
 
     def _client_key(self) -> ClientKey | None:
         """The migration's ClientKey for the unkeyed-method-patch check, unless the repo's CI
-        sets the key's variable (the sandbox's test phase then has a placeholder)."""
+        sets one of the key's variables (the sandbox's test phase then has a placeholder)."""
         key = getattr(self.migration, "client_key", None)
-        return None if key is None or key.env in self.sandbox_env else key
+        return None if key is None or any(e in self.sandbox_env for e in key.envs) else key
 
     def _updated_context(self, path: str) -> list[tuple[str, str]]:
         """The files a request for `path` may show as read-only context, as they are now:

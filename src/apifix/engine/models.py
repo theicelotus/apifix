@@ -37,16 +37,25 @@ class SmokeCheck:
 
 @dataclass(frozen=True)
 class ClientKey:
-    """How the library's clients get their API key: `classes` read it from the environment
-    variable `env` when no `keyword` argument is given, and raise when neither is set. A test
-    that patches one of the library's resource methods (a class under `<library>.<resources>.`)
-    leaves that constructor running, so it needs a key
-    (code_checks.unkeyed_method_patch_problems)."""
+    """How the library's clients get their API key: `classes` read it from any of the
+    environment variables `envs` when no `keyword` argument is given, and raise when none is
+    set. A test that patches one of the library's resource methods (a class under
+    `<library>.<resources>.`, or `<library>.<module>.` when `resources` is "") leaves that
+    constructor running, so it needs a key (code_checks.unkeyed_method_patch_problems)."""
 
-    env: str
+    envs: tuple[str, ...]
     keyword: str
     classes: frozenset[str]
     resources: str
+
+    @property
+    def unset(self) -> str:
+        """`OPENAI_API_KEY is not set`, `neither GOOGLE_API_KEY nor GEMINI_API_KEY is set`."""
+        if len(self.envs) == 1:
+            return f"{self.envs[0]} is not set"
+        if len(self.envs) == 2:
+            return f"neither {self.envs[0]} nor {self.envs[1]} is set"
+        return f"none of {', '.join(self.envs)} is set"
 
 
 @dataclass(frozen=True)

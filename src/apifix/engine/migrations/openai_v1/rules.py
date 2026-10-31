@@ -427,7 +427,7 @@ CLIENT_CLASSES = frozenset(_CLIENT_CLASSES)
 # neither is set; their resource methods live under openai.resources (Azure clients read other
 # variables and are not checked).
 CLIENT_KEY = ClientKey(
-    env="OPENAI_API_KEY",
+    envs=("OPENAI_API_KEY",),
     keyword="api_key",
     classes=frozenset({"OpenAI", "AsyncOpenAI"}),
     resources="resources",

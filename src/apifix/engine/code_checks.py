@@ -1264,24 +1264,41 @@ def _snake(name: str) -> str:
 def resource_method(target: str, library_modules: Collection[str], resources: str) -> str | None:
     """The client path a patch of a resource method stands for, under any module prefix:
     `openai.resources.chat.completions.Completions.create` -> `chat.completions.create`
-    (`openai.resources.chat.Completions.create` too); None for any other target."""
+    (`openai.resources.chat.Completions.create` too). With no `resources` segment (""), the
+    class sits in a module of its own name right under the library:
+    `google.genai.models.Models.generate_content` -> `models.generate_content`
+    (`AsyncModels` too). None for any other target."""
     parts = target.split(".")
-    for i, part in enumerate(parts[:-2]):
-        if part not in library_modules or parts[i + 1] != resources:
-            continue
-        rest = parts[i + 2 :]
-        if not rest[-2][:1].isupper() or any(p[:1].isupper() for p in rest[:-2]):
-            return None
-        modules, cls, method = rest[:-2], rest[-2], rest[-1]
-        name = _snake(cls.removeprefix("Async"))
-        if not modules or modules[-1] != name:
-            modules = [*modules, name]
-        return ".".join([*modules, method])
+    for i in range(len(parts)):
+        for j in range(i + 1, len(parts)):
+            if ".".join(parts[i:j]) not in library_modules:
+                continue
+            if resources:
+                if parts[j] != resources:
+                    continue
+                j += 1
+            rest = parts[j:]
+            if len(rest) < 2:
+                return None
+            if not rest[-2][:1].isupper() or any(p[:1].isupper() for p in rest[:-2]):
+                return None
+            modules, cls, method = rest[:-2], rest[-2], rest[-1]
+            name = _snake(cls.removeprefix("Async"))
+            if not resources and modules != [name]:
+                return None  # e.g. google.genai.types.Part.from_text: no resource
+            if not modules or modules[-1] != name:
+                modules = [*modules, name]
+            return ".".join([*modules, method])
     return None
 
 
 def _is_str(node: ast.AST | None, value: str) -> bool:
     return isinstance(node, ast.Constant) and node.value == value
+
+
+def _is_env(node: ast.AST | None, key: ClientKey) -> bool:
+    """Is `node` the name of one of the key's environment variables?"""
+    return any(_is_str(node, env) for env in key.envs)
 
 
 def _sets_key(node: ast.AST, key: ClientKey, passed: bool = True) -> bool:
@@ -1294,14 +1311,13 @@ def _sets_key(node: ast.AST, key: ClientKey, passed: bool = True) -> bool:
             func = _dotted(n.func) or ""
             last = func.rsplit(".", 1)[-1]
             first = n.args[0] if n.args else None
-            if last in ("setenv", "putenv", "setdefault") and _is_str(first, key.env):
+            if last in ("setenv", "putenv", "setdefault") and _is_env(first, key):
                 return True
             if func.endswith("patch.dict") or last == "update":
                 values = n.args[1:] if func.endswith("patch.dict") else n.args
                 if any(
-                    isinstance(v, ast.Dict) and any(_is_str(k, key.env) for k in v.keys)
-                    for v in values
-                ) or any(k.arg == key.env for k in n.keywords):
+                    isinstance(v, ast.Dict) and any(_is_env(k, key) for k in v.keys) for v in values
+                ) or any(k.arg in key.envs for k in n.keywords):
                     return True
             if passed and any(
                 k.arg == key.keyword
@@ -1311,7 +1327,7 @@ def _sets_key(node: ast.AST, key: ClientKey, passed: bool = True) -> bool:
                 return True
         elif isinstance(n, ast.Assign | ast.AnnAssign):
             targets = n.targets if isinstance(n, ast.Assign) else [n.target]
-            if any(isinstance(t, ast.Subscript) and _is_str(t.slice, key.env) for t in targets):
+            if any(isinstance(t, ast.Subscript) and _is_env(t.slice, key) for t in targets):
                 return True
     return False
 
@@ -1375,7 +1391,7 @@ class _KeySources:
             if conftest is not None:
                 self.modules.append(conftest)
         configs = [read_module(c) or "" for c in PYTEST_CONFIGS]
-        self.global_key = any(f"{key.env}=" in c for c in configs) or any(
+        self.global_key = any(f"{env}=" in c for c in configs for env in key.envs) or any(
             self._module_sets_key(m) for m in self.modules
         )
 
@@ -1558,13 +1574,14 @@ def unkeyed_method_patch_problems(
             continue
         also = f" (and likewise in: {', '.join(unkeyed[1:])})" if unkeyed[1:] else ""
         var = keyless.call.rsplit(".", 1)[-1]
+        env = key.envs[0]
         problems.append(
             f"mock target {target!r} patches a method, so the real client is still built: "
             f"{keyless.rel}:{keyless.line} calls {keyless.call}() without {key.keyword}=, which "
-            f"raises when {key.env} is not set (tests run without it, and the code's own "
+            f"raises when {key.unset} (tests run without it, and the code's own "
             f"try/except may hide the error), and {unkeyed[0]} sets no key{also}. Set a "
-            f'placeholder key in the test (@mock.patch.dict(os.environ, {{"{key.env}": "test"}}) '
-            f'or monkeypatch.setenv("{key.env}", "test")), or patch the client class instead, '
+            f'placeholder key in the test (@mock.patch.dict(os.environ, {{"{env}": "test"}}) '
+            f'or monkeypatch.setenv("{env}", "test")), or patch the client class instead, '
             f'without autospec: patch("{keyless.target}") and set '
             f"{var}.return_value.{client_path}.return_value"
         )

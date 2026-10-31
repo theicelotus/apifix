@@ -583,3 +583,13 @@ main, then stop.
   lines say `removed (google-genai is declared in the same file)`. `already_migrated.py`: a
   repo that still declares the old distribution is not migrated. Replay of the aipl result:
   identical.
+- **E3 `ClientKey` for several variables** (`envs`, openai-v1: `("OPENAI_API_KEY",)`): any of
+  them set counts in `code_checks._sets_key` (setenv, `os.environ[...]`, `patch.dict`), in
+  pytest-env settings, and in the repo's CI (`_client_key`: a placeholder for any of them
+  turns the unkeyed-method-patch check off); a rewrite may set any of them (`_env_names`).
+  The message says `raises when neither GOOGLE_API_KEY nor GEMINI_API_KEY is set` and suggests
+  the first variable (openai's text is unchanged). `resource_method` with `resources=""`:
+  `google.genai.models.Models.generate_content` -> `models.generate_content` (`AsyncModels`,
+  `chats.Chats.create`), only for a module named after its class (not `types.Part`); library
+  modules match by dotted name, and a target with nothing after the resources segment no
+  longer raises IndexError. Replay of the aipl result: identical.

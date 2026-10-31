@@ -280,7 +280,7 @@ def test_whole_file_checks_reject_the_runs_test_files():
             client_classes=MIGRATION.client_classes,
             client_resources=MIGRATION.client_resources,
             client_key=MIGRATION.client_key,
-            env_names=(MIGRATION.client_key.env,),
+            env_names=MIGRATION.client_key.envs,
             importable=IMPORTABLE,
         )
 

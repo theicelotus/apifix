@@ -4,6 +4,7 @@ unrelated-edit check, the uncalled-mock failure hint, and the guide's advice."""
 
 from __future__ import annotations
 
+import ast
 import os
 import subprocess
 import sys
@@ -12,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from apifix.engine import code_checks
 from apifix.engine.code_checks import (
     keyless_client,
     module_roots,
@@ -183,6 +185,36 @@ def test_the_suggested_fixes_pass_the_check():
 )
 def test_resource_method_targets(target, path):
     assert resource_method(target, OPENAI, "resources") == path
+
+
+@pytest.mark.parametrize(
+    ("target", "path"),
+    [
+        ("google.genai.models.Models.generate_content", "models.generate_content"),
+        ("google.genai.models.AsyncModels.embed_content", "models.embed_content"),
+        ("google.genai.chats.Chats.create", "chats.create"),
+        ("app.google.genai.models.Models.generate_content", "models.generate_content"),
+        ("google.genai.types.Part.from_text", None),
+        ("google.genai.Client", None),
+        ("google.genai.models", None),
+        ("google.cloud.models.Models.list", None),
+    ],
+)
+def test_resource_method_targets_without_a_resources_segment(target, path):
+    assert resource_method(target, frozenset({"google.genai", "google.generativeai"}), "") == path
+
+
+def test_a_key_with_several_variables():
+    key = ClientKey(("GOOGLE_API_KEY", "GEMINI_API_KEY"), "api_key", frozenset({"Client"}), "")
+    assert key.unset == "neither GOOGLE_API_KEY nor GEMINI_API_KEY is set"
+    assert KEY.unset == "OPENAI_API_KEY is not set"
+    for code in (
+        'monkeypatch.setenv("GEMINI_API_KEY", "x")',
+        'os.environ["GOOGLE_API_KEY"] = "x"',
+        'mock.patch.dict(os.environ, {"GEMINI_API_KEY": "x"})',
+    ):
+        assert code_checks._sets_key(ast.parse(code), key), code
+    assert not code_checks._sets_key(ast.parse('monkeypatch.setenv("OPENAI_API_KEY", "x")'), key)
 
 
 def test_every_test_without_a_key_is_named():
@@ -373,7 +405,7 @@ def checked(candidate: str, ci_key: bool = False):
         client_classes=MIGRATION.client_classes,
         client_resources=MIGRATION.client_resources,
         client_key=None if ci_key else KEY,
-        env_names=(KEY.env,),
+        env_names=KEY.envs,
     )
 
 
@@ -398,11 +430,11 @@ def test_key_setting_edits_far_from_findings_need_the_env_names():
         "def test_on_error_survives_a_failure(suggest, print, monkeypatch):\n"
         '    monkeypatch.setenv("OPENAI_API_KEY", "x")\n',
     )
-    assert unrelated_edits(ORIGINAL_TEST, survives, FINDINGS, OPENAI, (KEY.env,)) == []
+    assert unrelated_edits(ORIGINAL_TEST, survives, FINDINGS, OPENAI, KEY.envs) == []
     (error,) = unrelated_edits(ORIGINAL_TEST, survives, FINDINGS, OPENAI)
     assert "unrelated to the migration" in error
     # removing a key setting is still judged as before
-    assert unrelated_edits(survives, ORIGINAL_TEST, FINDINGS, OPENAI, (KEY.env,)) != []
+    assert unrelated_edits(survives, ORIGINAL_TEST, FINDINGS, OPENAI, KEY.envs) != []
 
 
 # --- in a sandbox-like run: the stub client raises without a key ------------------------------
@@ -540,7 +572,12 @@ def test_the_tests_guide_part_says_a_patched_method_needs_a_key():
 
 def test_keyless_client_through_a_dotted_library_module():
     google = frozenset({"google.generativeai", "google.genai"})
-    key = ClientKey(env="GOOGLE_API_KEY", keyword="api_key", classes={"Client"}, resources="")
+    key = ClientKey(
+        envs=("GOOGLE_API_KEY", "GEMINI_API_KEY"),
+        keyword="api_key",
+        classes={"Client"},
+        resources="",
+    )
     plain = "import google.genai\n\n\ndef ask():\n    return google.genai.Client()\n"
     other = (
         "import google.cloud.storage\n\n\ndef ask():\n    return google.cloud.storage.Client()\n"
