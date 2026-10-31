@@ -92,4 +92,12 @@ when one must change, say so in a comment and update the callers and tests that 
 - **0** `sandbox.py`: `CLEAR_NETWORK_MARKERS` / `AMBIGUOUS_NETWORK_MARKERS`,
   `MAX_UNKNOWN_INSTALL_RETRIES = 1`; the note names the kind. Tests in `test_sandbox.py`
   (clear errors retried 3 times, unknown/ambiguous once) and `test_verifier.py`.
-
+- **4+5** `google_genai/python_checks.py`: string patch targets (`patch`, `monkeypatch.setattr`,
+  `patch.object(module, "name")`) in test files; `google.api_core` imports and exception uses in
+  any file. `rules.py`: more `API_CORE_ERRORS`, `API_CORE_OTHER`, `API_CORE_MARK`,
+  `PATCH_TARGET`. `repo_findings._api_core`: drops them in a repo with no Gemini signal,
+  makes them `certain` when google-api-core is not declared (the completeness check then
+  rejects a rewrite that keeps the import), keeps only the exception findings, `likely`, when
+  it is declared. Chose rejecting over adding a pin (see the plan above). Guide: errors and
+  tests parts. Fixtures `tests/fixtures/google_genai_repos/{ailabel_like,agentic_like}`; tests
+  in `tests/test_google_genai_followups.py`.

@@ -162,11 +162,39 @@ API_CORE_ERRORS: dict[str, tuple[str, str]] = {
     "DeadlineExceeded": ("ServerError", "504"),
     "ServiceUnavailable": ("ServerError", "503"),
     "InternalServerError": ("ServerError", "500"),
+    "TooManyRequests": ("ClientError", "429; check e.code == 429"),
+    "BadRequest": ("ClientError", "400"),
+    "Forbidden": ("ClientError", "403"),
+    "Conflict": ("ClientError", "409"),
+    "GatewayTimeout": ("ServerError", "504"),
+    "BadGateway": ("ServerError", "502"),
     "GoogleAPICallError": ("APIError", "the common base class, 4xx and 5xx alike"),
     "GoogleAPIError": ("APIError", "the common base class, 4xx and 5xx alike"),
 }
+# An exception under google.api_core.exceptions with no entry above.
+API_CORE_OTHER = ("APIError", "ClientError for a 4xx status, ServerError for a 5xx one")
+# Every google.api_core finding's suggestion contains this text: repo_findings.py tells them
+# apart by it, then decides from the repo whether the import survives.
+API_CORE_MARK = "google-api-core is no longer installed with google-genai"
 API_CORE_NOTE = (
-    "google.genai.errors.{new} (google-api-core is no longer installed with google-genai; {note})"
+    "google.genai.errors.{new} (" + API_CORE_MARK + "; {note}; to build one in a test: "
+    "errors.{new}(code, response_json))"
+)
+API_CORE_IMPORT = (
+    API_CORE_MARK + " (it keeps working only if the repo declares google-api-core): use "
+    "`from google.genai import errors` (ClientError / ServerError / APIError) in place of "
+    "google.api_core.exceptions, and drop this import if nothing else in the file needs "
+    "google.api_core"
+)
+# Distributions that depend on google-api-core: declaring one keeps it installed.
+API_CORE_DEPENDENTS_PREFIXES = ("google-cloud-",)
+API_CORE_DEPENDENTS = frozenset({"google-api-core", "google-api-python-client"})
+GEMINI_DISTRIBUTIONS = frozenset({"google-generativeai", "google-genai"})
+
+# A patch target that goes through a removed module-level name of the old SDK.
+PATCH_TARGET = (
+    "String patch target `{target}` names `{name}`, which the new SDK's module does not have: "
+    "patch `{prefix}.Client` instead ({what}) and set its models / chats return value"
 )
 
 RESPONSE_TEXT_NONE = (

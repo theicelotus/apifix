@@ -116,17 +116,23 @@ one, which never raises them and does not depend on google-api-core at all:
 `FailedPrecondition` -> `google.genai.errors.ClientError` (check `e.code` for the HTTP status,
 e.g. 429 for a quota error); `DeadlineExceeded` / `ServiceUnavailable` / `InternalServerError`
 -> `google.genai.errors.ServerError`; `GoogleAPICallError` / `GoogleAPIError` ->
-`google.genai.errors.APIError` (the common base, 4xx and 5xx alike). Keep `google.api_core` only
-where the file uses it for something besides the Gemini calls (another Google client, or
-retries on the exception types themselves rather than catching them) — do not remove an import
-still needed for that.
+`google.genai.errors.APIError` (the common base, 4xx and 5xx alike). This applies to
+tests too (a test that raises or expects `google_exceptions.ResourceExhausted` raises or expects
+`errors.ClientError(429, {...})`), and to the `google.api_core` imports themselves: google-genai
+no longer installs google-api-core, so a file that still imports it fails to import unless the
+repo declares google-api-core (apifix reports any such import as a finding, and a rewrite that
+keeps one is rejected). Keep `google.api_core` only where the repo declares google-api-core and
+the file uses it for something besides the Gemini calls (another Google client, or retries on
+the exception types themselves rather than catching them).
 
 <!-- part: tests -->
 ## Tests
 
 Patch `pkg.mod.genai.Client`, not `genai.configure` or `genai.GenerativeModel` (those attributes
 no longer exist on the module, so a leftover patch of them fails well into the test run, not at
-collection). Set `Client.return_value.models.generate_content.return_value` (or `.chats.create`,
+collection). This holds for string targets too: `patch("pkg.mod.genai.GenerativeModel")`,
+`patch("google.generativeai.configure")` and `monkeypatch.setattr("pkg.mod.genai.configure",
+...)` name attributes the new module lacks. Set `Client.return_value.models.generate_content.return_value` (or `.chats.create`,
 `.models.embed_content`). Never patch the client class with `autospec=True`: its resources
 (`models`, `chats`, `aio`, ...) are properties, which autospec does not follow, leaving a mock
 without them. A mock response is `MagicMock(text="...")`, or a real

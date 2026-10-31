@@ -85,6 +85,17 @@ def _is_old_sdk_import(node: ast.Import | ast.ImportFrom) -> bool:
     return _in_root(module, _OLD_ROOT)
 
 
+def _is_api_core_import(node: ast.Import | ast.ImportFrom) -> bool:
+    if isinstance(node, ast.Import):
+        return any(_in_root(a.name, _API_CORE_ROOT) for a in node.names)
+    if node.level:
+        return False
+    module = node.module or ""
+    if module == "google":
+        return any(a.name == "api_core" for a in node.names)
+    return _in_root(module, _API_CORE_ROOT)
+
+
 def _module_rule(suffix: str) -> _Rule | None:
     """`suffix`: the canonical name with the `google.generativeai.` prefix stripped (e.g.
     ``configure``, ``types.GenerationConfig``)."""
@@ -216,6 +227,7 @@ class _Visitor(ast.NodeVisitor):
         # them is CERTAIN rather than LIKELY.
         self.embedding_names: set[str] = set()
         self.api_core_aliases = _collect_aliases(tree, _API_CORE_ROOT)
+        self.new_aliases = _collect_aliases(tree, _NEW_ROOT)
 
     def _report(
         self, node: ast.AST, category: Category, suggestion: str, confidence: Confidence
@@ -245,12 +257,16 @@ class _Visitor(ast.NodeVisitor):
     def visit_Import(self, node: ast.Import) -> None:
         if _is_old_sdk_import(node):
             self._report(node, "import", rules.KNOWN_IMPORTS["genai"], CERTAIN)
+        elif _is_api_core_import(node):
+            self._report(node, "import", rules.API_CORE_IMPORT, LIKELY)
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         if _is_old_sdk_import(node):
             self._report(node, "import", rules.KNOWN_IMPORTS["genai"], CERTAIN)
             return  # the names themselves are not separately reported as imports
+        if _is_api_core_import(node):
+            self._report(node, "import", rules.API_CORE_IMPORT, LIKELY)
         self.generic_visit(node)
 
     # calls
@@ -265,10 +281,64 @@ class _Visitor(ast.NodeVisitor):
             reported = self._method_call(node, func)
         if not reported:
             self.visit(func)
+        if self.test_file:
+            self._patch_target(node)
         for a in node.args:
             self.visit(a)
         for kw in node.keywords:
             self.visit(kw.value)
+
+    def _patch_target(self, node: ast.Call) -> None:
+        """A string patch target in a test (`patch("pkg.mod.genai.GenerativeModel")`,
+        `monkeypatch.setattr("google.generativeai.configure", ...)`, `patch.object(genai,
+        "configure")`) that names something the new SDK's module does not have. Reported on
+        the string, whether or not the test imports the old SDK."""
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+        if name not in ("patch", "setattr", "object") or not node.args:
+            return
+        first = node.args[0]
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            self._report_target(first, first.value)
+            return
+        second = node.args[1] if len(node.args) > 1 else None
+        if name == "object" and isinstance(second, ast.Constant) and isinstance(second.value, str):
+            module = _resolve(first, self.aliases) or _resolve(first, self.new_aliases)
+            if module is None:
+                text = ast.unparse(first)  # `patch.object(llms.genai, "configure")`
+                module = text if text.rsplit(".", 1)[-1] == "genai" else None
+            if module:
+                self._report_target(second, f"{module}.{second.value}")
+
+    def _report_target(self, node: ast.Constant, target: str) -> None:
+        parts = target.split(".")
+        if len(parts) < 2 or not all(p.isidentifier() for p in parts):
+            return
+        if target.startswith(f"{_OLD_ROOT}."):
+            prefix = _NEW_ROOT
+            suffix = target[len(_OLD_ROOT) + 1 :]
+            name = suffix.split(".")[0]
+            rule = _module_rule(suffix) or _module_rule(name)
+        else:
+            at = next(
+                (
+                    i
+                    for i, p in enumerate(parts[:-1])
+                    if p == "genai" and parts[i + 1] in rules.MODULE_CALLS
+                ),
+                None,
+            )
+            if at is None:
+                return
+            prefix = ".".join(parts[: at + 1])
+            name = parts[at + 1]
+            rule = _module_rule(name)
+        if rule is None:
+            return
+        text = rules.PATCH_TARGET.format(
+            target=target, name=name, prefix=prefix, what=rule.suggestion
+        )
+        self._report(node, rule.category, text, LIKELY)
 
     def _module_call(self, node: ast.Call, canonical: str) -> bool:
         suffix = canonical[len(_OLD_ROOT) + 1 :]
@@ -321,17 +391,27 @@ class _Visitor(ast.NodeVisitor):
             if rule is not None:
                 self._report_rule(node, rule)
                 return
-        api_core = _resolve(node, self.api_core_aliases)
-        if api_core and bool(self.aliases):
-            name = api_core.rsplit(".", 1)[-1]
-            if name in rules.API_CORE_ERRORS:
-                new, note = rules.API_CORE_ERRORS[name]
-                suggestion = rules.API_CORE_NOTE.format(new=new, note=note)
-                self._report(node, "error_class", suggestion, LIKELY)
-                return
+        if self._api_core_error(node):
+            return
         self.generic_visit(node)
 
+    def _api_core_error(self, node: ast.Attribute | ast.Name) -> bool:
+        """Report an exception under google.api_core.exceptions (any file: the new SDK does not
+        install google-api-core, so a test that raises one fails to import too)."""
+        dotted = _resolve(node, self.api_core_aliases)
+        prefix = f"{_API_CORE_ROOT}.exceptions."
+        if not dotted or not dotted.startswith(prefix):
+            return False
+        name = dotted[len(prefix) :]
+        if "." in name:
+            return False
+        new, note = rules.API_CORE_ERRORS.get(name, rules.API_CORE_OTHER)
+        self._report(node, "error_class", rules.API_CORE_NOTE.format(new=new, note=note), LIKELY)
+        return True
+
     def visit_Name(self, node: ast.Name) -> None:
+        if self._api_core_error(node):
+            return
         canonical = self.aliases.get(node.id)
         if canonical == f"{_OLD_ROOT}.GenerativeModel":
             return  # reported where constructed (visit_Call), not at every bare reference
