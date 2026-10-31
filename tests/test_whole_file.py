@@ -27,6 +27,7 @@ from apifix.engine.whole_file import (
     file_tokens,
     join_errors,
     must_change,
+    own_lines_note,
     parse_code_block,
     previous_version_note,
     region_previous_note,
@@ -927,3 +928,53 @@ def test_comments_the_model_added_are_dropped_even_next_to_a_finding():
     )
     assert "Use the module-level client" not in r.text
     assert "openai.embeddings.create" in r.text and r.ok
+
+
+# --- the model's own lines in repeated feedback -----------------------------------------------
+
+OWN_OLD = "a = 1\nb = 2\nassert x == 'Test prompt'\nd = 4\ne = 5\n"
+
+
+def test_own_lines_note_shows_the_line_that_stands_where_the_original_line_was():
+    new = "a = 1\nb = 2\nassert x == other\nd = 4\ne = 5\n"
+    note = own_lines_note(
+        ["original line 3: the string 'Test prompt' is missing; keep it"], OWN_OLD, new
+    )
+    assert note == (
+        "These errors came back. Your own lines at those spots:\n"
+        "- the string 'Test prompt' is missing; keep it\n"
+        "    line 3 of your version, you wrote: assert x == other"
+    )
+
+
+def test_own_lines_note_follows_inserted_lines_and_a_replaced_block():
+    new = "import os\na = 1\nb = 2\nassert x == other\nd = 4\ne = 5\n"
+    note = own_lines_note(["original line 3: boom"], OWN_OLD, new)
+    assert "line 4 of your version, you wrote: assert x == other" in note
+    new = "a = 1\nrenamed_1\nrenamed_2\nrenamed_3\nrenamed_4\ne = 5\n"  # lines 2-4 replaced by 4
+    note = own_lines_note(["original line 3: boom"], OWN_OLD, new)
+    assert "lines 2-4 of your version, you wrote: renamed_1\n    renamed_2\n    renamed_3" in note
+
+
+def test_own_lines_note_names_the_line_before_a_removed_line():
+    new = "a = 1\nb = 2\nd = 4\ne = 5\n"
+    note = own_lines_note(["original line 3: boom"], OWN_OLD, new)
+    assert "line 2 of your version (that line is gone; this precedes it), you wrote: b = 2" in note
+
+
+def test_own_lines_note_reads_a_new_line_number_in_the_candidate():
+    new = "a = 1\nb = 2\nc = nowhere\nd = 4\ne = 5\n"
+    note = own_lines_note(["line 3: undefined name 'nowhere'"], OWN_OLD, new)
+    assert "line 3 of your version, you wrote: c = nowhere" in note
+
+
+def test_own_lines_note_skips_what_has_no_spot():
+    new = "a = 1\n"
+    assert own_lines_note(["SyntaxError: bad"], OWN_OLD, new) == ""
+    assert own_lines_note(["R1: boom"], OWN_OLD, new) == ""
+    assert own_lines_note(["original line 3: boom"], OWN_OLD, None) == ""
+    assert own_lines_note([], OWN_OLD, new) == ""
+    # the same error twice is shown once; long lines are cut
+    new = "a = 1\nb = 2\n" + "x" * 500 + "\nd = 4\ne = 5\n"
+    note = own_lines_note(["original line 3: boom", "original line 3: boom"], OWN_OLD, new)
+    assert note.count("- boom") == 1 and "x" * 200 + "..." in note and "x" * 201 not in note

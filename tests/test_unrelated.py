@@ -11,7 +11,7 @@ import pytest
 
 from apifix.engine import unrelated
 from apifix.engine.migrations import get_migration
-from apifix.engine.scanner import scan
+from apifix.engine.scanner import scan, scan_text
 from apifix.engine.unrelated import Revert, revert_text_edits, unrelated_edits
 from apifix.engine.whole_file import error_key
 
@@ -895,3 +895,119 @@ def test_dotted_library_modules_bind_their_aliases_and_dotted_names_only():
     assert bound.library_patch(patch)
     other = ast.parse('mock.patch("google.cloud.storage.Client")').body[0].value
     assert not bound.library_patch(other)
+
+
+# --- agentic-tictactoe genai run 5: keys in assertions, a literal in a moved call ----------------
+
+GENAI = get_migration("google-genai")
+GENAI_TEST = "tests/unit/llm/test_gemini_provider.py"
+# shaped like original lines 78-95 of the run's test_gemini_provider.py
+GENAI_OLD = textwrap.dedent(
+    """\
+    from unittest.mock import patch
+
+    from src.llm.gemini_provider import GeminiProvider
+
+
+    def test_generate():
+        with patch("google.generativeai.GenerativeModel") as mock_generative_model:
+            mock_model = mock_generative_model.return_value
+            provider = GeminiProvider(api_key="k")
+            provider.generate(
+                prompt="Test prompt",
+                model="gemini-2.5-flash",
+            )
+
+            call_args = mock_generative_model.call_args
+            assert call_args[0][0] == "gemini-2.5-flash"
+            assert "safety_settings" in call_args[1]  # Keyword arg for safety settings
+
+            mock_model.generate_content.assert_called_once_with(
+                "Test prompt",
+                generation_config={"max_output_tokens": 100},
+            )
+    """
+)
+GENAI_NEW = (
+    GENAI_OLD.replace(
+        'patch("google.generativeai.GenerativeModel") as mock_generative_model',
+        'patch("google.genai.Client") as mock_client',
+    )
+    .replace(
+        "mock_model = mock_generative_model.return_value", "mock_model = mock_client.return_value"
+    )
+    .replace("mock_generative_model.call_args", "mock_client.call_args")
+    .replace(
+        "        mock_model.generate_content.assert_called_once_with(\n"
+        '            "Test prompt",\n'
+        '            generation_config={"max_output_tokens": 100},\n'
+        "        )",
+        "        mock_model.models.generate_content.assert_called_once_with(\n"
+        '            model="gemini-2.5-flash",\n'
+        '            contents="Test prompt",\n'
+        "            config=types.GenerateContentConfig(\n"
+        "                max_output_tokens=100, safety_settings=[]\n"
+        "            ),\n"
+        "        )",
+    )
+    .replace(
+        'assert "safety_settings" in call_args[1]', "assert config.safety_settings is not None"
+    )
+)
+
+
+def genai_errors(old: str, new: str) -> list[str]:
+    findings = scan_text(GENAI_TEST, old, GENAI)
+    assert findings
+    return unrelated_edits(old, new, findings, GENAI.api_modules)
+
+
+def test_the_genai_fixture_migrated_with_the_literals_kept_passes():
+    assert genai_errors(GENAI_OLD, GENAI_NEW) == []
+
+
+@pytest.mark.parametrize(
+    "old_line",
+    [
+        'assert "safety_settings" in call_args[1]',
+        'assert "safety_settings" not in call_args[1]',
+        'assert call_args[1]["safety_settings"] == []',
+        'assert call_args[1].get("safety_settings") is None',
+    ],
+)
+@pytest.mark.parametrize(
+    "new_line",
+    ["assert config.safety_settings is not None", "assert call.safety_settings == []"],
+)
+def test_a_key_the_rewrite_uses_as_an_attribute_or_keyword_is_kept(old_line, new_line):
+    old = GENAI_OLD.replace('assert "safety_settings" in call_args[1]', old_line)
+    new = GENAI_NEW.replace("assert config.safety_settings is not None", new_line)
+    assert genai_errors(old, new) == []
+
+
+def test_a_membership_key_the_rewrite_drops_is_still_reported():
+    # the keyword is gone too, so the name is nowhere in the rewrite
+    new = GENAI_NEW.replace("max_output_tokens=100, safety_settings=[]", "max_output_tokens=100")
+    new = new.replace("assert config.safety_settings is not None", "assert config is not None")
+    assert genai_errors(GENAI_OLD, new) == [
+        f"original line 17: the string 'safety_settings' {MISSING}"
+    ]
+
+
+def test_a_literal_present_anywhere_in_the_migrated_file_satisfies_the_check():
+    # not matched by position or call: the literal moved from the assert_called_once_with call
+    # (original line 20) to another assertion, on the line of the key (original line 17)
+    elsewhere = "assert config.system_instruction != 'Test prompt'"
+    moved = GENAI_NEW.replace('contents="Test prompt"', "contents=ANY")
+    moved = moved.replace("assert config.safety_settings is not None", elsewhere)
+    assert genai_errors(GENAI_OLD, moved) == []
+    # the same with the call keeping a different literal
+    other = moved.replace("contents=ANY", 'contents="Other prompt"')
+    assert genai_errors(GENAI_OLD, other) == []
+
+
+def test_a_literal_the_migrated_file_lacks_is_reported_at_its_original_line():
+    gone = GENAI_NEW.replace('contents="Test prompt"', "contents=prompt")
+    assert genai_errors(GENAI_OLD, gone) == [
+        f"original line 20: the string 'Test prompt' {MISSING}"
+    ]

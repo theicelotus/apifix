@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
+from apifix import cli
 from apifix.cli import EXIT_CLEAN, EXIT_FINDINGS, EXIT_USAGE, main
 from tests.conftest import FIXTURES
 
@@ -53,3 +55,29 @@ def test_missing_path(capsys, tmp_path):
 
 def test_github_url_not_supported_yet(capsys):
     assert main(["scan", "https://github.com/a/b", "--migration", "openai-v1"]) == EXIT_USAGE
+
+
+def test_write_outputs_writes_each_reply_to_replies_with_paths_redacted(tmp_path):
+    home = str(Path.home())
+    replies = {
+        "replies/attempt-1-response-0.txt": f"edited {home}/proj/app.py",
+        "replies/attempt-2-response-0.txt": "plain",
+    }
+    out = tmp_path / "run"
+    out.mkdir()
+    trajectory = {"job": {}}
+    cli._write_outputs(out, "diff", "report", {"verdict": "ok"}, trajectory, replies)
+    assert (out / "replies/attempt-1-response-0.txt").read_text() == "edited ~/proj/app.py"
+    assert (out / "replies/attempt-2-response-0.txt").read_text() == "plain"
+    assert sorted(p.name for p in out.iterdir()) == [
+        "fix.diff",
+        "replies",
+        "report.md",
+        "trajectory.json",
+        "verification.json",
+    ]
+
+
+def test_write_outputs_without_replies_makes_no_replies_folder(tmp_path):
+    cli._write_outputs(tmp_path, "d", "r", None, {"job": {}})
+    assert not (tmp_path / "replies").exists()

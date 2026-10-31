@@ -1096,15 +1096,20 @@ def _string_constants(tree: ast.Module) -> list[ast.Constant]:
 
 
 def _key_constants(tree: ast.Module) -> set[int]:
-    """ids of the string constants used as dict keys, subscript keys, or attribute names
-    (`getattr(x, "name")`, `hasattr(x, "name")`, `d.get("name")`): each is a name that the
-    old API's response carried as a key or attribute."""
+    """ids of the string constants used as dict keys, subscript keys, membership tests, or
+    attribute names (`d["name"]`, `"name" in d`, `getattr(x, "name")`, `hasattr(x, "name")`,
+    `d.get("name")`): each is a name that the old API's response or call carried as a key or
+    attribute."""
     out = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Dict):
             out.update(id(k) for k in node.keys if isinstance(k, ast.Constant))
         elif isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant):
             out.add(id(node.slice))
+        elif isinstance(node, ast.Compare):
+            # `"name" in d` / `"name" not in d`: the left side of a membership test
+            if isinstance(node.left, ast.Constant) and isinstance(node.ops[0], (ast.In, ast.NotIn)):
+                out.add(id(node.left))
         elif isinstance(node, ast.Call):
             func = node.func
             if isinstance(func, ast.Name) and func.id in _ATTRIBUTE_BUILTINS:
@@ -1131,10 +1136,11 @@ def _attribute_names(tree: ast.Module) -> set[str]:
 
 def _missing_strings(diff: _Diff, skipped: Sequence[Hunk]) -> list[str]:
     """Non-exempt string constants of the original that the candidate lacks (multiset). Exempt
-    besides those on finding lines: keys and `getattr`/`hasattr` names that became attribute or
-    keyword names (`getattr(c, "finish_reason", None)` -> `c.finish_reason`), and strings a
-    kept rename hunk renamed (`kwargs["engine"]` -> `kwargs["model"]`). Strings in the
-    `skipped` hunks (rejected or text-only) are reported by those hunks' own errors."""
+    besides those on finding lines: keys (subscript, `.get()`, `in`) and `getattr`/`hasattr`
+    names that became attribute or keyword names (`getattr(c, "finish_reason", None)` ->
+    `c.finish_reason`), and strings a kept rename hunk renamed (`kwargs["engine"]` ->
+    `kwargs["model"]`). Strings in the `skipped` hunks (rejected or text-only) are reported by
+    those hunks' own errors."""
     have = Counter(n.value for n in _string_constants(diff.new.tree))
     keys, attributes = _key_constants(diff.old.tree), _attribute_names(diff.new.tree)
     nodes = [

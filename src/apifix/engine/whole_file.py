@@ -551,6 +551,77 @@ def repeated_errors_note(repeated: Sequence[tuple[str, str, Sequence[int]]]) -> 
     return "\n".join(lines)
 
 
+YOU_WROTE_LINES = 3  # the model's lines shown at one spot
+YOU_WROTE_CHARS = 200
+YOU_WROTE_SPOTS = 5  # errors shown with their spot
+
+_ORIGINAL_LINE = re.compile(r"^(?:after |before )?original line (\d+): ")
+_NEW_LINE = re.compile(r"^line (\d+): ")
+
+
+def own_lines_note(errors: Sequence[str], original: str, candidate: str | None) -> str:
+    """For check errors that came back (same error as in an earlier reply): what the model
+    itself wrote at each error's spot, so that it can see what to change. `original line N`
+    maps to the candidate through a line diff (the lines that replaced N, else the line
+    before it); `line N` is a candidate line already. Errors without a line, or of a region
+    block, are left out. "" when none has a spot."""
+    if candidate is None:
+        return ""
+    old, new = original.splitlines(), candidate.splitlines()
+    opcodes = None
+    spots: list[str] = []
+    for error in dict.fromkeys(errors):
+        first = error.split("\n", 1)[0]
+        if m := _NEW_LINE.match(first):
+            start = int(m[1]) - 1
+            lines, where = new[start : start + 1], f"line {start + 1} of your version"
+        elif m := _ORIGINAL_LINE.match(first):
+            if opcodes is None:
+                opcodes = difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes()
+            lines, where = _lines_at(int(m[1]) - 1, opcodes, new)
+        else:
+            continue
+        if not lines:
+            continue
+        shown = [_clip(line.strip()) for line in lines[:YOU_WROTE_LINES]]
+        key = _clip(error_key(first), 120)
+        spots.append(f"- {key}\n    {where}, you wrote: " + "\n    ".join(shown))
+        if len(spots) == YOU_WROTE_SPOTS:
+            break
+    if not spots:
+        return ""
+    return "These errors came back. Your own lines at those spots:\n" + "\n".join(spots)
+
+
+def _clip(text: str, chars: int = YOU_WROTE_CHARS) -> str:
+    return text if len(text) <= chars else text[:chars] + "..."
+
+
+def _lines_at(
+    index: int, opcodes: Sequence[tuple[str, int, int, int, int]], new: list[str]
+) -> tuple[list[str], str]:
+    """The candidate lines at original line `index` (0-based) and where they are."""
+    for tag, i1, i2, j1, j2 in opcodes:
+        if not i1 <= index < i2:
+            continue
+        if tag == "equal":
+            j = j1 + (index - i1)
+            return new[j : j + 1], f"line {j + 1} of your version"
+        if tag == "replace":
+            # the spot is at the same relative place in the block that replaced it
+            at = j1 + (index - i1) * (j2 - j1) // (i2 - i1)
+            first = min(max(at - YOU_WROTE_LINES // 2, j1), max(j2 - YOU_WROTE_LINES, j1))
+            last = min(first + YOU_WROTE_LINES, j2)
+            span = f"line {first + 1}" if last - first == 1 else f"lines {first + 1}-{last}"
+            return new[first:last], f"{span} of your version"
+        # delete: the original line has no counterpart; show the line before the gap
+        if j1 > 0:
+            return new[
+                j1 - 1 : j1
+            ], f"line {j1} of your version (that line is gone; this precedes it)"
+    return [], ""
+
+
 def join_errors(errors: list[str]) -> str:
     """Check errors as one string: "; "-joined, or a bullet list when there are several and one
     spans lines (a message with an example)."""

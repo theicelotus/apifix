@@ -604,9 +604,14 @@ def test_cli_fix_writes_all_outputs(repo, tmp_path, monkeypatch, capsys):
     assert code == 0
     assert sorted(p.name for p in out.iterdir()) == [
         "fix.diff",
+        "replies",
         "report.md",
         "trajectory.json",
         "verification.json",
+    ]
+    assert sorted(p.name for p in (out / "replies").iterdir()) == [
+        "attempt-1-response-0.txt",
+        "attempt-1-response-1.txt",
     ]
     assert json.loads((out / "verification.json").read_text())["verdict"] == "verified"
     assert json.loads((out / "trajectory.json").read_text())["outcome"] == "verified"
@@ -3167,3 +3172,39 @@ def test_cut_off_reply_says_what_capped_it(repo):
     assert agent_module._truncated_error("file", 16_000) == (
         "the reply hit the output limit before the file was complete (at 16,000 reply tokens)"
     )
+
+
+# --- replies kept; the model's own lines in repeated feedback ----------------------------------
+
+
+def test_every_reply_text_is_kept_and_named_in_the_trajectory(repo):
+    llm = FakeLLM([block(APP_NEW), block(TESTS_NEW)])
+    result = wf(repo, llm)
+    responses = result.trajectory["attempts"][0]["responses"]
+    names = ["replies/attempt-1-response-0.txt", "replies/attempt-1-response-1.txt"]
+    assert [r["reply_file"] for r in responses] == names
+    assert list(result.replies) == names
+    assert result.replies[names[0]].startswith("Here is the updated file:")
+    assert f"```python\n{APP_NEW}```" in result.replies[names[0]]
+    assert f"```python\n{TESTS_NEW}```" in result.replies[names[1]]
+
+
+def test_a_rejected_reply_is_kept_too(repo):
+    broken = APP_NEW.replace("def ask(q):", "def ask(q:")
+    result = wf(repo, FakeLLM([block(broken), block(APP_NEW), block(TESTS_NEW)]))
+    assert f"```python\n{broken}```" in result.replies["replies/attempt-1-response-0.txt"]
+    assert len(result.replies) == 3
+
+
+def test_an_error_that_comes_back_shows_the_models_own_line(repo):
+    wrong = APP_NEW.replace("def ask(q):", "def ask(q):\n    value = missing_name + 1", 1)
+    assert wrong != APP_NEW
+    llm = FakeLLM([block(wrong), block(wrong), block(APP_NEW), block(TESTS_NEW)])
+    result = wf(repo, llm, max_check_retries_per_file=2)
+    assert result.outcome == "verified"
+    first, second = result.trajectory["attempts"][0]["nudges"]
+    # the first time an error shows up, only the error
+    assert "you wrote" not in first["message"]
+    # the second time, the line the model wrote at that spot
+    assert "These errors came back. Your own lines at those spots:" in second["message"]
+    assert "you wrote: value = missing_name + 1" in second["message"]

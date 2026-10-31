@@ -31,7 +31,8 @@ Exit codes: 0 clean (fix: verified; pr: branch made), 1 findings (fix: not verif
 already on the new API; nothing was sent to an LLM or run.
 
 report.md, verification.json and trajectory.json write the home directory as ~ (fix.diff is
-unchanged).
+unchanged). fix also writes the model's replies, one file per request, to replies/ (local
+only, never part of a pull request).
 
 fix and verify keep a pip cache for the sandbox's dependency installs
 ($APIFIX_PIP_CACHE, else ~/.cache/apifix/pip); --no-pip-cache turns it off.
@@ -245,18 +246,28 @@ def _out_dir(args: argparse.Namespace) -> Path:
 
 
 def _write_outputs(
-    out: Path, diff: str, report: str, verification: dict | None, trajectory: dict
+    out: Path,
+    diff: str,
+    report: str,
+    verification: dict | None,
+    trajectory: dict,
+    replies: dict[str, str] | None = None,
 ) -> None:
     from apifix.engine.local_paths import redact_local_paths
 
     # Outputs get published as evidence: home dir -> ~ (the diff stays byte-for-byte).
     # fix.diff's digest ties a later `apifix pr` to exactly the diff that was verified.
     trajectory["job"]["diff_sha256"] = hashlib.sha256(diff.encode("utf-8")).hexdigest()
-    report, verification, trajectory = redact_local_paths((report, verification, trajectory))
+    report, verification, trajectory, replies = redact_local_paths(
+        (report, verification, trajectory, replies or {})
+    )
     (out / "fix.diff").write_text(diff, newline="")  # CRLF lines of CRLF files stay
     (out / "report.md").write_text(report)
     (out / "verification.json").write_text(json.dumps(verification, indent=2) + "\n")
     (out / "trajectory.json").write_text(json.dumps(trajectory, indent=2) + "\n")
+    for name, text in replies.items():  # local-only: `apifix pr` never reads these
+        (out / name).parent.mkdir(parents=True, exist_ok=True)
+        (out / name).write_text(text)
 
 
 def _verify(args: argparse.Namespace) -> int:
@@ -356,7 +367,9 @@ def _fix(args: argparse.Namespace) -> int:
 
     out = _out_dir(args)
     verification = result.verification.to_dict() if result.verification else None
-    _write_outputs(out, result.diff, result.report_markdown, verification, result.trajectory)
+    _write_outputs(
+        out, result.diff, result.report_markdown, verification, result.trajectory, result.replies
+    )
     print(f"{result.outcome}: {result.reason}")
     if result.outcome == "already_migrated":
         print(_findings_text(result.trajectory["findings"]))

@@ -131,6 +131,7 @@ from apifix.engine.whole_file import (
     file_tokens,
     join_errors,
     must_change,
+    own_lines_note,
     parse_code_block,
     pins_note,
     previous_version_note,
@@ -257,6 +258,8 @@ class _CannotFit(LLMError):
 class Attempt:
     number: int
     responses: list[dict[str, Any]] = field(default_factory=list)
+    # the model's reply text, per response (not in to_dict: the CLI writes each to replies/)
+    reply_texts: list[str] = field(default_factory=list)
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     nudges: list[dict[str, Any]] = field(default_factory=list)
     edits: list[EditRecord] = field(default_factory=list)
@@ -312,6 +315,14 @@ class FixResult:
     attempts: int
     usage: Usage
     cost_usd: float
+    # the model's replies, by file name under replies/ (local-only; see reply_file)
+    replies: dict[str, str] = field(default_factory=dict)
+
+
+def reply_file(attempt: int, response: int) -> str:
+    """Where the CLI writes the text of an attempt's response (the 0-based index of its entry
+    in the attempt's `responses`), relative to the run folder."""
+    return f"replies/attempt-{attempt}-response-{response}.txt"
 
 
 # --- prompts ----------------------------------------------------------------------------------
@@ -470,6 +481,8 @@ class _Job:
         # whole-file: every check error of every reply so far, per file (error_key form), for
         # the "keep these fixed" part of a retry message; and the imports apifix may add
         self.wf_error_history: dict[str, list[str]] = {}
+        # whole-file: per file, the errors of its last failed reply that an earlier reply had too
+        self.wf_repeat_errors: dict[str, list[str]] = {}
         # whole-file: per file, each (check, error_key) its consecutive failed attempts had, with
         # their numbers (acceptance, or a failure without that error, ends a streak); the files
         # accepted so far (the others with findings are still on the old API); why the job
@@ -675,9 +688,11 @@ class _Job:
             self.chars_per_token = min(ratio, self.chars_per_token or ratio)
         self.cost += cost or 0.0
         attempt.cost_usd += cost or 0.0
+        attempt.reply_texts.append(response.text or "")
         attempt.responses.append(
             {
                 "model": response.model,
+                "reply_file": reply_file(attempt.number, len(attempt.responses)),
                 "stop_reason": response.raw_stop_reason or response.stop_reason,
                 "usage": asdict(response.usage),
                 "cost_usd": round(cost or 0.0, 6),
@@ -905,6 +920,7 @@ class _Job:
                 continue
             self.wf_accepted_in[path] = attempt.number
             self.wf_streaks.pop(path, None)
+            self.wf_repeat_errors.pop(path, None)
             self.wf_region_previous.pop(path, None)
             self.wf_region_errors.pop(path, None)
         self.wf_pending = again
@@ -1179,7 +1195,14 @@ class _Job:
         if path in self.wf_previous:
             text, reason = self.wf_previous[path]
             previous = previous_version_note(
-                path, original, text, reason, repeated=_repeated_text(repeated)
+                path,
+                original,
+                text,
+                reason,
+                repeated=_notes(
+                    _repeated_text(repeated),
+                    own_lines_note(self.wf_repeat_errors.get(path, []), original, text),
+                ),
             )
         tokens = file_tokens(original, self._read(self.work, path))
         max_tokens = self._reply_tokens(path, tokens)
@@ -1328,6 +1351,9 @@ class _Job:
                     history = self.wf_error_history.setdefault(path, [])
                     current = {error_key(e) for e in result.errors}
                     keep_fixed = [k for k in history if k not in current]
+                    self.wf_repeat_errors[path] = [
+                        e for e in result.errors if error_key(e) in history
+                    ]
                     history += [
                         k for k in dict.fromkeys(map(error_key, result.errors)) if k not in history
                     ]
@@ -1335,7 +1361,15 @@ class _Job:
                         retries += 1
                         again = self._repeated(path, list(current))
                         note = previous_version_note(
-                            path, original, candidate, error, keep_fixed, _repeated_text(again)
+                            path,
+                            original,
+                            candidate,
+                            error,
+                            keep_fixed,
+                            _notes(
+                                _repeated_text(again),
+                                own_lines_note(self.wf_repeat_errors[path], original, candidate),
+                            ),
                         )
                         retry, retry_parts = request(note)
                         attempt.nudges.append(
@@ -2769,6 +2803,10 @@ def _failed_checks(errors: Sequence[str], checks: Sequence[str]) -> list[list[st
     return [list(pair) for pair in pairs]
 
 
+def _notes(*notes: str) -> str:
+    return "\n".join(n for n in notes if n)
+
+
 def _repeated_text(repeated: Sequence[dict[str, Any]]) -> str:
     return repeated_errors_note([(r["check"], r["error"], r["attempts"]) for r in repeated])
 
@@ -3174,4 +3212,9 @@ def fix(
             attempts=len(job.attempts),
             usage=job.usage,
             cost_usd=job.cost,
+            replies={
+                reply_file(a.number, i): text
+                for a in job.attempts
+                for i, text in enumerate(a.reply_texts)
+            },
         )
