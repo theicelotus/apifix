@@ -66,6 +66,9 @@ def test_sandbox_requirements_lines_count_as_declared():
         ("vaderSentiment", "vaderSentiment==3.3.2", True),
         ("PIL", "Pillow", True),
         ("hydra", "hydra-core", True),
+        ("ruamel", "ruamel.yaml", True),
+        ("pythonjsonlogger", "python-json-logger", True),
+        ("pythonjsonlogger", "python_json_logger==3.1.0", True),
         ("google", "google-cloud-storage", True),
         ("sklearn", "sklearn-crfsuite", False),
     ],
@@ -78,6 +81,34 @@ def test_import_names_match_differently_named_distributions(
         {"requirements.txt": f"{declaration}\n", "app.py": f"import {module}.sub\n"},
     )
     assert (undeclared_imports(repo) == []) is declared
+
+
+def test_undeclared_mismatched_names_list_the_pip_name(tmp_path):
+    repo = write(
+        tmp_path,
+        {
+            "app.py": "from ruamel.yaml import YAML\nfrom pythonjsonlogger import jsonlogger\n"
+            "import vaderSentiment\n"
+        },
+    )
+    assert {u.module: u.distribution for u in undeclared_imports(repo)} == {
+        "pythonjsonlogger": "python-json-logger",
+        "ruamel": "ruamel-yaml",
+        "vaderSentiment": "vadersentiment",
+    }
+
+
+def test_the_mismatch_table_is_normalised_and_leads_with_the_import_name():
+    from apifix.engine.dependencies import (
+        IMPORT_DISTRIBUTIONS,
+        distribution_candidates,
+        normalize_name,
+    )
+
+    for module, distributions in IMPORT_DISTRIBUTIONS.items():
+        assert module == normalize_name(module) and distributions
+        assert all(d == normalize_name(d) for d in distributions)
+        assert distribution_candidates(module)[0] == module
 
 
 def test_declarations_in_every_file_and_table_count(tmp_path):

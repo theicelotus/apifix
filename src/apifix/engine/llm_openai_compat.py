@@ -22,6 +22,7 @@ hosted free tiers. Plain stdlib HTTP, no SDK.
 
 from __future__ import annotations
 
+import difflib
 import email.utils
 import ipaddress
 import json
@@ -62,6 +63,7 @@ REASONING_EFFORTS = ("low", "medium", "high")
 # "Python-urllib/3.x" with a bare 403.
 USER_AGENT = f"apifix/{__version__}"
 MAX_RESPONSE_BYTES = 20_000_000
+MAX_LISTED_MODELS = 10  # models named in a "model not found" error
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 RETRY_DELAYS_S = (1.0, 4.0)
 # Gateway/edge errors (a CDN or load balancer in front of the server, not the server itself):
@@ -290,12 +292,27 @@ class OpenAICompatLLM:
             str(m["id"]) for m in data.get("data", []) if isinstance(m, dict) and "id" in m
         )
 
+    def _listed(self, available: list[str]) -> str:
+        """The server's models for an error message: all of them when there are few, else the
+        MAX_LISTED_MODELS closest to the wanted one (hosted servers list hundreds)."""
+        if not available:
+            return ""
+        if len(available) <= MAX_LISTED_MODELS:
+            return f" Models on {self.endpoint}: {', '.join(available)}."
+        wanted = getattr(self, "model", "")
+        if wanted:
+            close = difflib.get_close_matches(wanted, available, n=MAX_LISTED_MODELS, cutoff=0.0)
+        else:
+            close = available[:MAX_LISTED_MODELS]
+        which = f"the {len(close)} closest to {wanted!r}" if wanted else f"the first {len(close)}"
+        return f" Models on {self.endpoint} ({len(available)} in all; {which}): {', '.join(close)}."
+
     def _model_help(self, problem: str) -> str:
         try:
             available = self.list_models()
         except LLMError:
             available = []
-        listed = f" Models on {self.endpoint}: {', '.join(available)}." if available else ""
+        listed = self._listed(available)
         if not self.local:  # hardware is irrelevant for a hosted model
             return f"{problem}.{listed or ' Check the model id against the provider list.'}"
         return f"{problem}.{listed} Starting points by hardware: {MODEL_SUGGESTIONS}."

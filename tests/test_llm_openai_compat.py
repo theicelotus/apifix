@@ -281,6 +281,36 @@ def test_unknown_hosted_model_lists_no_hardware(monkeypatch):
     assert "hardware" not in text and "GPU" not in text and "qwen2.5-coder" not in text
 
 
+def test_a_long_model_list_is_cut_to_the_closest_matches(monkeypatch):
+    monkeypatch.setenv("APIFIX_LLM_API_KEY", "gsk_x")
+    names = [f"vendor-{i}/model-{i}-instruct" for i in range(400)]
+    names += ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "openai/gpt-oss-safeguard-20b"]
+    models = HTTPResponse(200, json.dumps({"data": [{"id": n} for n in names]}).encode())
+    message = "The model `openai/gpt-oss-12b` does not exist or you do not have access to it"
+    http = FakeHTTP([error(404, message), models])
+    llm = OpenAICompatLLM(
+        "openai/gpt-oss-12b", base_url=HOSTED, transport=http, sleep=lambda s: None
+    )
+    with pytest.raises(LLMError) as exc:
+        complete(llm)
+    text = str(exc.value)
+    assert message in text  # the server's own message stays
+    listed = text.split("closest to 'openai/gpt-oss-12b'): ", 1)[1].rstrip(".").split(", ")
+    assert len(listed) == 10 and f"({len(names)} in all; the 10 closest" in text
+    assert {"openai/gpt-oss-120b", "openai/gpt-oss-20b"} <= set(listed)  # the close ones lead
+    assert len(text) < 1_000
+
+
+def test_a_missing_model_option_lists_only_the_first_few_models(monkeypatch):
+    monkeypatch.setenv("APIFIX_LLM_API_KEY", "gsk_x")
+    names = [f"m-{i:03}" for i in range(50)]
+    models = HTTPResponse(200, json.dumps({"data": [{"id": n} for n in names]}).encode())
+    with pytest.raises(LLMError) as exc:
+        OpenAICompatLLM(None, base_url=HOSTED, transport=FakeHTTP([models]), sleep=lambda s: None)
+    text = str(exc.value)
+    assert "(50 in all; the first 10)" in text and "m-009" in text and "m-010" not in text
+
+
 def test_unknown_hosted_model_without_a_model_list():
     http = FakeHTTP([error(404, "model not found"), HTTPResponse(404, b"")])
     llm = OpenAICompatLLM("nope", base_url=HOSTED, transport=http, sleep=lambda s: None)
