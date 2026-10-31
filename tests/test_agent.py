@@ -15,6 +15,7 @@ import textwrap
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1362,10 +1363,43 @@ def test_truncated_reply_fails_the_file_without_a_nudge(repo):
         "the reply hit the output limit before the file was complete (at 16,000 reply tokens)"
     )
     assert [t["then"] for t in entry["truncations"]] == ["more_reply_tokens", "failed"]
+    # cut off with no way out on two attempts in a row: a third would be cut off the same
     assert (result.outcome, result.reason) == (
         "aborted",
-        "check_failed: no attempt's files passed the checks",
+        "output_limit: app.py's reply was cut off at the output limit on attempts 1 and 2 with "
+        "no smaller request left; raise --max-output-tokens (now 16,000) or use a model or "
+        "endpoint with a higher output limit",
     )
+
+
+def test_a_per_minute_limit_that_leaves_no_reply_room_stops_the_job_after_two_cutoffs(repo):
+    first = budget(APP_OLD)
+    cut = LLMResponse("```python\nimport openai\n", [], "max_tokens", USAGE, "fake-model", "")
+    llm = FakeLLM([too_large(3000, 2000 + first), *[cut] * 3])
+    result = wf(repo, llm, max_retries=3)
+    assert llm.script == [] and len(result.trajectory["attempts"]) == 2
+    assert result.outcome == "aborted"
+    assert result.reason == (
+        "output_limit: app.py's reply was cut off at the output limit on attempts 1 and 2 with "
+        "no smaller request left; the server's per-minute limit (3,000 tokens) leaves too few "
+        "reply tokens for this file: use an endpoint with a higher limit"
+    )
+
+
+def test_a_cutoff_streak_needs_consecutive_attempts():
+    ns = SimpleNamespace(
+        wf_cutoffs={},
+        wf_stop="",
+        wf_stop_code="",
+        token_limit=None,
+        config=SimpleNamespace(max_output_tokens=9),
+    )
+    cut, other = {"truncations": [{"then": "failed"}]}, {"truncations": []}
+    for number, entry in ((1, cut), (2, other), (3, cut)):
+        attempt = SimpleNamespace(number=number, responses=[{"max_tokens": 9}])
+        agent_module._Job._count_cutoffs(ns, attempt, "app.py", entry)
+        assert ns.wf_stop == ""
+    assert ns.wf_cutoffs == {"app.py": [3]}
 
 
 def test_check_failure_gets_one_retry_as_a_fresh_request(repo):
@@ -2822,8 +2856,13 @@ def test_the_same_check_error_on_three_attempts_stops_the_job(tmp_path, file_edi
     )
     # none of the three reached verification: all of max_retries + 1 = 5 are left (within
     # 10 in all)
-    assert result.reason.endswith("...); stopped with 5 attempt(s) left")
+    assert result.reason.endswith("uses it:); stopped with 5 attempt(s) left")
     assert f"- Outcome: {result.reason}" in result.report_markdown
+    # the error that decides it is shown whole, in the outcome and in each attempt's line
+    error = " ".join(attempts[0]["nudges"][0]["error"].splitlines()[0].split())
+    assert "..." not in error
+    assert error in result.report_markdown.split("- Attempt 1 ", 1)[1].split("\n", 1)[0]
+    assert result.reason.split("(", 1)[1].split("); stopped")[0] in error
     # each failure named the module the test reaches, with its target
     first = attempts[0]["nudges"][0]
     assert first["file"] == "tests/test_context.py"

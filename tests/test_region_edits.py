@@ -7,6 +7,7 @@ from __future__ import annotations
 import pytest
 
 from apifix import cli
+from apifix.engine.agent import NO_REGION_ERROR
 from tests.test_agent import (
     APP_NEW,
     GOOD,
@@ -189,6 +190,24 @@ def test_whole_file_returned_to_a_region_request_is_accepted(big):
     assert result.outcome == "verified"
     entry = files_of(result)[1]
     assert entry["replies"][0]["parse"] == "whole" and entry["accepted"]
+
+
+def test_a_one_region_request_does_not_carry_another_regions_errors(big):
+    # attempt 1 fails on R2 only; attempt 2 sends every region again, split into one group per
+    # region: R1's request must not repeat R2's error text (it was 25% of such a request)
+    bad = R2_NEW.replace("def test_strips", "def test_strips_renamed")
+    first = [regions(("R1", R1_NEW), ("R2", bad)), regions(("R2", bad))]
+    second = [too_large(600, 100_000), regions(("R1", R1_NEW)), *[regions(("R2", bad))] * 5]
+    llm = FakeLLM([block(APP_NEW), *first, *second])
+    wf(big, llm, max_retries=0)
+    texts = request_texts(llm)
+    group_of_r1 = [t for t in texts[3:] if "Region R1:" in t and "Region R2:" not in t]
+    assert group_of_r1, "attempt 2 sent R1 on its own"
+    for text in group_of_r1:
+        reason = text.split("Your previous version of R1 ", 1)[1].split(" Its changes", 1)[0]
+        assert "test_strips" not in reason
+    # the first of them, sent before any of its own regions failed: nothing concerned it
+    assert f"was rejected: {NO_REGION_ERROR}." in group_of_r1[0]
 
 
 def test_later_attempt_resends_every_region_with_its_previous_version(big):

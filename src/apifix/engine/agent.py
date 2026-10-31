@@ -184,10 +184,14 @@ REGION_REQUEST_OVERHEAD_CHARS = 1_500
 # attempts is told so in its next request; on REPEATED_ERROR_STOP_AT, the job stops
 REPEATED_ERROR_NOTE_AT = 2
 REPEATED_ERROR_STOP_AT = 3
+NO_REGION_ERROR = (
+    "no check error concerned these regions (the errors were in other regions, which are not "
+    "sent in this request)"
+)
+REPEATED_CUTOFF_STOP_AT = 2  # attempts in a row a file's reply is cut off with no way out
 # whole-file mode: attempts that end check_failed do not count against max_retries + 1; the job
 # makes at most this many times max_retries + 1 attempts in all
 MAX_ATTEMPTS_FACTOR = 2
-REPEATED_KEY_CHARS = 160  # of the error in the stop reason
 
 
 def token_limit_margin(limit: int) -> int:
@@ -474,6 +478,8 @@ class _Job:
         self.wf_accepted: set[str] = set()
         self.wf_accepted_in: dict[str, int] = {}  # the attempt that last accepted each file
         self.wf_stop = ""
+        self.wf_stop_code = "repeated_check_error"
+        self.wf_cutoffs: dict[str, list[int]] = {}  # attempts a file was cut off with no way out
         self.known_imports = import_table(STDLIB_IMPORTS, migration.known_imports)
         # Variables the repo's CI sets that the sandbox's test phase gets placeholders for
         # (name -> workflow file), in the baseline and in every verification.
@@ -533,6 +539,9 @@ class _Job:
         self.wf_form: dict[str, tuple[str, str]] = {}
         self.wf_region_texts: dict[str, dict[str, str]] = {}
         self.wf_region_previous: dict[str, dict[str, str] | None] = {}
+        # the errors of that failed reply and the regions each concerns (a retry sends back
+        # only its own regions' errors)
+        self.wf_region_errors: dict[str, list[tuple[str, list[str]]]] = {}
         if self.whole_file:
             checker = getattr(migration, "rewrite_checker", None)
             self.rewrite_checks = checker(repo, findings) if callable(checker) else None
@@ -890,15 +899,18 @@ class _Job:
                 if path.endswith(".py") and not is_test_file(path, root=self.repo):
                     aside.append(path)
                 self._count_repeats(attempt.number, path, entry)
+                self._count_cutoffs(attempt, path, entry)
                 if self.wf_stop:
                     break  # the job stops: the files after this one are not sent
                 continue
             self.wf_accepted_in[path] = attempt.number
             self.wf_streaks.pop(path, None)
             self.wf_region_previous.pop(path, None)
+            self.wf_region_errors.pop(path, None)
         self.wf_pending = again
         self.wf_previous = previous
         self.wf_region_previous = {p: t for p, t in self.wf_region_previous.items() if p in again}
+        self.wf_region_errors = {p: e for p, e in self.wf_region_errors.items() if p in again}
         return not failed
 
     def _blocked_by(self, path: str, aside: Sequence[str]) -> str | None:
@@ -928,14 +940,42 @@ class _Job:
             return
         for (check, key), numbers in streaks.items():
             if len(numbers) >= REPEATED_ERROR_STOP_AT:
-                shown = key if len(key) <= REPEATED_KEY_CHARS else key[:REPEATED_KEY_CHARS] + "..."
                 left = self._attempts_left(number)
                 self.wf_stop = (
                     f"{path} failed the {check} check with the same error on attempts "
-                    f"{attempts_text(numbers)} ({shown})"
+                    f"{attempts_text(numbers)} ({key})"
                     + (f"; stopped with {left} attempt(s) left" if left else "")
                 )
                 return
+
+    def _count_cutoffs(self, attempt: Attempt, path: str, entry: dict[str, Any]) -> None:
+        """After `path` failed in `attempt`: extend its streak of attempts whose reply was cut
+        off at the output limit with no smaller request left (drop it for any other failure),
+        and stop the job on REPEATED_CUTOFF_STOP_AT attempts in a row: asking again at the same
+        limit gets the same cut-off."""
+        cut = (entry.get("truncations") or [{}])[-1].get("then") == "failed"
+        numbers = self.wf_cutoffs.get(path, []) if cut else []
+        if cut:
+            numbers = [n for n in numbers if n == attempt.number - 1] + [attempt.number]
+        self.wf_cutoffs[path] = numbers
+        if len(numbers) < REPEATED_CUTOFF_STOP_AT or self.wf_stop:
+            return
+        last = attempt.responses[-1]
+        if self.token_limit is not None and last["max_tokens"] < self.config.max_output_tokens:
+            advice = (
+                f"the server's per-minute limit ({self.token_limit:,} tokens) leaves too few "
+                "reply tokens for this file: use an endpoint with a higher limit"
+            )
+        else:
+            advice = (
+                f"raise --max-output-tokens (now {self.config.max_output_tokens:,}) or use a "
+                "model or endpoint with a higher output limit"
+            )
+        self.wf_stop_code = "output_limit"
+        self.wf_stop = (
+            f"{path}'s reply was cut off at the output limit on attempts "
+            f"{attempts_text(numbers)} with no smaller request left; {advice}"
+        )
 
     def _max_attempts(self) -> int:
         """Attempts in all: max_retries + 1 that count, and in whole-file mode check_failed
@@ -978,6 +1018,7 @@ class _Job:
         self.wf_region_previous = {
             p: self.wf_region_texts[p] for p in self.wf_pending if p in self.wf_region_texts
         }
+        self.wf_region_errors = {}  # the verifier's feedback names no regions' check errors
         for p in self.wf_pending:
             if p in self.wf_plans and self._form(p)[0] == "regions":
                 self._add_feedback_regions(p, v)
@@ -1645,6 +1686,7 @@ class _Job:
                 if outcome.error:
                     entry["error"] = outcome.error
                     self.wf_region_previous[path] = outcome.rejected
+                    self.wf_region_errors[path] = outcome.attributed
                     return entry, outcome.candidate
                 texts = outcome.texts
                 if number == len(batches):
@@ -1671,6 +1713,12 @@ class _Job:
         repeated = _repeated_text(self._repeated(path))
         if texts is None and text is not None:  # the last version was a whole file
             return previous_version_note(path, original, text, reason, repeated=repeated)
+        attributed = self.wf_region_errors.get(path)
+        if texts is not None and attributed:
+            # only the errors of these regions (and those naming none): another region's
+            # errors are no use to a request that does not send it
+            own = [e for e, where in attributed if not where or set(where) & set(ids)]
+            reason = join_errors(own) if own else NO_REGION_ERROR
         return region_previous_note(path, original, plan, texts, ids, reason, repeated=repeated)
 
     def _region_batch(
@@ -1777,8 +1825,13 @@ class _Job:
             """One _Send per group of `send`'s regions, each with its own regions' errors."""
             out = []
             for group in groups:
-                errors = [e for e, where in send.attributed if set(where) & set(group)]
-                error = join_errors(errors) if errors and send.rejected is not None else send.error
+                # its own regions' errors, and those that name no region; never another
+                # group's (a one-region request once carried 7,000 characters of them)
+                errors = [e for e, where in send.attributed if not where or set(where) & set(group)]
+                if send.rejected is None or not send.attributed:
+                    error = send.error
+                else:
+                    error = join_errors(errors) if errors else NO_REGION_ERROR
                 out.append(dataclasses.replace(send, ids=group, error=error))
             return out or [send]
 
@@ -1958,7 +2011,12 @@ class _Job:
             keep_fixed = [k for k in history if k not in current]
             history += [k for k in dict.fromkeys(map(error_key, shown)) if k not in history]
             if send.retries >= self.config.max_check_retries_per_file:
-                return _BatchOutcome(error=error, candidate=applied.text or None, rejected=rejected)
+                return _BatchOutcome(
+                    error=error,
+                    candidate=applied.text or None,
+                    rejected=rejected,
+                    attributed=attributed,
+                )
             again = self._repeated(path, list(current))
             base = dict(applied.texts)
             for i in affected:
@@ -2284,7 +2342,7 @@ class _Job:
         best = self.best_attempt()
         if best is None:
             if self.wf_stop:
-                return "aborted", f"repeated_check_error: {self.wf_stop}"
+                return "aborted", f"{self.wf_stop_code}: {self.wf_stop}"
             if self.whole_file:
                 return "aborted", "check_failed: no attempt's files passed the checks"
             return "aborted", "no_changes: the model made no edits in any attempt"
@@ -2459,6 +2517,11 @@ def revert_text(r: dict[str, Any]) -> str:
         if not r["old"]:
             return "blank lines removed outside the migration, put back"
         return f'text removed outside the migration: "{r["old"]}" put back'
+    if r["old"] == r["new"]:  # only whitespace differed (the excerpt is the same either way)
+        what = f'the line "{r["new"]}"' if r["new"] else "a blank line"
+        return f"whitespace changed on {what} outside the migration, restored to the original"
+    if not r["new"]:
+        return f'text changed outside the migration: a blank line restored to "{r["old"]}"'
     return f'text changed outside the migration: "{r["new"]}" restored to the original'
 
 
@@ -2697,6 +2760,7 @@ class _BatchOutcome:
     error: str = ""
     candidate: str | None = None
     rejected: dict[str, str] | None = None
+    attributed: list[tuple[str, list[str]]] = field(default_factory=list)
 
 
 def _failed_checks(errors: Sequence[str], checks: Sequence[str]) -> list[list[str]]:
@@ -2806,6 +2870,16 @@ def _upgraded_lines(job: _Job) -> list[str]:
 def _one_line(text: str, limit: int = 300) -> str:
     flat = " ".join(line.strip().removeprefix("- ") for line in text.splitlines() if line.strip())
     return flat if len(flat) <= limit else flat[: limit - 3] + "..."
+
+
+def _errors_line(text: str) -> str:
+    """A file's check errors (`join_errors` form) for the report, each one whole: the first
+    line of every bullet (the lines after it are an example), so that a long list does not
+    hide the error that decided a stop."""
+    lines = text.splitlines()
+    if sum(line.startswith("- ") for line in lines) > 1:
+        return "; ".join(line[2:].strip() for line in lines if line.startswith("- "))
+    return " ".join(lines[0].split()) if lines else text
 
 
 def _install_retries(job: _Job) -> list[str]:
@@ -2981,7 +3055,7 @@ def report_markdown(
             if a.files:
                 files = ", ".join(
                     f"`{f['path']}` "
-                    + ("ok" if f["accepted"] else f"failed: {_one_line(f['error'])}")
+                    + ("ok" if f["accepted"] else f"failed: {_errors_line(f['error'])}")
                     + (
                         f" (kept its attempt {f['fell_back_to']} version)"
                         if "fell_back_to" in f
