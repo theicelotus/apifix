@@ -108,6 +108,77 @@ def _assignments(tree: ast.Module) -> dict[str, list[ast.expr]]:
     return out
 
 
+def _env_read(node: ast.AST) -> str | None:
+    """The environment variable a node reads (`os.getenv("X")`, `os.environ.get("X")`,
+    `os.environ["X"]`), or None."""
+    if isinstance(node, ast.Call) and node.args:
+        func, arg = node.func, node.args[0]
+        reads = isinstance(func, ast.Attribute) and (
+            func.attr == "getenv" or (func.attr == "get" and _name(func.value) == "environ")
+        )
+        if reads and isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            return arg.value
+    if (
+        isinstance(node, ast.Subscript)
+        and _name(node.value) == "environ"
+        and isinstance(node.slice, ast.Constant)
+        and isinstance(node.slice.value, str)
+    ):
+        return node.slice.value
+    return None
+
+
+def _env_reads(
+    value: ast.expr, assigned: dict[str, list[ast.expr]], seen: set[str]
+) -> dict[str, ast.AST]:
+    """Environment variables `value` reads (following local names), each with its read."""
+    out: dict[str, ast.AST] = {}
+    for node in ast.walk(value):
+        if (env := _env_read(node)) is not None:
+            out.setdefault(env, node)
+        elif isinstance(node, ast.Name) and node.id not in seen:
+            seen.add(node.id)
+            for v in assigned.get(node.id, []):
+                for env, read in _env_reads(v, assigned, seen).items():
+                    out.setdefault(env, read)
+    return out
+
+
+def _leaves(
+    value: ast.expr, assigned: dict[str, list[ast.expr]], seen: set[str], keep: str
+) -> list[ast.expr]:
+    """The values `value` can take, in the order they are tried: the operands of `or`, the two
+    arms of a conditional (not its test), the values a local name was assigned (except the
+    expression `keep`, an `ast.dump`, which stays whole)."""
+    if isinstance(value, ast.BoolOp):
+        return [leaf for v in value.values for leaf in _leaves(v, assigned, seen, keep)]
+    if isinstance(value, ast.IfExp):
+        return _leaves(value.body, assigned, seen, keep) + _leaves(
+            value.orelse, assigned, seen, keep
+        )
+    if (
+        isinstance(value, ast.Name)
+        and value.id not in seen
+        and assigned.get(value.id)
+        and ast.dump(value) != keep
+    ):
+        seen.add(value.id)
+        return [leaf for v in assigned[value.id] for leaf in _leaves(v, assigned, seen, keep)]
+    return [value]
+
+
+def _key_source_error(
+    line: int, text: str, original_reads: dict[str, ast.AST], added: list[str], source: str
+) -> str:
+    read = _source(next(iter(original_reads.values())), source)
+    names = ", ".join(added)
+    return (
+        f"original line {line}: the original reads the key from `{read}`; keep that exactly, "
+        f"don't add {names} (a different or earlier variable can win over the original). Pass "
+        f"the same value to `genai.Client(api_key={text})`"
+    )
+
+
 def _key_errors(original: str, candidate: str) -> list[str]:
     old = _parse(original)
     new = _parse(candidate)
@@ -115,24 +186,51 @@ def _key_errors(original: str, candidate: str) -> list[str]:
         return []
     errors = []
     assigned = _assignments(new)
+    old_assigned = _assignments(old)
     for call in _calls(old, "configure"):
         key = _kwarg(call, "api_key")
         if key is None:
             continue  # implicit (reads the environment); not enforced here
         expr = ast.dump(key)
-        clients = _calls(new, "Client")
-        if any(
-            _carries(v, expr, assigned, set())
-            for c in clients
-            if (v := _kwarg(c, "api_key")) is not None
-        ):
-            continue
         text = _source(key, original)
-        errors.append(
-            f"original line {call.lineno}: `configure(api_key={text}, ...)`'s key does not "
-            f"reach a `genai.Client(api_key={text})` in the rewrite: never drop a key value "
-            "(the new client raises with no key and none set in the environment)"
-        )
+        original_reads = _env_reads(key, old_assigned, set())
+        values = [v for c in _calls(new, "Client") if (v := _kwarg(c, "api_key")) is not None]
+        carriers = [v for v in values if _carries(v, expr, assigned, set())]
+        if not carriers:
+            added = sorted(
+                {e for v in values for e in _env_reads(v, assigned, set())} - set(original_reads)
+            )
+            if original_reads and added:
+                errors.append(_key_source_error(call.lineno, text, original_reads, added, original))
+                continue
+            errors.append(
+                f"original line {call.lineno}: `configure(api_key={text}, ...)`'s key does not "
+                f"reach a `genai.Client(api_key={text})` in the rewrite: never drop a key value "
+                "(the new client raises with no key and none set in the environment)"
+            )
+            continue
+        # `original or fallback` keeps the original winning; a fallback tried first does not
+        for v in carriers:
+            leaves = _leaves(v, assigned, set(), expr)
+            first = next(
+                (i for i, leaf in enumerate(leaves) if _carries(leaf, expr, assigned, set())),
+                None,
+            )
+            before = {
+                e
+                for leaf in leaves[: first or 0]
+                for e in _env_reads(leaf, assigned, set())
+                if e not in original_reads
+            }
+            if before:
+                errors.append(
+                    _key_source_error(call.lineno, text, original_reads, sorted(before), original)
+                    if original_reads
+                    else f"original line {call.lineno}: the rewrite tries "
+                    f"{', '.join(sorted(before))} before the original key `{text}`, so it can win "
+                    f"over it; keep the original first: `{text} or <fallback>`"
+                )
+                break
     return errors
 
 

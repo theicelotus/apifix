@@ -114,3 +114,23 @@ def test_sandbox_extra_adds_and_excludes_sandbox_requirements(capsys, tmp_path):
             ["verify", str(tmp_path), "--migration", "openai-v1", "--diff", "x"]
             + ["--sandbox-extra", str(extra), "--sandbox-requirements", str(extra)]
         )
+
+
+def _limit_args(**flags):
+    import argparse
+
+    base = dict(max_file_bytes=None, max_output_tokens=None, file_edits=None, region_threshold=None)
+    return argparse.Namespace(**{**base, **flags})
+
+
+def test_max_file_bytes_also_sets_the_region_threshold():
+    from apifix.cli import _agent_limits
+
+    assert _agent_limits(_limit_args()) == {}
+    assert _agent_limits(_limit_args(max_file_bytes=80_000)) == {
+        "whole_file_max_bytes": 80_000,
+        "region_threshold_bytes": 80_000,
+    }
+    both = _agent_limits(_limit_args(max_file_bytes=80_000, region_threshold=10_000))
+    assert both["region_threshold_bytes"] == 10_000
+    assert _agent_limits(_limit_args(region_threshold=5_000)) == {"region_threshold_bytes": 5_000}

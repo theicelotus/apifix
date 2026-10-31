@@ -30,7 +30,8 @@ def test_client_part_is_always_included():
 
 
 def test_every_guide_part_has_a_selector_or_is_always_sent():
-    selected = set(guide_parts.rules.GUIDE_SELECTORS) | guide_parts.rules.GUIDE_ALWAYS
+    rules = guide_parts.rules
+    selected = set(rules.GUIDE_SELECTORS) | rules.GUIDE_ALWAYS | rules.GUIDE_FOR_CONFIGURE
     all_parts = {part for part, _ in guide_parts.PARTS if part}
     assert all_parts <= selected | {"tests"}  # tests: selected by file content, not a category
 

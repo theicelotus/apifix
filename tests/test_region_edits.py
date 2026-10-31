@@ -113,7 +113,8 @@ def test_a_large_test_file_is_sent_as_regions_and_spliced_back(big):
     assert len(entry["batches"]) == 1 and entry["batches"][0]["ids"] == ["R1", "R2"]
     assert entry["bytes_sent"] < len(TESTS_BIG) // 3
     assert (
-        f"- Region edits: `tests/test_app.py` ({len(TESTS_BIG):,} bytes, over 8,000): "
+        f"- Region edits: `tests/test_app.py` ({len(TESTS_BIG):,} bytes, "
+        "over the --region-threshold of 8,000): "
         "R1 test_ask (lines 6-9), R2 test_strips (lines 12-15)" in result.report_markdown
     )
 

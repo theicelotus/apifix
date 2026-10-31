@@ -110,7 +110,8 @@ def main(argv: list[str] | None = None) -> int:
         "--max-file-bytes",
         type=int,
         help="whole-file: byte budget for one file plus its read-only context; larger files "
-        "are not sent (default 24000)",
+        "are not sent whole. Also raises --region-threshold to this value unless that is "
+        "given (default 24000)",
     )
     p_fix.add_argument(
         "--file-edits",
@@ -124,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         metavar="BYTES",
         help="whole-file, --file-edits auto: Python files over this size are sent as regions "
-        "(default 8000)",
+        "(default 8000, or --max-file-bytes when that is given)",
     )
     p_fix.add_argument(
         "--strict-tool-calls",
@@ -234,6 +235,24 @@ def main(argv: list[str] | None = None) -> int:
 
     print(_to_json(result) if args.json else _to_text(result))
     return EXIT_FINDINGS if result.findings else EXIT_CLEAN
+
+
+def _agent_limits(args: argparse.Namespace) -> dict[str, object]:
+    """AgentConfig limits the flags set. --max-file-bytes also moves the region threshold
+    (the size above which auto mode sends regions) unless --region-threshold is given."""
+    threshold = args.region_threshold
+    if threshold is None:
+        threshold = args.max_file_bytes
+    return {
+        key: value
+        for key, value in (
+            ("whole_file_max_bytes", args.max_file_bytes),
+            ("max_output_tokens", args.max_output_tokens),
+            ("file_edits", args.file_edits),
+            ("region_threshold_bytes", threshold),
+        )
+        if value is not None
+    }
 
 
 def _sandbox(args: argparse.Namespace):
@@ -363,16 +382,7 @@ def _fix(args: argparse.Namespace) -> int:
         if notice:
             print(notice, file=sys.stderr)
         max_cost = None if args.no_cost_limit else args.max_cost
-        limits = {
-            key: value
-            for key, value in (
-                ("whole_file_max_bytes", args.max_file_bytes),
-                ("max_output_tokens", args.max_output_tokens),
-                ("file_edits", args.file_edits),
-                ("region_threshold_bytes", args.region_threshold),
-            )
-            if value is not None
-        }
+        limits = _agent_limits(args)
         config = AgentConfig(
             max_cost_usd=max_cost,
             max_retries=args.max_retries,

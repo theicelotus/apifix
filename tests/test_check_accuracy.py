@@ -161,3 +161,87 @@ def test_revert_text_names_the_line_or_a_blank_line():
     assert revert_text({**base, "old": "x = 1", "new": "x = 2"}) == (
         'text changed outside the migration: "x = 2" restored to the original'
     )
+
+
+# --- the key keeps its source ----------------------------------------------------------------
+
+ENV_ORIGINAL = """\
+import os
+import google.generativeai as genai
+
+
+def build():
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    genai.configure(api_key=api_key)
+"""
+
+
+def env_errors(candidate: str) -> list[str]:
+    return MIGRATION.rewrite_checker(Path("."), [])("app.py", ENV_ORIGINAL, candidate)["key"]
+
+
+def env_candidate(body: str) -> str:
+    return "import os\nfrom google import genai\n\n\ndef build():\n" + body
+
+
+def test_a_changed_key_source_is_named_plainly():
+    errors = env_errors(
+        env_candidate(
+            '    client_api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")\n'
+            "    return genai.Client(api_key=client_api_key)\n"
+        )
+    )
+    assert len(errors) == 1
+    assert 'reads the key from `os.environ.get("GOOGLE_API_KEY")`' in errors[0]
+    assert "keep that exactly, don't add GEMINI_API_KEY" in errors[0]
+
+
+def test_a_fallback_tried_before_the_original_is_rejected():
+    errors = env_errors(
+        env_candidate(
+            '    api_key = os.environ.get("GOOGLE_API_KEY")\n'
+            '    return genai.Client(api_key=os.getenv("GEMINI_API_KEY") or api_key)\n'
+        )
+    )
+    assert len(errors) == 1 and "don't add GEMINI_API_KEY" in errors[0]
+
+
+def test_the_original_key_followed_by_a_fallback_is_accepted():
+    assert (
+        env_errors(
+            env_candidate(
+                '    api_key = os.environ.get("GOOGLE_API_KEY")\n'
+                '    return genai.Client(api_key=api_key or os.getenv("GEMINI_API_KEY"))\n'
+            )
+        )
+        == []
+    )
+
+
+def test_the_key_read_unchanged_is_accepted():
+    assert (
+        env_errors(
+            env_candidate(
+                '    api_key = os.environ.get("GOOGLE_API_KEY")\n'
+                "    return genai.Client(api_key=api_key)\n"
+            )
+        )
+        == []
+    )
+
+
+def test_an_attribute_key_with_an_env_fallback_after_it_is_still_accepted():
+    body = (
+        "        self._client = genai.Client(\n"
+        '            api_key=self._api_key or os.getenv("GEMINI_API_KEY")\n        )\n'
+    )
+    assert key_errors(init(body)) == []
+
+
+def test_an_env_fallback_before_an_attribute_key_is_rejected():
+    body = (
+        "        self._client = genai.Client(\n"
+        '            api_key=os.getenv("GEMINI_API_KEY") or self._api_key\n        )\n'
+    )
+    errors = key_errors(init(body))
+    assert len(errors) == 1 and "GEMINI_API_KEY" in errors[0] and "first" in errors[0]

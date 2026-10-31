@@ -139,3 +139,54 @@ def test_a_rewrite_that_keeps_the_import_still_has_the_finding(tmp_path):
     assert [(f.category, f.confidence) for f in found] == [("import", "certain")]
     moved = "from google.genai import errors\n\n\ndef test_x():\n    assert errors.APIError\n"
     assert scan_text(path, moved, get_migration("google-genai"), others=others, root=repo) == []
+
+
+# --- key rules in the guide go only with the configure() they are about ----------------------
+
+
+def _configure(old: str):
+    from apifix.engine.models import Finding
+
+    return Finding(
+        file="app.py",
+        line=1,
+        col=1,
+        end_line=1,
+        end_col=1,
+        category="client_config",
+        old_pattern=old,
+        suggestion="Use genai.Client(api_key=...)",
+        confidence="certain",
+    )
+
+
+def _guide(*olds: str) -> str:
+    from apifix.engine.migrations.google_genai.guide_parts import job_guide
+
+    return job_guide([_configure(o) for o in olds])[0]
+
+
+def test_own_key_gets_the_keep_it_rule_and_not_the_precedence_swap():
+    text = _guide('genai.configure(api_key=os.environ.get("GOOGLE_API_KEY"))')
+    assert "keep how the repo reads it exactly as written" in text.replace("\n", " ")
+    assert "Do not add `GEMINI_API_KEY`" in text.replace("\n", " ")
+    assert "the old SDK read `GEMINI_API_KEY` first" not in text.replace("\n", " ")
+
+
+def test_keyless_configure_gets_the_precedence_swap_only():
+    text = _guide("genai.configure()").replace("\n", " ")
+    assert "the old SDK read `GEMINI_API_KEY` first" in text
+    assert "Do not add `GEMINI_API_KEY`" not in text
+
+
+def test_both_kinds_of_configure_get_both_rules():
+    text = _guide("genai.configure()", "genai.configure(api_key=k)").replace("\n", " ")
+    assert "the old SDK read `GEMINI_API_KEY` first" in text
+    assert "Do not add `GEMINI_API_KEY`" in text
+
+
+def test_no_configure_finding_sends_neither_key_rule():
+    from apifix.engine.migrations.google_genai.guide_parts import job_guide
+
+    text = job_guide([])[0].replace("\n", " ")
+    assert "the old SDK read" not in text and "Do not add `GEMINI_API_KEY`" not in text

@@ -2943,9 +2943,9 @@ def region_edit_lines(job: _Job) -> list[str]:
             original = job._read(job.repo, path)
             size = len(original.encode("utf-8"))
             why = {
-                "size": f"over the {config.whole_file_max_bytes:,}-byte size limit"
+                "size": f"over the --max-file-bytes limit of {config.whole_file_max_bytes:,}"
                 if size > config.whole_file_max_bytes
-                else f"over {config.region_threshold_bytes:,}",
+                else f"over the --region-threshold of {config.region_threshold_bytes:,}",
                 "refused": "the server refused it as a whole file",
                 "truncated": "its whole-file reply was cut off at the output limit",
                 "forced": "--file-edits regions",

@@ -283,6 +283,8 @@ COMPANION_PINS: dict[str, CompanionPin] = {}
 GUIDE_ALWAYS = frozenset({"client"})
 GUIDE_FOR_TEST_FILES = frozenset({"tests"})
 GUIDE_PER_FILE = frozenset({"streaming"})
+# chosen by whether a configure() finding passes api_key (guide_parts._configure_key)
+GUIDE_FOR_CONFIGURE = frozenset({"client.key.own", "client.key.env"})
 GUIDE_SELECTORS: dict[str, tuple[tuple[frozenset[str], tuple[str, ...]], ...]] = {
     "client.async": ((frozenset(), ("_async", "await", "aio")),),
     "models": ((frozenset({"api_call"}), ("GenerativeModel", "generate_content", "count_tokens")),),

@@ -25,14 +25,24 @@ depend on that. Where the new SDK has no equivalent object, return the least dif
 use) rather than changing what callers receive; when a signature or return shape must change,
 update every caller you were given and say so in the summary.
 
-Never drop a key value. If the old code called `configure()` with an explicit key
-(`configure(api_key=my_key)`), pass that same expression to `Client(api_key=my_key)`. If the old
-code called `configure()` with no key at all, relying on the environment, `genai.Client()` reads
-the environment itself too — but the two SDKs disagree on which variable wins when both are set:
-the old SDK read `GEMINI_API_KEY` first, falling back to `GOOGLE_API_KEY`; the new SDK's default
+Never drop a key value: whatever key the old code gave `configure()` must reach the new client.
+
+<!-- part: client.key.own -->
+When `configure(api_key=X)` gets the repo's own key, pass that same expression to
+`genai.Client(api_key=X)` and keep how the repo reads it exactly as written: the same variable
+names, the same order, the same fallbacks. If the repo reads `os.environ.get("GOOGLE_API_KEY")`,
+the rewrite reads that and only that. Do not add `GEMINI_API_KEY` or any other fallback, and do
+not rebuild the key expression.
+
+<!-- part: client.key.env -->
+When `configure()` is called with no key, relying on the environment, `genai.Client()` reads the
+environment itself too — but the two SDKs disagree on which variable wins when both are set: the
+old SDK read `GEMINI_API_KEY` first, falling back to `GOOGLE_API_KEY`; the new SDK's default
 prefers `GOOGLE_API_KEY`. If the old code (or its surrounding deployment) could plausibly have
 both set, keep the old precedence explicitly:
 `genai.Client(api_key=os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))`.
+This applies only to a `configure()` with no `api_key`; code that reads its own key keeps that
+code unchanged.
 
 <!-- part: client.async -->
 ## Async

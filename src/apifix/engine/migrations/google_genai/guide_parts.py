@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -22,6 +23,23 @@ def _matches(finding: Finding, selector: tuple[frozenset[str], tuple[str, ...]])
     return not keywords or any(k in text for k in keywords)
 
 
+def _configure_key(finding: Finding) -> bool | None:
+    """For a `configure()` finding: does the call pass `api_key`? None for any other finding."""
+    if finding.category != "client_config" or "configure" not in finding.old_pattern:
+        return None
+    try:
+        tree = ast.parse(finding.old_pattern.strip())
+    except SyntaxError:
+        return "api_key" in finding.old_pattern
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+    configure = [
+        c for c in calls if getattr(c.func, "attr", getattr(c.func, "id", None)) == "configure"
+    ]
+    if not configure:
+        return None
+    return any(k.arg == "api_key" for c in configure for k in c.keywords)
+
+
 def selected_parts(
     findings: list[Finding], root: Path | None = None, shared: bool = False
 ) -> set[str]:
@@ -33,6 +51,12 @@ def selected_parts(
     for part, selectors in rules.GUIDE_SELECTORS.items():
         if any(_matches(f, s) for f in findings for s in selectors):
             keep.add(part)
+    # the key rules go only with a configure() they are about
+    keys = [k for f in findings if (k := _configure_key(f)) is not None]
+    if any(keys):
+        keep.add("client.key.own")  # in rules.GUIDE_FOR_CONFIGURE
+    if not all(keys) and keys:
+        keep.add("client.key.env")
     if shared:
         keep -= rules.GUIDE_PER_FILE
     return with_sections(keep)
