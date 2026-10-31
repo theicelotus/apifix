@@ -2365,6 +2365,7 @@ def test_sandbox_requirements_reach_the_report_and_trajectory(repo):
         "path": "/x/reqs.txt",
         "sha256": "ab" * 32,
         "lines": ["openai==0.28"],
+        "extra": False,
     }
     assert (
         "- Sandbox dependencies: from `/x/reqs.txt` (1 requirement(s), sha256 abababababab), "

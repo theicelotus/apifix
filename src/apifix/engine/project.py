@@ -15,7 +15,7 @@ import shlex
 import sys
 import tomllib
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
@@ -615,31 +615,54 @@ class SandboxRequirements:
     path: str
     sha256: str
     lines: tuple[str, ...]  # requirement and index-option lines, comments dropped
+    extra: bool = False  # --sandbox-extra: adds to the detected requirements, replaces nothing
+
+    @property
+    def flag(self) -> str:
+        return "--sandbox-extra" if self.extra else "--sandbox-requirements"
 
     @property
     def label(self) -> str:
-        return f"--sandbox-requirements {PurePosixPath(self.path).name}"
+        return f"{self.flag} {PurePosixPath(self.path).name}"
 
     @property
     def count(self) -> int:
         return sum(not line.startswith("-") for line in self.lines)
 
 
-def load_sandbox_requirements(path: str | Path) -> SandboxRequirements:
-    """Read and check a --sandbox-requirements file; ValueError says what is wrong."""
+def load_sandbox_requirements(path: str | Path, extra: bool = False) -> SandboxRequirements:
+    """Read and check a --sandbox-requirements (or, with `extra`, --sandbox-extra) file;
+    ValueError says what is wrong."""
+    flag = "--sandbox-extra" if extra else "--sandbox-requirements"
     p = Path(path)
     try:
         text = p.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
-        raise ValueError(f"cannot read --sandbox-requirements {path}: {exc}") from None
+        raise ValueError(f"cannot read {flag} {path}: {exc}") from None
     problem = sandbox_requirements_problem(text)
     if problem:
-        raise ValueError(f"--sandbox-requirements {path}: {problem}")
+        raise ValueError(f"{flag} {path}: {problem}")
     return SandboxRequirements(
         str(p.resolve()),
         hashlib.sha256(text.encode("utf-8")).hexdigest(),
         tuple(sandbox_requirement_lines(text)),
+        extra,
     )
+
+
+def missing_old_side(override: SandboxRequirements, migration: str) -> list[str]:
+    """The distribution the migration's old side needs (`source_package`, else `package`) when
+    a --sandbox-requirements file leaves it out: the original code then runs without its SDK.
+    Empty for --sandbox-extra (it adds to detection) and when the file lists it."""
+    if override.extra:
+        return []
+    from apifix.engine.migrations import get_migration
+
+    mig = get_migration(migration)
+    name = normalize_name(mig.source_package or mig.package)
+    if any(_req_name(line) == name for line in override.lines):
+        return []
+    return [mig.source_package or mig.package]
 
 
 _REQ_NAME_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(\[[^\]]*\])?\s*([^;@]*)")
@@ -1019,6 +1042,8 @@ def build_install_plan(
     when the fix did not change the library. Without `override`, `target` drops lockfile pins
     that hold the library back (see _filter_pins), and `python` (the sandbox's version) picks
     among a poetry.lock's versions of one package."""
+    if override is not None and override.extra:
+        return _extra_plan(repo, runner, override, original, target, python)
     if override is not None:
         return _override_plan(repo, runner, override, original, target)
     notes: list[str] = []
@@ -1118,6 +1143,46 @@ def _by_name(reqs: Iterable[str]) -> dict[str, list[str]]:
         if name := _req_name(req):
             out.setdefault(name, []).append(req)
     return out
+
+
+def _extra_plan(
+    repo: Path,
+    runner: Runner | None,
+    extra: SandboxRequirements,
+    original: Path | None,
+    target: LibraryTarget | None,
+    python: str | None,
+) -> InstallPlan:
+    """Detection as usual, plus the --sandbox-extra file's lines: a line replaces the detected
+    requirements of its name (in the fix too, unless the fix changed that name's declaration
+    against `original`); index options and other names are added."""
+    plan = build_install_plan(repo, runner, None, original, target, python)
+    changed: set[str] = set()
+    if original is not None:
+        new = _by_name(plan.requirements)
+        old = _by_name(build_install_plan(original, None, python=python).requirements)
+        changed = {n for n in set(new) | set(old) if new.get(n) != old.get(n)}
+    lines = [r for r in extra.lines if _req_name(r) not in changed]
+    skipped = [r for r in extra.lines if r not in lines]
+    upgraded: list[str] = []
+    if original is not None and target is not None:
+        lines, upgraded = _upgrade_library(lines, target, changed)
+    names = {n for r in lines if (n := _req_name(r))}
+    reqs = [r for r in plan.requirements if _req_name(r) not in names] + lines
+    declared = dict(plan.declared)
+    declared.update({n: (extra.label,) for n in names})
+    count = sum(not r.startswith("-") for r in extra.lines)
+    notes = [*plan.notes, f"{count} requirement(s) added from {extra.label}"]
+    notes += [f"{extra.label}: {r} not used (the fix changed that declaration)" for r in skipped]
+    return replace(
+        plan,
+        requirements=tuple(dict.fromkeys(reqs)),
+        sources=(*plan.sources, extra.label),
+        notes=tuple(notes),
+        declared=declared,
+        override=extra.label,
+        upgraded=tuple(upgraded),
+    )
 
 
 def _override_plan(

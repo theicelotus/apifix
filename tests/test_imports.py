@@ -203,7 +203,7 @@ def test_section_and_record():
         "",
         "Found by reading the code before any sandbox run. Information only: nothing was "
         "installed because of this list. To install them in the sandbox, list them in a "
-        "`--sandbox-requirements` file.",
+        "`--sandbox-extra` file (or `--sandbox-requirements`).",
         "",
         "- `nlpaug` (pip: `nlpaug`): src/a.py",
         "- `cv2` (pip: `opencv-python`): m0.py, m1.py, m2.py, m3.py, m4.py (+2 more)",

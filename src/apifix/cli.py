@@ -9,10 +9,11 @@ apifix fix <path> --migration openai-v1 --provider openai-compat --model M [--ba
     [--reasoning-effort low|medium|high]
 apifix verify <path> --migration openai-v1 --diff FILE [--out DIR]
                                  apply a saved diff to a copy and verify it (no LLM)
-apifix fix|verify ... --sandbox-requirements FILE
+apifix fix|verify ... --sandbox-requirements FILE | --sandbox-extra FILE
                                  install FILE in the sandbox instead of the repo's detected
                                  dependencies (original code and fix; the fix's own
-                                 dependency edits still apply)
+                                 dependency edits still apply); --sandbox-extra adds FILE's
+                                 lines to the detected ones instead
 apifix pr RUN_DIR --repo CHECKOUT
                                  dry run: a local branch with one commit holding a verified
                                  run's fix, plus pr-title.txt, pr-body.md and pr.json in RUN_DIR
@@ -164,7 +165,15 @@ def main(argv: list[str] | None = None) -> int:
             action="store_true",
             help="download every dependency again instead of using apifix's pip cache",
         )
-        p.add_argument(
+        group = p.add_mutually_exclusive_group()
+        group.add_argument(
+            "--sandbox-extra",
+            metavar="FILE",
+            help="requirements file whose lines are added to the detected dependencies "
+            "(original code and fix); a line replaces the detected requirements of its name. "
+            "Same file format as --sandbox-requirements",
+        )
+        group.add_argument(
             "--sandbox-requirements",
             metavar="FILE",
             help="requirements file installed in the sandbox instead of the repo's detected "
@@ -229,13 +238,23 @@ def main(argv: list[str] | None = None) -> int:
 
 def _sandbox(args: argparse.Namespace):
     """The sandbox for fix/verify; ValueError if --sandbox-requirements is unusable."""
-    from apifix.engine.project import load_sandbox_requirements
+    from apifix.engine.project import load_sandbox_requirements, missing_old_side
     from apifix.engine.sandbox import Sandbox, SandboxConfig, default_pip_cache_dir
 
     cache = None if args.no_pip_cache else default_pip_cache_dir()
-    override = (
-        load_sandbox_requirements(args.sandbox_requirements) if args.sandbox_requirements else None
-    )
+    override = None
+    if args.sandbox_requirements:
+        override = load_sandbox_requirements(args.sandbox_requirements)
+        for name in missing_old_side(override, args.migration):
+            print(
+                f"apifix: warning: --sandbox-requirements does not list {name}, which the "
+                f"original code needs ({args.migration}); the baseline run will not have it. "
+                "Add it, or use --sandbox-extra FILE to add to the detected dependencies "
+                "instead of replacing them",
+                file=sys.stderr,
+            )
+    elif getattr(args, "sandbox_extra", None):
+        override = load_sandbox_requirements(args.sandbox_extra, extra=True)
     return Sandbox(SandboxConfig(pip_cache_dir=cache, requirements_override=override))
 
 

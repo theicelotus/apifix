@@ -1773,3 +1773,57 @@ def test_missing_key_markers_come_from_the_migration():
     keyless = run(("m::a", "failed", "OpenAIError: The api_key client option must be set"))
     assert compare_runs(keyless, keyless, key_markers=openai).no_signal_external == ["m::a"]
     assert compare_runs(keyless, keyless).no_signal_preexisting == ["m::a"]
+
+
+# --- baseline environment rot -----------------------------------------------------------------
+
+ROT_ATTR = "AttributeError: module 'app' has no attribute 'llm'"
+ROT_IMPORT = "ImportError: cannot import name 'Part' from 'google.generativeai.types' (/x/y.py)"
+
+
+def rot_runs(baseline_msgs, fixed_msgs):
+    def make(msgs, **kw):
+        return run(
+            (T_ASK, "failed", msgs[0]),
+            (T_STRIP, "failed", msgs[1]),
+            ("tests.test_ok::test_fine", "passed"),
+            **kw,
+        )
+
+    return make(baseline_msgs), make(fixed_msgs, coverage=FULL_COVERAGE)
+
+
+def test_baseline_rot_is_named_in_why_this_verdict(trees):
+    original, fixed = trees({})
+    baseline, fixed_run = rot_runs((ROT_ATTR, ROT_IMPORT), (ROT_ATTR, ROT_IMPORT))
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(baseline, [fixed_run]))
+    r = reason(v, "baseline_import_rot")
+    assert r.severity == "weak" and v.verdict != "verified"
+    assert "could not be imported by the tests in either run" in r.message
+    assert "`app`" in r.message
+    assert f"`{ROT_IMPORT}`" in r.message
+    assert "pin it with --sandbox-extra" in r.message
+    assert r.tests == (T_ASK,)
+    assert "**baseline_import_rot**" in v.report_markdown()
+
+
+def test_baseline_rot_without_an_underlying_error_says_where_to_look(trees):
+    original, fixed = trees({})
+    baseline, fixed_run = rot_runs((ROT_ATTR, "AssertionError: x"), (ROT_ATTR, "AssertionError: x"))
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(baseline, [fixed_run]))
+    assert "not in the clipped test output" in reason(v, "baseline_import_rot").message
+
+
+def test_no_rot_when_the_fixed_run_imports_the_module(trees):
+    original, fixed = trees({})
+    baseline, _ = rot_runs((ROT_ATTR, ROT_IMPORT), (ROT_ATTR, ROT_IMPORT))
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(baseline, [PASSING]))
+    assert "baseline_import_rot" not in codes(v)
+
+
+def test_no_rot_for_a_module_without_changed_files(trees):
+    original, fixed = trees({})
+    other = "AttributeError: module 'unrelated' has no attribute 'llm'"
+    baseline, fixed_run = rot_runs((other, other), (other, other))
+    v = verify(original, fixed, "openai-v1", sandbox=FakeSandbox(baseline, [fixed_run]))
+    assert "baseline_import_rot" not in codes(v)

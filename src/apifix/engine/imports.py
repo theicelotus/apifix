@@ -219,7 +219,7 @@ def undeclared_section(items: list[UndeclaredImport]) -> list[str]:
         "",
         "Found by reading the code before any sandbox run. Information only: nothing was "
         "installed because of this list. To install them in the sandbox, list them in a "
-        "`--sandbox-requirements` file.",
+        "`--sandbox-extra` file (or `--sandbox-requirements`).",
         "",
     ]
     for item in items:

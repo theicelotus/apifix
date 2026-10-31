@@ -468,7 +468,7 @@ def sandbox_requirements_record(sandbox: Sandbox) -> dict[str, Any] | None:
     req = requirements_override(sandbox)
     if req is None:
         return None
-    return {"path": req.path, "sha256": req.sha256, "lines": list(req.lines)}
+    return {"path": req.path, "sha256": req.sha256, "lines": list(req.lines), "extra": req.extra}
 
 
 def upgraded_text(upgraded: str, override: str | None) -> str:
@@ -480,6 +480,10 @@ def upgraded_text(upgraded: str, override: str | None) -> str:
     )
 
 
+def _override_effect(extra: bool) -> str:
+    return "added to apifix's detection" if extra else "replacing apifix's detection"
+
+
 def sandbox_requirements_lines(sandbox: Sandbox) -> list[str]:
     """Report line for a --sandbox-requirements file, if one replaced dependency detection."""
     req = requirements_override(sandbox)
@@ -487,7 +491,7 @@ def sandbox_requirements_lines(sandbox: Sandbox) -> list[str]:
         return []
     return [
         f"- Sandbox dependencies: from `{req.path}` ({req.count} requirement(s), sha256 "
-        f"{req.sha256[:12]}), replacing apifix's detection for the original code and the fix"
+        f"{req.sha256[:12]}), {_override_effect(req.extra)} for the original code and the fix"
     ]
 
 
@@ -1326,6 +1330,92 @@ def environment_reasons(
     ]
 
 
+_ROT_ATTRIBUTE = re.compile(r"module '([\w.]+)' has no attribute '\w+'")
+_ROT_IMPORT = re.compile(r"(?:ImportError|ModuleNotFoundError):[^\n]*?(?:from|named) '([\w.]+)'")
+_IMPORT_ERROR_LINE = re.compile(r"(?:ModuleNotFoundError|ImportError): [^\n]+")
+MAX_ROT_TESTS = 3
+
+
+def _module_names(paths: Iterable[str]) -> set[str]:
+    """Dotted names of the changed Python files' modules and the packages around them, from
+    every layout (`src/pkg/mod.py` is `src.pkg.mod`, `pkg.mod`, `mod`; its packages `src`,
+    `src.pkg`, `pkg`)."""
+    names: set[str] = set()
+    for path in paths:
+        if not path.endswith(".py"):
+            continue
+        parts = path[:-3].split("/")
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        for i in range(len(parts)):
+            for j in range(i + 1, len(parts) + 1):
+                names.add(".".join(parts[i:j]))
+    return names
+
+
+def _rot_module(message: str, names: set[str]) -> str | None:
+    """The changed module or package a failure's message says could not be imported (or has no
+    attribute, the way `mock.patch("pkg.mod.x")` reports a module it failed to import)."""
+    for pattern in (_ROT_ATTRIBUTE, _ROT_IMPORT):
+        for m in pattern.finditer(message):
+            if m.group(1) in names:
+                return m.group(1)
+    return None
+
+
+def baseline_rot_reasons(
+    baseline: SandboxResult, fixed: SandboxResult, changes: Sequence[FileChange]
+) -> list[Reason]:
+    """Tests that fail in both runs because a module or package holding changed files could
+    not be imported (`module 'src' has no attribute 'llm'` from `patch("src.llm.x")`: the
+    import failed, so the package has no such submodule). The tests never ran the changed
+    code, before or after, so a pass here says nothing about the fix; the reason names the
+    underlying import error found in the original's output and suggests pinning the dependency."""
+    if not baseline_usable(baseline):
+        return []
+    names = _module_names(c.path for c in changes if c.kind != "deleted")
+    if not names:
+        return []
+    fixed_failing = {t.id: t for t in fixed.tests if t.outcome in ("failed", "error")}
+    rotten: dict[str, str] = {}  # test id -> the changed module its failure names
+    for t in baseline.tests:
+        other = fixed_failing.get(t.id)
+        if t.outcome not in ("failed", "error") or other is None:
+            continue
+        module = _rot_module(t.message, names)
+        if module and _rot_module(other.message, names):
+            rotten[t.id] = module
+    if not rotten:
+        return []
+    texts = [t.message for t in baseline.tests if t.outcome in ("failed", "error")]
+    if baseline.test is not None:
+        texts += [baseline.test.stdout, baseline.test.stderr]
+    errors = list(
+        dict.fromkeys(m.group(0) for text in texts for m in _IMPORT_ERROR_LINE.finditer(text))
+    )
+    elsewhere = [e for e in errors if not any(f"'{n}'" in e for n in names)]
+    shown = (elsewhere or errors or [None])[0]
+    modules = ", ".join(f"`{m}`" for m in sorted(set(rotten.values())))
+    cause = (
+        f"The underlying import error: `{shown}`."
+        if shown
+        else "The underlying import error is not in the clipped test output; import the "
+        "module by hand in the sandbox's environment to see it."
+    )
+    return [
+        Reason(
+            "baseline_import_rot",
+            "weak",
+            f"the changed code could not be imported by the tests in either run: "
+            f"{len(rotten)} test(s) fail in the original and the fixed run on {modules}. "
+            f"{cause} The environment has a dependency missing or at the wrong version, not the "
+            "fix: pin it with --sandbox-extra FILE (for `apifix verify` on the diff too), so "
+            "the tests run the changed code",
+            tuple(sorted(rotten))[:MAX_ROT_TESTS],
+        )
+    ]
+
+
 def test_files_of(test_ids: Iterable[str], root: Path) -> list[str]:
     """The test files of runtime test ids (`tests.test_x`, `tests.test_x::test_y`,
     `tests.test_x.TestA::test_b`): the longest dotted prefix that is a .py file under `root`,
@@ -1458,6 +1548,7 @@ def verify(
         + _suspicious_reasons(original, fixed, changes, mig)
         + smoke_reasons(fixed_run, baseline)
         + environment_reasons(baseline, original, key_markers)
+        + baseline_rot_reasons(baseline, fixed_run, changes)
         + _evidence_reasons(fixed_run, coverage, config)
     )
     reasons = library_held_back(reasons, mig.package)
@@ -1604,8 +1695,9 @@ def _report(v: Verification) -> str:
             out.append(f"**Import paths ({label} run):** {retried[0]}.")
     if v.fixed.requirements_override:
         line = (
-            f"**Dependencies:** from `{v.fixed.requirements_override}`, replacing apifix's "
-            "detection for the original code and the fix."
+            f"**Dependencies:** from `{v.fixed.requirements_override}`, "
+            f"{_override_effect(v.fixed.requirements_override.startswith('--sandbox-extra'))} "
+            "for the original code and the fix."
         )
         if v.fixed.override_replaced:
             line += " For the fix, its own dependency edits replaced: " + "; ".join(

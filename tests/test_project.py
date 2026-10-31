@@ -19,6 +19,7 @@ from apifix.engine.project import (
     detect_tests,
     is_test_file,
     load_sandbox_requirements,
+    missing_old_side,
     pytest_config,
 )
 
@@ -1289,3 +1290,57 @@ def test_llmflows_shaped_fixture():
     (d,) = plan.dropped_sources
     assert d.pins == (("six==1.16.0", "six==1.15.0"), ("tiktoken==0.5.1", "tiktoken==0.3.3"))
     assert d.kept == "requirements.txt"
+
+
+# --- --sandbox-extra: adds to detection --------------------------------------------------
+
+
+def extra_file(tmp_path, text):
+    path = tmp_path / "extra.txt"
+    path.write_text(text)
+    return load_sandbox_requirements(path, extra=True)
+
+
+def test_extra_label_and_flag(tmp_path):
+    extra = extra_file(tmp_path, "google-generativeai==0.8.3\n")
+    assert extra.extra and extra.flag == "--sandbox-extra"
+    assert extra.label == "--sandbox-extra extra.txt"
+    with pytest.raises(ValueError, match="cannot read --sandbox-extra"):
+        load_sandbox_requirements(tmp_path / "missing.txt", extra=True)
+
+
+def test_extra_adds_to_detected_requirements_and_replaces_same_name(tmp_path):
+    repo = write(tmp_path / "repo", {"requirements.txt": "flask==2.0\nrequests\n"})
+    extra = extra_file(tmp_path, "requests==2.31.0\ngoogle-generativeai==0.8.3\n")
+    plan = build_install_plan(repo, None, override=extra)
+    assert plan.requirements == (
+        "flask==2.0",
+        "requests==2.31.0",
+        "google-generativeai==0.8.3",
+    )
+    assert plan.override == "--sandbox-extra extra.txt"
+    assert plan.sources == ("requirements.txt", "--sandbox-extra extra.txt")
+    assert plan.declared["flask"] == ("requirements.txt",)
+    assert plan.declared["requests"] == ("--sandbox-extra extra.txt",)
+    assert any("2 requirement(s) added from --sandbox-extra extra.txt" in n for n in plan.notes)
+
+
+def test_extra_line_for_a_name_the_fix_changed_is_not_used(tmp_path):
+    original = write(tmp_path / "original", {"requirements.txt": "google-generativeai==0.7\n"})
+    fixed = write(tmp_path / "fixed", {"requirements.txt": "google-genai>=1.0\n"})
+    extra = extra_file(tmp_path, "google-generativeai==0.8.3\nrich\n")
+    plan = build_install_plan(fixed, None, override=extra, original=original)
+    assert plan.requirements == ("google-genai>=1.0", "rich")
+    assert any("google-generativeai==0.8.3 not used" in n for n in plan.notes)
+
+
+def test_requirements_file_without_the_old_side_is_flagged(tmp_path):
+    path = tmp_path / "reqs.txt"
+    path.write_text("pytest\nrequests\n")
+    req = load_sandbox_requirements(path)
+    assert missing_old_side(req, "google-genai") == ["google-generativeai"]
+    path.write_text("google_generativeai==0.8.3\n")
+    assert missing_old_side(load_sandbox_requirements(path), "google-genai") == []
+    path.write_text("pytest\n")
+    assert missing_old_side(load_sandbox_requirements(path), "openai-v1") == ["openai"]
+    assert missing_old_side(extra_file(tmp_path, "pytest\n"), "google-genai") == []

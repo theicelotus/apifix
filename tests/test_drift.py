@@ -1,0 +1,113 @@
+"""Behavior drift inside migrated lines: a dropped `from` clause, a replaced argument variable."""
+
+from __future__ import annotations
+
+import textwrap
+
+from apifix.engine.migrations import get_migration
+from apifix.engine.scanner import scan_text
+from apifix.engine.unrelated import unrelated_edits
+
+ORIGINAL = textwrap.dedent(
+    """\
+    import time
+
+    import openai
+
+
+    def ask(prompt, retries, wait_time):
+        for attempt in range(retries):
+            try:
+                response = openai.ChatCompletion.create(
+                    model="gpt-4", messages=[{"role": "user", "content": prompt}]
+                )
+                return response["choices"][0]["message"]["content"]
+            except openai.error.RateLimitError as e:
+                if attempt == retries - 1:
+                    raise RuntimeError(
+                        "rate limited"
+                    ) from e
+                time.sleep(wait_time)
+    """
+)
+
+MIGRATED = textwrap.dedent(
+    """\
+    import time
+
+    import openai
+
+
+    def ask(prompt, retries, wait_time):
+        client = openai.OpenAI()
+        for attempt in range(retries):
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-4", messages=[{"role": "user", "content": prompt}]
+                )
+                return response.choices[0].message.content
+            except openai.RateLimitError as e:
+                if attempt == retries - 1:
+                    raise RuntimeError(
+                        "rate limited"
+                    ) from e
+                time.sleep(wait_time)
+    """
+)
+
+
+def check(candidate: str, original: str = ORIGINAL, renames=None) -> list[str]:
+    findings = scan_text("m.py", original, get_migration("openai-v1"))
+    return unrelated_edits(original, candidate, findings, frozenset({"openai"}), renames=renames)
+
+
+def test_faithful_migration_has_no_drift():
+    assert check(MIGRATED) == []
+
+
+def test_dropped_from_clause_is_reported():
+    errors = check(MIGRATED.replace("    ) from e", "    )"))
+    assert len(errors) == 1
+    assert "`raise ... from e` lost its `from e`" in errors[0]
+    assert errors[0].startswith("original line 15:")
+
+
+def test_renamed_cause_is_not_a_dropped_one():
+    renamed = MIGRATED.replace("as e:", "as err:").replace(") from e", ") from err")
+    assert check(renamed) == []
+
+
+def test_replaced_argument_variable_is_reported():
+    errors = check(MIGRATED.replace("time.sleep(wait_time)", "time.sleep(2**attempt)"))
+    drift = [e for e in errors if "the argument `wait_time`" in e]
+    assert len(drift) == 1
+    assert "`time.sleep(...)` became `2 ** attempt`" in drift[0]
+    assert drift[0].startswith("original line 18:")
+
+
+def test_variable_renamed_throughout_is_fine():
+    renamed = MIGRATED.replace("wait_time", "delay")
+    assert check(renamed) == []
+
+
+def test_arguments_of_the_migrated_call_may_change():
+    # the migration renames engine= to model=, and moves the value through unchanged
+    original = ORIGINAL.replace('model="gpt-4"', "engine=engine").replace(
+        "def ask(prompt,", "def ask(engine, prompt,"
+    )
+    migrated = MIGRATED.replace('model="gpt-4"', "model=engine").replace(
+        "def ask(prompt,", "def ask(engine, prompt,"
+    )
+    assert check(migrated, original, renames={"engine": "model"}) == []
+
+
+def test_added_calls_do_not_confuse_pairing():
+    extra = MIGRATED.replace(
+        "time.sleep(wait_time)", "print('retrying')\n                time.sleep(wait_time)"
+    )
+    assert check(extra) == []
+
+
+def test_expression_still_built_from_the_variable_is_fine():
+    errors = check(MIGRATED.replace("time.sleep(wait_time)", "time.sleep(wait_time * 2)"))
+    assert not [e for e in errors if "the argument" in e]

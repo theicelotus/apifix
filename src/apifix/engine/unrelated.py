@@ -1085,6 +1085,134 @@ def unrelated_edits(
     reverts = [j.hunk for j in diff.judged if j.verdict == "revert"]  # left after a failed revert
     errors = [diff.code_error(h) for h in rejected]
     errors += _missing_strings(diff, rejected + reverts)
+    errors += _drift(diff)
+    return errors
+
+
+def _by_scope(tree: ast.Module, scopes: _Scopes, kind: type) -> dict[str, list]:
+    """The nodes of `kind` by scope, in source order."""
+    out: dict[str, list] = {}
+    for n in sorted(
+        (n for n in ast.walk(tree) if isinstance(n, kind)),
+        key=lambda n: (n.lineno, n.col_offset),
+    ):
+        out.setdefault(scopes.scope(n), []).append(n)
+    return out
+
+
+def _drift(diff: _Diff) -> list[str]:
+    """Behavior the rewrite changed inside lines the hunk judgement keeps (they sit near a
+    finding): an exception's `from` clause that is gone, and a variable passed to a call of
+    the original that another expression, not built from it, replaced
+    (`time.sleep(wait_time)` -> `time.sleep(2**attempt)`). Calls on a finding's own lines are
+    the migration's to rewrite."""
+    errors = sorted([*_dropped_causes(diff), *_replaced_arguments(diff)])
+    return [message for _, message in errors]
+
+
+def _dropped_causes(diff: _Diff) -> list[tuple[int, str]]:
+    """`raise X from Y` of the original with no `from` left in the candidate's same scope. A
+    cause may be renamed (`from e` -> `from err`), not dropped: per scope, each original cause
+    needs a candidate cause with the same text, or else any one not matched by another."""
+    old = _by_scope(diff.old.tree, diff.old_scopes, ast.Raise)
+    new = _by_scope(diff.new.tree, diff.new_scopes, ast.Raise)
+    errors = []
+    for scope, raises in old.items():
+        have = Counter(ast.unparse(r.cause) for r in new.get(scope, []) if r.cause is not None)
+        unmatched = []
+        for r in raises:
+            if r.cause is None:
+                continue
+            text = ast.unparse(r.cause)
+            if have[text] > 0:
+                have[text] -= 1
+            else:
+                unmatched.append((r, text))
+        for r, text in unmatched:
+            spare = next((t for t, n in have.items() if n > 0), None)
+            if spare is not None:
+                have[spare] -= 1
+                continue
+            errors.append(
+                (
+                    r.lineno,
+                    f"original line {r.lineno}: `raise ... from {text}` lost its `from {text}`; "
+                    "keep the exception chaining exactly as in the original",
+                )
+            )
+    return errors
+
+
+def _replaced_arguments(diff: _Diff) -> list[tuple[int, str]]:
+    """Arguments that were plain variables in a call of the original and are another
+    expression in the same call of the candidate. Calls pair up by scope and callee text;
+    identical calls pair first, the rest by order when their numbers match. A keyword the
+    migration renames is looked up under its new name; a variable renamed to another that
+    replaces it everywhere in the scope is fine."""
+    old = _by_scope(diff.old.tree, diff.old_scopes, ast.Call)
+    new = _by_scope(diff.new.tree, diff.new_scopes, ast.Call)
+    used = {n.id for n in ast.walk(diff.new.tree) if isinstance(n, ast.Name)}
+    errors = []
+    for scope, calls in old.items():
+        groups: dict[str, list[list[ast.Call]]] = {}
+        for c in calls:
+            if _lines_of(c) & diff.finding_lines:
+                continue
+            callee = ast.unparse(c.func)
+            groups.setdefault(callee, [[], []])[0].append(c)
+        for c in new.get(scope, []):
+            callee = ast.unparse(c.func)
+            if callee in groups:
+                groups[callee][1].append(c)
+        for olds, news in groups.values():
+            for o, n in _pair_calls(olds, news):
+                errors += _argument_drift(diff, o, n, used)
+    return errors
+
+
+def _pair_calls(olds: list[ast.Call], news: list[ast.Call]) -> list[tuple[ast.Call, ast.Call]]:
+    text = {id(c): ast.unparse(c) for c in [*olds, *news]}
+    free = list(news)
+    rest = []
+    for o in olds:
+        same = next((n for n in free if text[id(n)] == text[id(o)]), None)
+        if same is not None:
+            free.remove(same)
+        else:
+            rest.append(o)
+    return list(zip(rest, free, strict=True)) if len(rest) == len(free) else []
+
+
+def _argument_drift(
+    diff: _Diff, old: ast.Call, new: ast.Call, used: set[str]
+) -> list[tuple[int, str]]:
+    pairs: list[tuple[ast.expr, ast.expr | None]] = [
+        (a, new.args[i] if i < len(new.args) else None)
+        for i, a in enumerate(old.args)
+        if not isinstance(a, ast.Starred)
+    ]
+    by_name = {k.arg: k.value for k in new.keywords if k.arg}
+    pairs += [
+        (k.value, by_name.get(diff.renames.get(k.arg, k.arg)))
+        for k in old.keywords
+        if k.arg is not None
+    ]
+    errors = []
+    for was, now in pairs:
+        if not isinstance(was, ast.Name) or now is None or ast.unparse(was) == ast.unparse(now):
+            continue
+        if isinstance(now, ast.Name) and was.id not in used:
+            continue  # the variable is renamed throughout, not replaced by something else
+        if any(isinstance(x, ast.Name) and x.id == was.id for x in ast.walk(now)):
+            continue  # still built from the variable (`response` -> `response.model_dump()`)
+        errors.append(
+            (
+                was.lineno,
+                f"original line {was.lineno}: the argument `{was.id}` of "
+                f"`{ast.unparse(old.func)}(...)` became `{ast.unparse(now)}`; keep passing "
+                f"`{was.id}` as the original does",
+            )
+        )
     return errors
 
 

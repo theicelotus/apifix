@@ -81,3 +81,36 @@ def test_write_outputs_writes_each_reply_to_replies_with_paths_redacted(tmp_path
 def test_write_outputs_without_replies_makes_no_replies_folder(tmp_path):
     cli._write_outputs(tmp_path, "d", "r", None, {"job": {}})
     assert not (tmp_path / "replies").exists()
+
+
+def _sandbox_args(**kw):
+    import argparse
+
+    base = dict(
+        migration="google-genai", no_pip_cache=True, sandbox_requirements=None, sandbox_extra=None
+    )
+    return argparse.Namespace(**{**base, **kw})
+
+
+def test_sandbox_requirements_warns_when_the_old_side_is_left_out(capsys, tmp_path):
+    reqs = tmp_path / "reqs.txt"
+    reqs.write_text("pytest\n")
+    cli._sandbox(_sandbox_args(sandbox_requirements=str(reqs)))
+    err = capsys.readouterr().err
+    assert "does not list google-generativeai" in err and "--sandbox-extra" in err
+    reqs.write_text("pytest\ngoogle-generativeai\n")
+    cli._sandbox(_sandbox_args(sandbox_requirements=str(reqs)))
+    assert capsys.readouterr().err == ""
+
+
+def test_sandbox_extra_adds_and_excludes_sandbox_requirements(capsys, tmp_path):
+    extra = tmp_path / "extra.txt"
+    extra.write_text("rich\n")
+    sandbox = cli._sandbox(_sandbox_args(sandbox_extra=str(extra)))
+    assert sandbox.config.requirements_override.extra
+    assert capsys.readouterr().err == ""  # nothing to warn about: it adds to detection
+    with pytest.raises(SystemExit):
+        main(
+            ["verify", str(tmp_path), "--migration", "openai-v1", "--diff", "x"]
+            + ["--sandbox-extra", str(extra), "--sandbox-requirements", str(extra)]
+        )
