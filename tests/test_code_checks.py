@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from apifix.engine import code_checks
 from apifix.engine.code_checks import (
     STDLIB_IMPORTS,
     add_missing_imports,
@@ -1771,3 +1772,49 @@ def test_an_old_line_commented_out_stays_for_its_own_check():
         drop_added_comments(original, candidate) == "import openai\n# openai.api_key = 'k'\nx = 1\n"
     )
     assert commented_out_code(original, drop_added_comments(original, candidate))
+
+
+# --- dotted library modules (google.genai, google.generativeai) ----------------------------------
+
+GOOGLE = frozenset({"google.generativeai", "google.genai"})
+
+
+@pytest.mark.parametrize(
+    ("source", "target"),
+    [
+        (
+            "from google import genai\n\ndef ask(q):\n    client = genai.Client()\n"
+            "    return client.models.generate_content(model='m', contents=q)\n",
+            "google.genai.Client",
+        ),
+        (
+            "import google.generativeai\n\ndef ask(q):\n"
+            "    m = google.generativeai.GenerativeModel('m')\n    return m.generate_content(q)\n",
+            "google.generativeai.GenerativeModel",
+        ),
+        (
+            "import google.generativeai as genai\n\ndef ask(q):\n"
+            "    m = genai.GenerativeModel('m')\n    return m.generate_content(q)\n",
+            "google.generativeai.GenerativeModel",
+        ),
+        (
+            "from google.genai import Client\n\ndef ask(q):\n"
+            "    return Client().models.generate_content(model='m', contents=q)\n",
+            "app.gen.Client",
+        ),
+        (
+            "import google.cloud.storage\n\ndef ask(q):\n"
+            "    return google.cloud.storage.Client().bucket(q)\n",
+            None,
+        ),
+    ],
+)
+def test_dotted_library_modules_get_their_own_patch_target(source, target):
+    use = code_checks._ModuleIndex("app.gen", ast.parse(source), GOOGLE).library_use()
+    assert (use.target if use else None) == target
+
+
+def test_a_patch_of_a_dotted_library_module_reaches_code_using_it_as_an_attribute():
+    tree = ast.parse("from google import genai\nclient = genai.Client()\n")
+    assert code_checks._uses_attribute(tree, "google.genai.Client", GOOGLE)
+    assert not code_checks._uses_attribute(tree, "google.genai.Client", frozenset({"openai"}))

@@ -65,6 +65,8 @@ src/apifix/
   worker/             background jobs (later)
   engine/
     models.py         Finding / ScanResult dataclasses
+    api_names.py      a migration's dotted library modules (`google.genai`): prefix matching,
+                      the local names imports bind them to
     walk.py           shared repo walker (skips venvs, conda/pixi envs, tooling dirs; never
                       follows symlinks)
     dependencies.py   parses requirements/pyproject (incl. pixi tables)/pixi.toml/setup.py/

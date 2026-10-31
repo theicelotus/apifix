@@ -19,6 +19,7 @@ from apifix.engine.code_checks import (
     unkeyed_method_patch_problems,
 )
 from apifix.engine.migrations import get_migration
+from apifix.engine.models import ClientKey
 from apifix.engine.scanner import scan
 from apifix.engine.verifier import UNCALLED_MOCK_MARKERS, failure_hints
 from apifix.engine.whole_file import check_candidate
@@ -535,3 +536,20 @@ def test_the_tests_guide_part_says_a_patched_method_needs_a_key():
         '@mock.patch("openai.resources.chat.completions.Completions.create")'
     )
     assert "call_args.args[0]" in tests_part
+
+
+def test_keyless_client_through_a_dotted_library_module():
+    google = frozenset({"google.generativeai", "google.genai"})
+    key = ClientKey(env="GOOGLE_API_KEY", keyword="api_key", classes={"Client"}, resources="")
+    plain = "import google.genai\n\n\ndef ask():\n    return google.genai.Client()\n"
+    other = (
+        "import google.cloud.storage\n\n\ndef ask():\n    return google.cloud.storage.Client()\n"
+    )
+    found = keyless_client(reader({"a.py": plain}), ["a.py"], key, library_modules=google)
+    assert found is not None
+    assert (found.line, found.call, found.target) == (
+        5,
+        "google.genai.Client",
+        "a.google.genai.Client",
+    )
+    assert keyless_client(reader({"a.py": other}), ["a.py"], key, library_modules=google) is None

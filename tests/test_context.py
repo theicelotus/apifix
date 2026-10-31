@@ -133,3 +133,23 @@ def test_library_uses_from_imports_module_clients_and_the_cap():
     capped = library_uses(text, LIB, limit=60)
     assert len(capped) <= 60 + 25 and capped.endswith("# ... (more not shown)")
     assert library_uses("import os\n", LIB) == ""
+
+
+def test_library_uses_of_dotted_library_modules():
+    source = (
+        "import json\n"
+        "import google.protobuf\n"
+        "from google import genai\n"
+        "from google.genai import types\n"
+        "\n"
+        "client = genai.Client()\n"
+        "config = types.GenerateContentConfig()\n"
+        "data = json.dumps({})\n"
+    )
+    shown = library_uses(source, frozenset({"google.generativeai", "google.genai"}))
+    assert "from google import genai" in shown
+    assert "from google.genai import types" in shown
+    assert "client = genai.Client()" in shown
+    assert "config = types.GenerateContentConfig()" in shown
+    assert "google.protobuf" not in shown
+    assert "json" not in shown

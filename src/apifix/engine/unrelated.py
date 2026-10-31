@@ -39,6 +39,7 @@ from collections import Counter
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 
+from apifix.engine.api_names import in_modules
 from apifix.engine.diffing import opcodes
 from apifix.engine.models import Finding
 
@@ -346,19 +347,25 @@ def _exempt_node(
 
 
 def _library_names(tree: ast.Module, library_modules: Collection[str]) -> set[str]:
-    """The library's module names and the names a file imports from it."""
-    names = set(library_modules)
+    """The library's top-level module names and the names a file imports from it. A plain
+    `import google.genai` binds `google`, which is not added: `_Bound.rooted` matches its
+    dotted names (`google.genai.Client`) instead."""
+    names = {m for m in library_modules if "." not in m}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for a in node.names:
-                if a.name.split(".")[0] in library_modules:
-                    names.add((a.asname or a.name).split(".")[0])
-        elif (
-            isinstance(node, ast.ImportFrom)
-            and not node.level
-            and (node.module or "").split(".")[0] in library_modules
-        ):
-            names.update(a.asname or a.name for a in node.names if a.name != "*")
+                if a.asname and in_modules(a.name, library_modules):
+                    names.add(a.asname)
+                elif in_modules(a.name.split(".")[0], library_modules):
+                    names.add(a.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+            whole = in_modules(node.module, library_modules)
+            names.update(
+                a.asname or a.name
+                for a in node.names
+                if a.name != "*"
+                and (whole or in_modules(f"{node.module}.{a.name}", library_modules))
+            )
     return names
 
 
@@ -490,7 +497,7 @@ class _Bound:
             return (
                 isinstance(first, ast.Constant)
                 and isinstance(first.value, str)
-                and first.value.split(".")[0] in self.library
+                and in_modules(first.value, self.library)
             )
         return func in _PATCH_OBJECT_CALLS and self.rooted(first, self.scopes.scope(node))
 
@@ -535,6 +542,8 @@ class _Bound:
                 return self.attr(attr, scope)
             if isinstance(node, ast.Name):
                 return self.name(node.id, scope)
+            if isinstance(node, ast.Attribute) and _dotted(node) in self.library:
+                return True  # a dotted library module: `google.genai` of `google.genai.Client`
             if isinstance(node, ast.Attribute | ast.Subscript):
                 node = node.value
             elif isinstance(node, ast.Call):

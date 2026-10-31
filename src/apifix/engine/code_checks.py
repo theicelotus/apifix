@@ -32,6 +32,7 @@ from pathlib import PurePosixPath
 
 from pyflakes import checker, messages
 
+from apifix.engine.api_names import in_modules
 from apifix.engine.context import reachable_modules
 from apifix.engine.diffing import opcodes
 from apifix.engine.models import ClientKey
@@ -393,7 +394,9 @@ class _ModuleIndex:
                         self.imports[root] = self.module_names[root] = root
             elif isinstance(stmt, ast.ImportFrom) and stmt.module and not stmt.level:
                 for a in stmt.names:
-                    self.imports[a.asname or a.name] = f"{stmt.module}.{a.name}"
+                    full = self.imports[a.asname or a.name] = f"{stmt.module}.{a.name}"
+                    if full in library_modules:  # from google import genai
+                        self.module_names[a.asname or a.name] = full
             elif isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
                 if isinstance(stmt.targets[0], ast.Name):
                     self.assigned[stmt.targets[0].id] = stmt.value
@@ -407,8 +410,11 @@ class _ModuleIndex:
     def _from_library(self, dotted: str | None) -> bool:
         if not dotted:
             return False
-        imported = self.imports.get(dotted.split(".")[0])
-        return imported is not None and imported.split(".")[0] in self.library
+        head, _, rest = dotted.partition(".")
+        imported = self.imports.get(head)
+        if imported is None:
+            return False
+        return in_modules(f"{imported}.{rest}" if rest else imported, self.library)
 
     def _library_class(self, dotted: str | None) -> bool:
         """A class of the library (`openai.OpenAI`), not one of its calls
@@ -521,9 +527,10 @@ class _ModuleIndex:
                 continue
             root, _, tail = s.target[len(self.dotted) + 1 :].partition(".")
             module = self.module_names.get(root)
-            if module is None or module.split(".")[0] not in self.library:
+            target = f"{module}.{tail}" if tail else module
+            if target is None or not in_modules(target, self.library):
                 return s
-            return replace(s, target=f"{module}.{tail}" if tail else module)
+            return replace(s, target=target)
         return None
 
 
@@ -937,9 +944,10 @@ class _RepoImports:
         return min(names, key=len), False
 
 
-def _uses_attribute(tree: ast.Module, target: str) -> bool:
+def _uses_attribute(tree: ast.Module, target: str, library_modules: frozenset[str]) -> bool:
     """Does the code use `target` as an attribute of the library module (`openai.OpenAI`, also
-    through `import openai as oa`)? A patch of it then reaches that code."""
+    through `import openai as oa` or `from google import genai`)? A patch of it then reaches
+    that code."""
     aliases: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -949,6 +957,10 @@ def _uses_attribute(tree: ast.Module, target: str) -> bool:
                 else:  # import openai.types binds openai
                     root = a.name.split(".")[0]
                     aliases[root] = root
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            for a in node.names:  # from google import genai -> genai.X is google.genai.X
+                if f"{node.module}.{a.name}" in library_modules:
+                    aliases[a.asname or a.name] = f"{node.module}.{a.name}"
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute):
             dotted = _dotted(node)
@@ -976,9 +988,9 @@ def _library_binding_problem(
     parts = target.split(".")
     if (
         len(parts) < 2
-        or parts[0] not in options.library_modules
+        or not in_modules(target, options.library_modules)
         or _module_file(parts[:1], read_module, options.roots) is not None
-        or _uses_attribute(tree, target)
+        or _uses_attribute(tree, target, options.library_modules)
     ):
         return None
     # (rel, dotted module, bound name, import, a patch of it by another path)
@@ -1157,7 +1169,7 @@ def _client_class(
     except (SyntaxError, ValueError):
         return False
     imported = _ModuleIndex("", tree, options.library_modules).imports.get(parts[-1], "")
-    return imported.split(".")[0] in options.library_modules and imported.split(".")[-1] in classes
+    return in_modules(imported, options.library_modules) and imported.split(".")[-1] in classes
 
 
 def _autospec_uses(
@@ -1444,7 +1456,7 @@ def _keyless_client(
             imported = index.imports.get(root, "")
             full = f"{imported}.{rest}" if rest else imported
             if (
-                full.split(".")[0] not in options.library_modules
+                not in_modules(full, options.library_modules)
                 or full.rsplit(".", 1)[-1] not in key.classes
             ):
                 continue

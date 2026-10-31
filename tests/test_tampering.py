@@ -61,6 +61,29 @@ def test_api_renames_are_only_silent_for_the_migrated_module():
     assert [e.kind for e in plain] == ["setup_changed"]
 
 
+def test_api_renames_through_dotted_modules_and_their_aliases_are_silent():
+    google = frozenset({"google.generativeai", "google.genai"})
+    old = (
+        "import google.generativeai as genai\n"
+        "def test_x():\n"
+        "    with pytest.raises(genai.types.BlockedPromptException):\n"
+        "        f()\n"
+        "    assert google.generativeai.types.HarmCategory.X == 1\n"
+    )
+    new = (
+        "from google import genai\n"
+        "def test_x():\n"
+        "    with pytest.raises(genai.errors.ClientError):\n"
+        "        f()\n"
+        "    assert google.genai.types.HarmCategory.X == 1\n"
+    )
+    assert check_test_file("tests/test_x.py", old, new, api_modules=google) == []
+    # a sibling package under the same top-level name is not the migrated library
+    sibling = new.replace("google.genai.types.HarmCategory", "google.protobuf.HarmCategory")
+    found = check_test_file("tests/test_x.py", old, sibling, api_modules=google)
+    assert [e.kind for e in found] == ["setup_changed"]
+
+
 def test_response_access_rewrite_in_asserts_is_silent():
     old = """
         def test_x(resp):

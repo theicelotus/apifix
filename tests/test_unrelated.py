@@ -870,3 +870,28 @@ def test_keyword_renames_are_kwarg_changes():
     }
     for old, new in MIGRATION.keyword_renames.items():
         assert f"{new}=" in rules.KWARG_CHANGES[old]
+
+
+def test_dotted_library_modules_bind_their_aliases_and_dotted_names_only():
+    source = textwrap.dedent(
+        """\
+        import google.generativeai as old_genai
+        import google.cloud.storage
+        from google import genai
+        from google.protobuf import json_format
+
+        a = old_genai.GenerativeModel("m")
+        b = genai.Client()
+        c = google.genai.types.Part()
+        d = google.cloud.storage.Client()
+        e = json_format.MessageToDict(x)
+        """
+    )
+    tree = ast.parse(source)
+    library = frozenset({"google.generativeai", "google.genai"})
+    bound = unrelated._Bound(tree, unrelated._Scopes(tree), library)
+    assert {n for _, n in bound.names} == {"old_genai", "genai", "a", "b", "c"}
+    patch = ast.parse('mock.patch("google.genai.Client")').body[0].value
+    assert bound.library_patch(patch)
+    other = ast.parse('mock.patch("google.cloud.storage.Client")').body[0].value
+    assert not bound.library_patch(other)

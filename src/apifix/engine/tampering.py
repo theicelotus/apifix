@@ -10,16 +10,20 @@ from __future__ import annotations
 
 import ast
 import configparser
+import contextlib
 import contextvars
 import copy
 import json
 import re
 import tomllib
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
+from types import MappingProxyType
 from typing import Literal
+
+from apifix.engine.api_names import in_modules, module_aliases, resolve
 
 Severity = Literal["reject", "warn", "info"]
 
@@ -101,10 +105,15 @@ def dotted_name(node: ast.AST) -> str | None:
 
 
 # Modules whose renamed attributes a migration may rewrite freely (e.g. "openai", so that
-# `openai.error.RateLimitError` -> `openai.RateLimitError` is not a test change). Set per call
-# of check_test_file.
+# `openai.error.RateLimitError` -> `openai.RateLimitError` is not a test change), matched by
+# dotted prefix, and the local names either version of the file binds them to (`genai` of
+# `import google.generativeai as genai` / `from google import genai`). Set per call of
+# check_test_file.
 _API_MODULES: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
     "api_modules", default=frozenset()
+)
+_API_ALIASES: contextvars.ContextVar[Mapping[str, str]] = contextvars.ContextVar(
+    "api_aliases", default=MappingProxyType({})
 )
 # Extra catch-all exception names for the migrated library (e.g. "APIError"), so narrowing
 # `pytest.raises(RateLimitError)` to `pytest.raises(openai.APIError)` counts as broadening.
@@ -125,7 +134,7 @@ class _Normalize(ast.NodeTransformer):
 
     def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
         name = dotted_name(node)
-        if name and name.split(".", 1)[0] in _API_MODULES.get():
+        if name and in_modules(resolve(name, _API_ALIASES.get()), _API_MODULES.get()):
             return ast.Name(id="<api>", ctx=node.ctx)
         return self.generic_visit(node)
 
@@ -413,12 +422,18 @@ def check_test_file(
     """Compare one test file across the fix. None means the file did not exist / was deleted.
     References into `api_modules` may be renamed freely (that is the migration), except that
     catching one of `api_broad_exceptions` counts as broadening."""
+    aliases: dict[str, str] = {}
+    for src in (old_src, new_src):
+        with contextlib.suppress(SyntaxError):
+            aliases |= module_aliases(ast.parse(src), api_modules) if src is not None else {}
     modules = _API_MODULES.set(frozenset(api_modules))
+    bound = _API_ALIASES.set(aliases)
     broad = _API_BROAD.set(frozenset(api_broad_exceptions))
     try:
         return _check_test_file(file, old_src, new_src)
     finally:
         _API_MODULES.reset(modules)
+        _API_ALIASES.reset(bound)
         _API_BROAD.reset(broad)
 
 

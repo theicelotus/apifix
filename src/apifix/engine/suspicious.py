@@ -15,6 +15,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 
+from apifix.engine.api_names import in_modules, resolve
 from apifix.engine.dependencies import normalize_name, parse_dependency_file
 from apifix.engine.tampering import dotted_name
 
@@ -83,18 +84,6 @@ def _aliases(tree: ast.Module) -> dict[str, str]:
     return out
 
 
-def _resolve(name: str, aliases: dict[str, str]) -> str:
-    head, _, rest = name.partition(".")
-    base = aliases.get(head)
-    if base is None:
-        return name
-    return f"{base}.{rest}" if rest else base
-
-
-def _in(name: str, modules: tuple[str, ...]) -> bool:
-    return any(name == m or name.startswith(f"{m}.") for m in modules)
-
-
 def _imports(tree: ast.Module) -> list[tuple[str, int]]:
     found = []
     for node in ast.walk(tree):
@@ -120,12 +109,12 @@ def _calls(tree: ast.Module) -> list[tuple[str, str, int]]:
         raw = dotted_name(node.func)
         if not raw:
             continue
-        name = _resolve(raw, aliases)
+        name = resolve(raw, aliases)
         if name in DYNAMIC_CODE or raw in DYNAMIC_CODE:
             found.append(("dynamic_code", name, node.lineno))
-        elif _in(name, NETWORK_MODULES) and name not in NETWORK_DATA_TYPES:
+        elif in_modules(name, NETWORK_MODULES) and name not in NETWORK_DATA_TYPES:
             found.append(("network_call", name, node.lineno))
-        elif _in(name, PROCESS_MODULES) or name.startswith(PROCESS_FUNCTIONS):
+        elif in_modules(name, PROCESS_MODULES) or name.startswith(PROCESS_FUNCTIONS):
             found.append(("process_call", name, node.lineno))
     return found
 
@@ -186,7 +175,7 @@ def check_python(
         prefixes = _prefixes(name)
         if (
             name in old_imports
-            or prefixes[0] in free
+            or in_modules(name, free)
             or any(p in HARMLESS_IMPORTS for p in prefixes)
         ):
             continue

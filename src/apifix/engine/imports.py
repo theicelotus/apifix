@@ -120,7 +120,7 @@ def importable_modules(
         frozenset(repo_module_names(root)),
         frozenset(declared_names(root, override)),
         frozenset(imported),
-        frozenset(extra),
+        frozenset(m.split(".", 1)[0] for m in extra),  # google.genai -> google
     )
 
 

@@ -54,6 +54,24 @@ def test_harmless_and_companion_imports_are_not_flagged():
     assert kinds(OLD, new, frozenset({"httpx"})) == []
 
 
+def test_dotted_library_modules_are_free_but_their_siblings_are_not():
+    google = frozenset({"google.generativeai", "google.genai"})
+    old = "import google.generativeai as genai\n"
+    new = "from google import genai\nfrom google.genai import types\nimport google.cloud.storage\n"
+    found = check_python("app.py", old, new, google)
+    assert [(e.kind, e.line, e.detail) for e in found] == [
+        ("new_import", 3, "new import `google.cloud.storage`")
+    ]
+
+
+def test_dotted_library_modules_allow_their_distribution():
+    google = frozenset({"google.generativeai", "google.genai"})
+    old = "google-generativeai==0.8.3\n"
+    new = "google-genai>=1.19.0,<3\ngoogle-cloud-storage\n"
+    (e,) = check_dependencies("requirements.txt", old, new, google)
+    assert e.detail == "new dependency `google-cloud-storage`"
+
+
 def test_existing_imports_are_not_new():
     assert kinds("import requests\n" + OLD, "import requests\n" + OLD + "\nX = 1\n") == []
 

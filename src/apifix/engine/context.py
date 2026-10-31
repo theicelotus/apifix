@@ -14,6 +14,8 @@ import difflib
 from collections.abc import Callable, Collection, Iterable, Sequence
 from pathlib import PurePosixPath
 
+from apifix.engine.api_names import in_modules
+
 ReadModule = Callable[[str], str | None]
 LIBRARY_USES_CHARS = 600  # per module
 _DEFS = (ast.FunctionDef, ast.AsyncFunctionDef)
@@ -112,12 +114,11 @@ def _units(tree: ast.Module) -> list[ast.stmt]:
 
 def _is_library_import(node: ast.AST, library: Collection[str]) -> bool:
     if isinstance(node, ast.Import):
-        return any(a.name.split(".")[0] in library for a in node.names)
-    return (
-        isinstance(node, ast.ImportFrom)
-        and bool(node.module)
-        and not node.level
-        and node.module.split(".")[0] in library  # type: ignore[union-attr]
+        return any(in_modules(a.name, library) for a in node.names)
+    if not isinstance(node, ast.ImportFrom) or not node.module or node.level:
+        return False
+    return in_modules(node.module, library) or any(
+        in_modules(f"{node.module}.{a.name}", library) for a in node.names
     )
 
 

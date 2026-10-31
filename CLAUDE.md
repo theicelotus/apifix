@@ -25,6 +25,7 @@ src/apifix/engine/
   sandbox_driver.py         runs inside containers (Python 3.8+, stdlib only)
   docker.py, cleanup.py     docker CLI wrapper; remove orphaned containers/temp dirs
   imports.py                third-party imports no dependency file declares
+  api_names.py              a migration's dotted library modules: prefix match, import aliases
   test_results.py           JUnit / unittest output -> per-test outcomes
   diffing.py, tampering.py  tree diffs; weakened/removed test assertions
   scope.py, suspicious.py   CI/config edits; injected or unrelated added code

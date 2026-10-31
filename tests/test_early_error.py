@@ -222,6 +222,8 @@ def test_importable_modules(tmp_path):
         assert names(name), name
     for name in ("app", "yourpkg", "numpy"):
         assert not names(name), name
+    dotted = importable_modules(repo, None, frozenset({"google.genai", "google.generativeai"}))
+    assert dotted("google")  # patch("google.genai.Client") starts with an importable name
 
 
 # --- the call assertion the run added ---------------------------------------------------------
