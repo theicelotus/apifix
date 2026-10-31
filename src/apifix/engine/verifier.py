@@ -49,6 +49,7 @@ Verdict = Literal["verified", "verified_weak", "rejected", "unverified"]
 ReasonSeverity = Literal["reject", "unverified", "weak", "warn", "info"]
 
 # Failure text that means "needed a network service or credentials", not "the code is wrong".
+# The migrated library's own missing-key messages come from `Migration.key_failure_markers`.
 EXTERNAL_MARKERS = (
     "APIConnectionError",
     "Connection error",
@@ -63,8 +64,6 @@ EXTERNAL_MARKERS = (
     "getaddrinfo failed",
     "AuthenticationError",
     "No API key provided",
-    "api_key client option must be set",
-    "OPENAI_API_KEY",
 )
 NON_SOURCE_FILES = {"setup.py", "noxfile.py"}
 MAX_LISTED = 15
@@ -511,8 +510,10 @@ def _in_module(test_id: str, module: str) -> bool:
     return test_id.startswith((f"{module}::", f"{module}."))
 
 
-def is_external_failure(message: str) -> bool:
-    return any(marker in message for marker in EXTERNAL_MARKERS)
+def is_external_failure(message: str, key_markers: Sequence[str] = ()) -> bool:
+    """Does the failure need a network service or credentials? `key_markers`: the migrated
+    library's missing-key messages."""
+    return any(marker in message for marker in (*EXTERNAL_MARKERS, *key_markers))
 
 
 def baseline_usable(baseline: SandboxResult) -> bool:
@@ -523,8 +524,17 @@ def baseline_usable(baseline: SandboxResult) -> bool:
 
 
 def compare_runs(
-    baseline: SandboxResult, fixed: SandboxResult, rerun: SandboxResult | None = None
+    baseline: SandboxResult,
+    fixed: SandboxResult,
+    rerun: SandboxResult | None = None,
+    key_markers: Sequence[str] = (),
 ) -> TestDelta:
+    """Per-test changes from `baseline` to `fixed`. `key_markers`: the migrated library's
+    missing-key messages (no-signal failures, with EXTERNAL_MARKERS)."""
+
+    def external(message: str) -> bool:
+        return is_external_failure(message, key_markers)
+
     delta = TestDelta(baseline_available=baseline_usable(baseline))
     if fixed.test is None:  # the fixed code's tests never ran (install failed, ...): no signal
         return delta
@@ -562,7 +572,7 @@ def compare_runs(
                 if any(_in_module(t, module) for t in after):  # its tests ran this time
                     delta.fixed_by_change.append(module)
             else:
-                if is_external_failure(b.message) or is_external_failure(f.message):
+                if external(b.message) or external(f.message):
                     delta.no_signal_external.append(module)
                 else:
                     delta.no_signal_preexisting.append(module)
@@ -590,7 +600,7 @@ def compare_runs(
             elif f.outcome == "skipped":
                 delta.newly_skipped.append(test_id)
             else:
-                if is_external_failure(b.message) or is_external_failure(f.message):
+                if external(b.message) or external(f.message):
                     delta.no_signal_external.append(test_id)
                 else:
                     delta.no_signal_preexisting.append(test_id)
@@ -1256,7 +1266,9 @@ def _module_detail(module: str, run: SandboxResult) -> str:
     return f"{module} (not declared in any dependency file apifix reads)"
 
 
-def environment_reasons(baseline: SandboxResult, original: Path) -> list[Reason]:
+def environment_reasons(
+    baseline: SandboxResult, original: Path, key_markers: Sequence[str] = ()
+) -> list[Reason]:
     """The original code's tests fail because modules are missing from the sandbox's
     environment (not the repo's own modules, not the stdlib). When nothing usable ran besides
     (no test passed, and none failed for a reason a fix could change: not an import error,
@@ -1281,7 +1293,7 @@ def environment_reasons(baseline: SandboxResult, original: Path) -> list[Reason]
         elif t.outcome == "passed" or (
             t.outcome in ("failed", "error")
             and not t.missing_module  # an import error of any kind is nothing a fix changes
-            and not is_external_failure(t.message)
+            and not is_external_failure(t.message, key_markers)
         ):
             usable += 1
     if not missing:
@@ -1421,6 +1433,7 @@ def verify(
         baseline = sandbox.run(original, env=env)
     rerun = None
     smoke = getattr(mig, "smoke_check", None)
+    key_markers = tuple(getattr(mig, "key_failure_markers", ()))
     target = LibraryTarget(
         mig.package, mig.first_version, mig.pin_spec, dict(getattr(mig, "companion_pins", {}))
     )
@@ -1428,10 +1441,10 @@ def verify(
         fixed, coverage=True, env=env, smoke=smoke, original=original, target=target
     ) as session:
         fixed_run = session.run_tests()
-        delta = compare_runs(baseline, fixed_run)
+        delta = compare_runs(baseline, fixed_run, key_markers=key_markers)
         if config.rerun_new_failures and (delta.newly_failing or delta.newly_erroring):
             rerun = session.run_tests(coverage=False)
-            delta = compare_runs(baseline, fixed_run, rerun)
+            delta = compare_runs(baseline, fixed_run, rerun, key_markers)
     coverage = changed_line_coverage(changes, fixed_run, fixed, original)
 
     old_errors = {e.file for e in before_scan.parse_errors}
@@ -1444,7 +1457,7 @@ def verify(
         + _scope_reasons(original, fixed, changes, {f.file for f in before_scan.findings})
         + _suspicious_reasons(original, fixed, changes, mig)
         + smoke_reasons(fixed_run, baseline)
-        + environment_reasons(baseline, original)
+        + environment_reasons(baseline, original, key_markers)
         + _evidence_reasons(fixed_run, coverage, config)
     )
     reasons = library_held_back(reasons, mig.package)

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from apifix.engine.migrations import get_migration
 from apifix.engine.migrations.openai_v1 import rules as openai_rules
 from apifix.engine.models import LibraryTarget
 from apifix.engine.project import NotInstalled
@@ -1759,3 +1760,16 @@ def test_report_and_summary_show_dropped_sources_and_pip_conflicts(trees):
             "pins": [["tiktoken==0.5.1", "tiktoken==0.3.3"]],
         }
     ]
+
+
+def test_missing_key_markers_come_from_the_migration():
+    message = "ValueError: Missing key inputs argument! No API key was provided"
+    before = run(("m::a", "failed", message))
+    after = run(("m::a", "failed", message))
+    assert compare_runs(before, after).no_signal_preexisting == ["m::a"]
+    d = compare_runs(before, after, key_markers=("No API key was provided",))
+    assert d.no_signal_external == ["m::a"]
+    openai = get_migration("openai-v1").key_failure_markers
+    keyless = run(("m::a", "failed", "OpenAIError: The api_key client option must be set"))
+    assert compare_runs(keyless, keyless, key_markers=openai).no_signal_external == ["m::a"]
+    assert compare_runs(keyless, keyless).no_signal_preexisting == ["m::a"]

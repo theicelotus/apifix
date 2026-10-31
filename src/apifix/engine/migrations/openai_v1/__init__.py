@@ -102,6 +102,7 @@ class OpenAIV1Migration:
     package = rules.PACKAGE
     pin_spec = rules.PIN_SPEC
     source_package = ""
+    key_failure_markers = ("api_key client option must be set", "OPENAI_API_KEY")
     companion_pins = rules.COMPANION_PINS
     first_version = rules.FIRST_V1
     target_name = "openai 1.x"

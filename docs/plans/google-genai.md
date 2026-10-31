@@ -1,6 +1,7 @@
 # Plan: second migration `google-genai` (google-generativeai -> Google Gen AI SDK)
 
-Status: approved with amendments (2026-10-30); engine changes E1-E4 in progress.
+Status: approved with amendments (2026-10-30); engine changes E1-E4 built. Next: E5-E6 and
+the migration package (section 7, steps 1-6).
 
 ## Request
 
@@ -593,3 +594,11 @@ main, then stop.
   `chats.Chats.create`), only for a module named after its class (not `types.Part`); library
   modules match by dotted name, and a target with nothing after the resources segment no
   longer raises IndexError. Replay of the aipl result: identical.
+- **E4 no-signal key markers from the migration** (`Migration.key_failure_markers`;
+  openai-v1: `api_key client option must be set`, `OPENAI_API_KEY`, moved out of
+  `verifier.EXTERNAL_MARKERS`, which keeps the generic ones including `No API key provided`).
+  `compare_runs`, `is_external_failure` and `environment_reasons` take them; `verify` passes the
+  migration's. google-genai will add `No API key was provided`, `GOOGLE_API_KEY`,
+  `GEMINI_API_KEY`. Replay of the aipl result: identical.
+- Not built in this session (by request): E5 minimum Python, E6 registry and docs, and the
+  migration package itself.

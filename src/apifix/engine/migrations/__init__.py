@@ -27,6 +27,9 @@ class Migration(Protocol):
     # Environment variables that get a placeholder value in the sandbox's test phase when the
     # repo's CI (GitHub Actions) sets them for its own runs. Literal values only, never secrets.
     ci_env_placeholders: Mapping[str, str]
+    # Failure text that means the library found no API key (the sandbox has none): a test that
+    # fails with one before and after the fix is no signal, not a failure the fix kept.
+    key_failure_markers: tuple[str, ...]
     # (marker, explanation): when a failing test's output contains the marker, the retry
     # feedback carries the explanation.
     failure_hints: tuple[tuple[str, str], ...]
