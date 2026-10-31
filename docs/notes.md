@@ -592,6 +592,28 @@ ANTHROPIC_API_KEY=... .venv/bin/apifix fix tests/fixtures/injected_repo --migrat
   at most 15 in the report (`verification.review_by_hand` has all). Fixed-side line numbers; a
   removal is shown at the line that now follows it.
 
+## Import paths (guessed PYTHONPATH dirs)
+
+Found on saulpw/aipl: `aipl/ops/test.py` does `import json`, and `aipl/ops/json.py` is an aipl
+op, so adding `aipl/ops/` to the import path shadowed the stdlib `json` for the whole run and
+both the baseline and the fixed run crashed at collection. aipl's CI runs `pytest .`.
+
+- `project.guess_import_paths` only reads files pytest would collect: the basename matches the
+  repo's `python_files` (default `test_*.py`, `*_test.py`). Other files that `detect_tests`
+  finds (`test.py`, `testapp.py`) are still handed to pytest by name, but do not justify a dir.
+- A first name in `sys.stdlib_module_names` never justifies a dir, and a dir that holds a module
+  (`x.py` or `x/__init__.py`) named like a stdlib module is never added (dunder names aside). The
+  check uses the host's stdlib list, not the sandbox Python's.
+- `TestPlan.import_paths_guessed` is true for guessed dirs, false for the repo's own `pythonpath`.
+  `SandboxSession.run_tests` runs the test phase again without guessed dirs when that run
+  collected no tests (status `error`, or only collection errors), and keeps the retry only if it
+  collected tests; otherwise the first run. Both baseline and fixed runs do this on their own.
+  `SandboxResult.retried_without_import_paths`, a note, `verification.json` and a report line
+  say which run was used.
+- Limit: the retry fires on "collected nothing", not on any failure. If some modules collect
+  with the dir on the path and others crash, the first run stands. The fix is not retried when
+  the guess was fine for the baseline but not the fixed run (the same dirs apply to both).
+
 ## Known limitations (imported but not declared)
 
 - `imports.py`, once per job from the original repo before the baseline (`fix` and `apifix

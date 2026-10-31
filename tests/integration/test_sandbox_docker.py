@@ -261,7 +261,7 @@ def test_flat_package_layout_with_sibling_imports(tmp_path):
                 logging.info("replying")
                 return text.upper()
             """,
-            "svc/testserver.py": """
+            "svc/test_server.py": """
             import unittest
 
             from server import reply

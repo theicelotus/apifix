@@ -399,6 +399,7 @@ def run_summary(run: SandboxResult) -> dict:
         "env_placeholders": list(run.env_placeholders),
         "notes": list(run.notes),
         "import_paths": list(run.import_paths),
+        **({"retried_without_import_paths": True} if run.retried_without_import_paths else {}),
         **(
             {"runner_error": run.runner_error, "runner_output": run.runner_output}
             if run.runner_error
@@ -1584,6 +1585,10 @@ def _report(v: Verification) -> str:
             f"**Import paths:** {paths} on PYTHONPATH in the test phase (test files import "
             "modules from there by bare name)."
         )
+    for label, run in (("baseline", v.baseline), ("fixed", v.fixed)):
+        retried = [n for n in run.notes if n.startswith("no tests collected with ")]
+        if run.retried_without_import_paths and retried:
+            out.append(f"**Import paths ({label} run):** {retried[0]}.")
     if v.fixed.requirements_override:
         line = (
             f"**Dependencies:** from `{v.fixed.requirements_override}`, replacing apifix's "

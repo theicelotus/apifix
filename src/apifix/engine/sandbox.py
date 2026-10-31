@@ -330,6 +330,8 @@ class SandboxResult:
     env_placeholders: list[str] = field(default_factory=list)
     # Repo dirs put on PYTHONPATH in the test phase (TestPlan.import_paths).
     import_paths: list[str] = field(default_factory=list)
+    # nothing collected with those dirs, so the test phase was run again without them
+    retried_without_import_paths: bool = False
     smoke: SmokeResult | None = None
     pip_cache: bool = False  # the install phase used the persistent pip cache
     # From the install plan: normalised name -> where it is declared; declared dependencies left
@@ -867,6 +869,13 @@ class Sandbox:
         )
 
 
+def _tests_run(result: SandboxResult) -> int:
+    """Tests that were collected and ran or were skipped (a collection error is not one)."""
+    if result.test is None or result.status == "error":
+        return 0
+    return max(0, result.counts.total - result.counts.errors)
+
+
 def _read_json(path: Path) -> dict:
     try:
         data = json.loads(path.read_text())
@@ -982,6 +991,31 @@ class SandboxSession:
             used = plan if base.lockfile_applied else dataclasses.replace(plan, constraints=())
             base.smoke = self.sandbox._smoke(self._workspace, self._image, self.smoke, used)
 
+    def _retry_without_import_paths(self, first: SandboxResult, measure: bool) -> SandboxResult:
+        """Nothing collected with the import dirs apifix guessed: run once more without them and
+        keep whichever run collected tests (the run with them if neither did)."""
+        assert self._workspace is not None and self._image is not None
+        plain = dataclasses.replace(self.tests, import_paths=(), import_paths_guessed=False)
+        retry = copy.deepcopy(self.base)
+        retry.import_paths = []
+        retry.notes = [n for n in retry.notes if n not in self.tests.notes]
+        self._workspace.reset_work(self.repo)
+        self.sandbox._test(self._workspace, self._image, plain, retry, measure, self.env)
+        paths = ", ".join(f"{p}/" for p in self.tests.import_paths)
+        if _tests_run(retry) > 0:
+            retry.notes.append(
+                f"no tests collected with {paths} on the import path; ran again without it "
+                "and used that run"
+            )
+            retry.retried_without_import_paths = True
+            return retry
+        first.notes.append(
+            f"no tests collected with {paths} on the import path, or without it; kept the run "
+            "with it"
+        )
+        first.retried_without_import_paths = True
+        return first
+
     def run_tests(self, *, coverage: bool | None = None) -> SandboxResult:
         """Run the test phase. `coverage` defaults to the session setting (it can only be
         turned on if the session was opened with coverage=True, since it must be installed)."""
@@ -995,6 +1029,8 @@ class SandboxSession:
             self._runs += 1
             measure = self.coverage if coverage is None else (coverage and self.coverage)
             self.sandbox._test(self._workspace, self._image, self.tests, result, measure, self.env)
+            if self.tests.import_paths_guessed and _tests_run(result) == 0:
+                result = self._retry_without_import_paths(result, measure)
             return result
         finally:
             # This run's cost: the (shared) install plus its own test phase.

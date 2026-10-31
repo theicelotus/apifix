@@ -308,7 +308,7 @@ FLAT_SERVICE = {
     "requirements.txt": "openai==0.28.1\n",
     "svc/__init__.py": "",
     "svc/server.py": "def reply():\n    return 1\n",
-    "svc/testserver.py": "import unittest\nfrom server import reply\n",
+    "svc/test_server.py": "import unittest\nfrom server import reply\n",
 }
 
 
@@ -316,9 +316,9 @@ def test_sibling_import_in_a_package_gets_an_import_path(tmp_path):
     plan = detect_tests(write(tmp_path, FLAT_SERVICE))
     assert plan.import_paths == ("svc",)
     assert plan.notes == (
-        "added svc/ to the import path: svc/testserver.py imports server from it",
+        "added svc/ to the import path: svc/test_server.py imports server from it",
     )
-    assert plan.command == (*RUN, "svc/testserver.py")
+    assert plan.command == (*RUN, "svc/test_server.py")
 
 
 def test_module_in_a_parent_dir_is_found(tmp_path):
@@ -327,7 +327,7 @@ def test_module_in_a_parent_dir_is_found(tmp_path):
         "svc/checks/__init__.py": "",
         "svc/checks/test_x.py": "import server\n",
     }
-    del files["svc/testserver.py"]
+    del files["svc/test_server.py"]
     assert detect_tests(write(tmp_path, files)).import_paths == ("svc",)
 
 
@@ -344,8 +344,93 @@ def test_no_import_path_when_importable_from_the_root(tmp_path, where):
 
 
 def test_stdlib_and_third_party_imports_add_nothing(tmp_path):
-    files = {**FLAT_SERVICE, "svc/testserver.py": "import json\nimport flask\nimport unittest\n"}
+    files = {**FLAT_SERVICE, "svc/test_server.py": "import json\nimport flask\nimport unittest\n"}
     assert detect_tests(write(tmp_path, files)).import_paths == ()
+
+
+# shaped like saulpw/aipl: ops are modules named after what they do, one of them `json`
+AIPL = {
+    "pyproject.toml": "[project]\nname = 'aipl'\n",
+    "aipl/__init__.py": "",
+    "aipl/ops/__init__.py": "",
+    "aipl/ops/json.py": "def parse(s):\n    return s\n",
+    "aipl/ops/test.py": "import json\nimport sys\n",
+    "aipl/ops/ops_helper.py": "X = 1\n",
+    "tests/test_aipl.py": "def test_x():\n    assert True\n",
+}
+
+
+def test_only_files_pytest_collects_justify_an_import_path(tmp_path):
+    # aipl/ops/test.py is run when named, but pytest would not collect it
+    files = {
+        **AIPL,
+        "aipl/ops/json.py": "",
+        "aipl/ops/test.py": "import ops_helper\n",
+    }
+    plan = detect_tests(write(tmp_path, files))
+    assert "aipl/ops/test.py" in plan.test_files
+    assert plan.import_paths == ()
+
+
+def test_collected_file_in_the_same_place_does_justify_it(tmp_path):
+    files = {
+        "aipl/__init__.py": "",
+        "aipl/ops/__init__.py": "",
+        "aipl/ops/ops_helper.py": "X = 1\n",
+        "aipl/ops/test_helper.py": "import ops_helper\n",
+    }
+    plan = detect_tests(write(tmp_path, files))
+    assert plan.import_paths == ("aipl/ops",)
+    assert plan.import_paths_guessed
+
+
+def test_python_files_config_decides_what_counts_as_a_test_file(tmp_path):
+    files = {
+        "pytest.ini": "[pytest]\npython_files = check_*.py\n",
+        "pkg/__init__.py": "",
+        "pkg/helper.py": "",
+        "pkg/check_it.py": "import unittest\nimport helper\n\ndef test_x():\n    pass\n",
+        "pkg/test_it.py": "import helper\n",
+    }
+    plan = detect_tests(write(tmp_path, files))
+    assert plan.import_paths == ("pkg",)
+    assert plan.notes == ("added pkg/ to the import path: pkg/check_it.py imports helper from it",)
+    files["pkg/check_it.py"] = "import unittest\n\ndef test_x():\n    pass\n"
+    assert detect_tests(write(tmp_path, files)).import_paths == ()
+
+
+def test_bare_stdlib_import_never_adds_a_directory(tmp_path):
+    # the directory has a module named like the stdlib one the test imports
+    files = {
+        "aipl/__init__.py": "",
+        "aipl/ops/__init__.py": "",
+        "aipl/ops/json.py": "",
+        "aipl/ops/test_ops.py": "import json\n",
+    }
+    assert detect_tests(write(tmp_path, files)).import_paths == ()
+
+
+def test_directory_shadowing_a_stdlib_name_is_never_added(tmp_path):
+    files = {
+        **AIPL,
+        "aipl/ops/test_ops.py": "import ops_helper\n",  # a real sibling import...
+    }
+    plan = detect_tests(write(tmp_path, files))
+    assert plan.import_paths == ()  # ...but ops/ also holds json.py
+    # a package shadows too
+    shutil_files = {k: v for k, v in files.items() if k != "aipl/ops/json.py"}
+    root = tmp_path / "two"
+    shutil_files["aipl/ops/logging/__init__.py"] = ""
+    assert detect_tests(write(root, shutil_files)).import_paths == ()
+    del shutil_files["aipl/ops/logging/__init__.py"]
+    shutil_files["aipl/ops/string.py"] = ""
+    assert detect_tests(write(tmp_path / "three", shutil_files)).import_paths == ()
+
+
+def test_directory_without_shadowing_names_is_still_added(tmp_path):
+    files = {k: v for k, v in AIPL.items() if k not in ("aipl/ops/json.py", "aipl/ops/test.py")}
+    files["aipl/ops/test_ops.py"] = "import ops_helper\n"
+    assert detect_tests(write(tmp_path, files)).import_paths == ("aipl/ops",)
 
 
 def test_repo_pythonpath_config_replaces_the_guess(tmp_path):
@@ -353,7 +438,7 @@ def test_repo_pythonpath_config_replaces_the_guess(tmp_path):
     plan = detect_tests(write(tmp_path, files))
     assert plan.import_paths == ("lib",)
     assert plan.notes == ("import path from pyproject.toml pythonpath: lib",)
-    assert plan.command == (*RUN, "svc/testserver.py")  # no testpaths: explicit
+    assert plan.command == (*RUN, "svc/test_server.py")  # no testpaths: explicit
 
 
 @pytest.mark.parametrize(

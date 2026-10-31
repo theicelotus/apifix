@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import ast
 import configparser
+import fnmatch
 import hashlib
 import json
 import re
 import shlex
+import sys
 import tomllib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -225,6 +227,9 @@ class TestPlan:
     # bare name, e.g. backend/testapp.py doing `from app import ...`), and why.
     import_paths: tuple[str, ...] = ()
     notes: tuple[str, ...] = ()
+    # import_paths were guessed from imports (not set by the repo's pytest `pythonpath`), so a
+    # run that cannot collect with them may be retried without
+    import_paths_guessed: bool = False
 
 
 # One definition of "test file", used by the scanner, the sandbox, the verifier (tampering
@@ -432,21 +437,52 @@ def _pytest_basedir(repo: Path, directory: PurePosixPath) -> PurePosixPath:
     return directory
 
 
+DEFAULT_PYTHON_FILES = ("test_*.py", "*_test.py")
+
+
+def _shadows_stdlib(repo: Path, directory: PurePosixPath) -> str | None:
+    """A standard-library module name that a module in `directory` would shadow, or None."""
+    try:
+        entries = sorted((repo / directory).iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if entry.is_file() and entry.suffix == ".py":
+            name = entry.stem
+        elif entry.is_dir() and (entry / "__init__.py").is_file():
+            name = entry.name
+        else:
+            continue
+        if name in sys.stdlib_module_names and not name.startswith("__"):
+            return name
+    return None
+
+
 def guess_import_paths(
-    repo: Path, files: Iterable[tuple[str, str]]
+    repo: Path,
+    files: Iterable[tuple[str, str]],
+    python_files: Iterable[str] = DEFAULT_PYTHON_FILES,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Dirs to put on PYTHONPATH so test files can import sibling modules by bare name, and a
-    note for each. For every absolute import in a test file whose first name is not a module
-    at the repo root or under src/, the nearest dir from the file's own dir upwards that has
-    it, unless that is the dir pytest puts on sys.path anyway."""
+    note for each. For every absolute import in a test file pytest would collect (its name
+    matches `python_files`) whose first name is not a module at the repo root or under src/,
+    the nearest dir from the file's own dir upwards that has it, unless that is the dir pytest
+    puts on sys.path anyway. A standard-library name never justifies a dir, and a dir holding
+    a module named like a standard-library one is never added: it would shadow that module for
+    the whole run."""
+    patterns = tuple(python_files) or DEFAULT_PYTHON_FILES
     paths: dict[str, str] = {}
     root = PurePosixPath(".")
     for rel, source in files:
+        if not any(fnmatch.fnmatchcase(PurePosixPath(rel).name, pat) for pat in patterns):
+            continue
         directory = PurePosixPath(rel).parent
         if directory == root:
             continue
         base = _pytest_basedir(repo, directory)
         for name in sorted(_top_level_imports(source)):
+            if name in sys.stdlib_module_names:
+                continue
             if _has_module(repo, root, name) or _has_module(repo, PurePosixPath("src"), name):
                 continue
             for candidate in (directory, *directory.parents):
@@ -454,7 +490,11 @@ def guess_import_paths(
                     break
                 if _has_module(repo, candidate, name):
                     key = candidate.as_posix()
-                    if candidate != base and key not in paths:
+                    if (
+                        candidate != base
+                        and key not in paths
+                        and _shadows_stdlib(repo, candidate) is None
+                    ):
                         paths[key] = (
                             f"added {key}/ to the import path: {rel} imports {name} from it"
                         )
@@ -497,7 +537,9 @@ def detect_tests(repo: Path) -> TestPlan:
             f"import path from {config} pythonpath: {', '.join(import_paths)}",
         )
     else:
-        import_paths, notes = guess_import_paths(repo, runnable)
+        import_paths, notes = guess_import_paths(
+            repo, runnable, options.get("python_files") or DEFAULT_PYTHON_FILES
+        )
     base = PYTEST_COMMAND
     stop = stops_at_first_failure(options.get("addopts", ()))
     if stop:
@@ -513,7 +555,8 @@ def detect_tests(repo: Path) -> TestPlan:
         command = base
     else:
         command = (*base, *test_files)
-    return TestPlan("pytest", test_files, command, reason, import_paths, notes)
+    guessed = bool(import_paths) and not options.get("pythonpath")
+    return TestPlan("pytest", test_files, command, reason, import_paths, notes, guessed)
 
 
 # --- dependencies ---------------------------------------------------------------------------

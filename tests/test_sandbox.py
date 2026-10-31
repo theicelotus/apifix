@@ -724,7 +724,7 @@ def flat_service(tmp_path) -> Path:
         "requirements.txt": "openai==0.28.1\ntyping_extensions==4.5.0\nflask==2.2.3\n",
         "svc/__init__.py": "",
         "svc/server.py": "def reply():\n    return 1\n",
-        "svc/testserver.py": "import unittest\nfrom server import reply\n",
+        "svc/test_server.py": "import unittest\nfrom server import reply\n",
     }
     for rel, text in files.items():
         (root / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -738,10 +738,12 @@ def test_import_paths_and_explicit_files_reach_the_driver(flat_service):
     (test_call,) = [c for c in docker.calls if c.phase == "test"]
     driver_args = test_call.args[test_call.args.index("/apifix/driver.py") + 1 :]
     assert driver_args[:4] == ["test", "--path", "svc", "--"]
-    assert driver_args[-1] == "svc/testserver.py"
+    assert driver_args[-1] == "svc/test_server.py"
     assert result.import_paths == ["svc"]
-    assert result.test_command[-1] == "svc/testserver.py"
-    assert "added svc/ to the import path: svc/testserver.py imports server from it" in result.notes
+    assert result.test_command[-1] == "svc/test_server.py"
+    assert (
+        "added svc/ to the import path: svc/test_server.py imports server from it" in result.notes
+    )
 
 
 def test_note_when_there_is_nothing_to_install(flat_service):
@@ -1138,3 +1140,73 @@ def test_dropped_sources_reach_the_result(tmp_path):
         "six==1.15.0",
     ]
     assert "tiktoken==0.5.1" not in docker.requirements[0]
+
+
+# --- guessed import paths that break collection ----------------------------------------------
+
+GUESSED = TestPlan(
+    "pytest",
+    ("aipl/ops/test_ops.py",),
+    ("{python}", "-m", "pytest"),
+    "explicit",
+    import_paths=("aipl/ops",),
+    notes=("added aipl/ops/ to the import path: aipl/ops/test_ops.py imports ops_helper",),
+    import_paths_guessed=True,
+)
+
+
+def paths_in(call: Call) -> list[str]:
+    return call.opt("--path") if "--path" in call.args else []
+
+
+def collects_only_without_paths(call: Call) -> ProcResult:
+    """The circular import of aipl: collection crashes while the dir is on the path."""
+    results = write_driver_json(call)
+    if "--path" in call.args:
+        return exited(2, stderr="ImportError: cannot import name 'loads' from partially init json")
+    (results / "junit.xml").write_text(junit(passed=3))
+    return ok("pytest output")
+
+
+def test_collection_failure_retries_without_guessed_import_paths(repo):
+    docker = FakeDocker(test=collects_only_without_paths)
+    result = Sandbox(docker=docker).run(repo, tests=GUESSED)
+    tests = [c for c in docker.calls if c.phase == "test"]
+    assert [bool(c.opt("--path")) for c in tests] == [True, False]
+    assert result.status == "passed"
+    assert result.import_paths == []
+    assert result.retried_without_import_paths
+    assert any("ran again without it" in n for n in result.notes)
+    assert not any(n.startswith("added aipl/ops/") for n in result.notes)
+
+
+def test_retry_that_collects_nothing_keeps_the_first_run(repo):
+    def nothing(call: Call) -> ProcResult:
+        write_driver_json(call)
+        return exited(2, stderr="boom")
+
+    docker = FakeDocker(test=nothing)
+    result = Sandbox(docker=docker).run(repo, tests=GUESSED)
+    assert len([c for c in docker.calls if c.phase == "test"]) == 2
+    assert result.import_paths == ["aipl/ops"]
+    assert result.retried_without_import_paths
+    assert any("kept the run with it" in n for n in result.notes)
+
+
+def test_no_retry_when_the_guessed_paths_collected_tests(repo):
+    docker = FakeDocker(test=pytest_run(passed=2))
+    result = Sandbox(docker=docker).run(repo, tests=GUESSED)
+    assert len([c for c in docker.calls if c.phase == "test"]) == 1
+    assert result.import_paths == ["aipl/ops"]
+    assert not result.retried_without_import_paths
+
+
+def test_no_retry_for_import_paths_from_the_repos_config(repo):
+    import dataclasses
+
+    configured = dataclasses.replace(GUESSED, import_paths_guessed=False)
+    docker = FakeDocker(test=collects_only_without_paths)
+    result = Sandbox(docker=docker).run(repo, tests=configured)
+    assert len([c for c in docker.calls if c.phase == "test"]) == 1
+    assert result.status == "error"
+    assert result.import_paths == ["aipl/ops"]
