@@ -11,6 +11,7 @@ from apifix.engine.diffing import FileChange
 from apifix.engine.test_results import FileCoverage
 from apifix.engine.verifier import TestDelta
 from apifix.engine.weak_retry import (
+    import_rot_tests,
     patches,
     retry_prompt,
     skip_reason,
@@ -111,6 +112,31 @@ def test_no_extra_attempt_when_none_is_left(repo):
     assert "No extra attempt before settling for weak evidence: not retried" in (
         result.report_markdown
     )
+
+
+def test_no_extra_attempt_when_baseline_import_rot_explains_the_failing_tests(repo):
+    # the changed module `app` cannot be imported in either run (a pydantic-ai-style import error
+    # elsewhere): no edit makes these tests pass
+    message = "AttributeError: module 'app' has no attribute 'llm'"
+    result = go(repo, FakeLLM([tools(FIX_APP, FIX_TESTS), done()]), judging(message=message))
+    assert (result.outcome, result.attempts) == ("verified_weak", 1)
+    first = result.trajectory["attempts"][0]
+    assert first["weak_retried"] is False
+    assert first["weak_retry"].startswith("not retried: baseline_import_rot")
+
+
+def test_import_rot_tests_needs_the_reason_and_a_message_naming_a_changed_module():
+    rot = SimpleNamespace(code="baseline_import_rot")
+    messages = {"t::a": "AttributeError: module 'app' has no attribute 'llm'", "t::b": "boom"}
+    fixed = SimpleNamespace(tests=[SimpleNamespace(id=t, message=m) for t, m in messages.items()])
+    base = {
+        "changes": [FileChange("app.py", "modified")],
+        "fixed": fixed,
+        "delta": TestDelta(),
+    }
+    tests = list(messages)
+    assert import_rot_tests(SimpleNamespace(reasons=[rot], **base), tests) == {"t::a"}
+    assert import_rot_tests(SimpleNamespace(reasons=[], **base), tests) == set()
 
 
 def test_no_extra_attempt_when_the_test_imports_a_repo_module_the_checkout_lacks(tmp_path):

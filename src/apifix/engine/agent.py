@@ -115,6 +115,7 @@ from apifix.engine.verifier import (
 )
 from apifix.engine.walk import copy_repo, iter_files
 from apifix.engine.weak_retry import (
+    import_rot_tests,
     retry_prompt,
     retry_reason,
     skip_reason,
@@ -2479,6 +2480,15 @@ class _Job:
             return skip("no attempt is left")
         if environment_incomplete(v) or sandbox_requirements_pin(v) or pytest_usage_error(v):
             return skip("the sandbox's environment is incomplete, which no edit fixes")
+        rotten = import_rot_tests(v, tests)
+        if rotten:
+            tests = {t: why for t, why in tests.items() if t not in rotten}
+            if not tests:
+                return skip(
+                    f"baseline_import_rot: an import error blocks all {len(rotten)} of them in "
+                    "both runs, so no edit to the code can make them pass"
+                )
+            attempt.weak_tests = tests
         kept, environmental, missing = split_environmental(
             v, self.work, self.migration.api_modules, tests
         )

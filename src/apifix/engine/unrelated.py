@@ -1105,11 +1105,176 @@ def _drift(diff: _Diff) -> list[str]:
     finding): an exception's `from` clause that is gone, and a variable passed to a call of
     the original that another expression, not built from it, replaced
     (`time.sleep(wait_time)` -> `time.sleep(2**attempt)`). Calls on a finding's own lines are
-    the migration's to rewrite."""
+    the migration's to rewrite. Control flow too: a statement that moved into an existing
+    branch it was not in, and a variable left assigned only inside a new condition."""
     errors = sorted(
-        [*_dropped_causes(diff), *_replaced_arguments(diff), *_dropped_module_guards(diff)]
+        [
+            *_dropped_causes(diff),
+            *_replaced_arguments(diff),
+            *_dropped_module_guards(diff),
+            *_moved_statements(diff),
+            *_stranded_variables(diff),
+        ]
     )
     return [message for _, message in errors]
+
+
+# --- control flow --------------------------------------------------------------------------------
+
+_Block = tuple[str, str]  # (header text, branch): ("if retry_after", "else")
+
+
+@dataclass
+class _Flow:
+    """The simple statements and the names of one version, each with its chain of enclosing
+    blocks (if/else branches, loops, try/except clauses) inside its function."""
+
+    stmts: list[tuple[ast.stmt, str, tuple[_Block, ...]]]
+    names: list[tuple[str, str, bool, tuple[_Block, ...], ast.AST]]  # scope, name, store?, ...
+
+
+def _branches(stmt: ast.stmt) -> list[tuple[_Block | None, list[ast.stmt]]] | None:
+    """The statement lists inside a compound statement with the block each one opens (None: the
+    chain does not change, as in `with`); None for a simple statement."""
+    if isinstance(stmt, ast.If):
+        head = f"if {ast.unparse(stmt.test)}"
+        return [((head, "body"), stmt.body), ((head, "else"), stmt.orelse)]
+    if isinstance(stmt, ast.For | ast.AsyncFor):
+        head = f"for {ast.unparse(stmt.target)} in {ast.unparse(stmt.iter)}"
+        return [((head, "body"), stmt.body), ((head, "else"), stmt.orelse)]
+    if isinstance(stmt, ast.While):
+        head = f"while {ast.unparse(stmt.test)}"
+        return [((head, "body"), stmt.body), ((head, "else"), stmt.orelse)]
+    if isinstance(stmt, ast.Try | ast.TryStar):
+        out: list[tuple[_Block | None, list[ast.stmt]]] = [(("try", "body"), stmt.body)]
+        for h in stmt.handlers:
+            kind = ast.unparse(h.type) if h.type else ""
+            head = f"except {kind}" + (f" as {h.name}" if h.name else "")
+            out.append(((head, "body"), h.body))
+        return [*out, (("try", "else"), stmt.orelse), (("try", "finally"), stmt.finalbody)]
+    if isinstance(stmt, ast.With | ast.AsyncWith):
+        return [(None, stmt.body)]
+    return None
+
+
+def _flow(tree: ast.Module, scopes: _Scopes) -> _Flow:
+    flow = _Flow([], [])
+
+    def names(nodes: Iterable[ast.AST], chain: tuple[_Block, ...]) -> None:
+        for top in nodes:
+            for n in ast.walk(top):
+                if isinstance(n, ast.Name):
+                    store = not isinstance(n.ctx, ast.Load)
+                    flow.names.append((scopes.scope(n), n.id, store, chain, n))
+                if isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name):
+                    flow.names.append((scopes.scope(n), n.target.id, False, chain, n.target))
+
+    def visit(body: list[ast.stmt], chain: tuple[_Block, ...]) -> None:
+        for stmt in body:
+            if isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                visit(stmt.body, ())
+                continue
+            branches = _branches(stmt)
+            if branches is None:
+                if not isinstance(stmt, ast.Pass):
+                    flow.stmts.append((stmt, scopes.scope(stmt), chain))
+                names([stmt], chain)
+                continue
+            head = [c for c in ast.iter_child_nodes(stmt) if not isinstance(c, ast.stmt)]
+            for c in list(head):
+                if isinstance(c, ast.ExceptHandler):  # its body is visited below
+                    head.remove(c)
+                    head += [c.type] if c.type else []
+            names(head, chain)
+            for block, inner in branches:
+                visit(inner, chain if block is None else (*chain, block))
+
+    visit(tree.body, ())
+    return flow
+
+
+def _block_text(block: _Block) -> str:
+    head, branch = block
+    where = {"body": "the body of", "else": "the else of"}.get(branch, f"the {branch} of")
+    return f"{where} `{head}:`"
+
+
+def _moved_statements(diff: _Diff) -> list[tuple[int, str]]:
+    """Statements outside the findings' lines that the candidate puts inside a block of the
+    original it was not in (a statement after `if retry_after: ... else: ...` now in that
+    else). The statements pair up by scope and text (when the counts match); a block the
+    candidate adds (a wrapper such as a new `if e.code == 429:`) is the migration's business,
+    one that the original also has, with the same condition text and branch, is not: the
+    statement now runs under another condition. One error per block."""
+    old, new = _flow(diff.old.tree, diff.old_scopes), _flow(diff.new.tree, diff.new_scopes)
+    existing = {b for _, _, chain in old.stmts for b in chain if b[0] != "try"}
+    groups: dict[tuple[str, str], list[list]] = {}
+    for stmt, scope, chain in old.stmts:
+        groups.setdefault((scope, ast.unparse(stmt)), [[], []])[0].append((stmt, chain))
+    for stmt, scope, chain in new.stmts:
+        if (scope, ast.unparse(stmt)) in groups:
+            groups[(scope, ast.unparse(stmt))][1].append((stmt, chain))
+    errors: dict[tuple[str, _Block], tuple[int, str]] = {}
+    for (scope, text), (olds, news) in groups.items():
+        if len(olds) != len(news):
+            continue
+        for (stmt, was), (_, now) in zip(olds, news, strict=True):
+            if _lines_of(stmt) & diff.finding_lines:
+                continue
+            for block in now:
+                if block in was or block not in existing or (scope, block) in errors:
+                    continue
+                errors[(scope, block)] = (
+                    stmt.lineno,
+                    f"original line {stmt.lineno}: `{_clip(text)}` now sits in "
+                    f"{_block_text(block)}, which it was not in; it runs under another "
+                    "condition than before. Keep it where it was (a migration guard goes in "
+                    "its own `if`, the rest of the block stays as written)",
+                )
+    return sorted(errors.values())
+
+
+def _stranded_variables(diff: _Diff) -> list[tuple[int, str]]:
+    """A variable of the original that the candidate assigns only inside a new conditional
+    block (an added `if`, loop or `except`) and still reads outside it: when the condition does
+    not hold the read fails with a NameError or sees another value. Variables the findings'
+    lines assign are the migration's to move."""
+    old, new = _flow(diff.old.tree, diff.old_scopes), _flow(diff.new.tree, diff.new_scopes)
+    existing = {b for _, _, chain in old.stmts for b in chain}
+    skipped = {
+        (scope, name)
+        for scope, name, _, _, node in old.names
+        if getattr(node, "lineno", 0) in diff.finding_lines
+    }
+    olds: dict[tuple[str, str], list[tuple[bool, tuple[_Block, ...], ast.AST]]] = {}
+    news: dict[tuple[str, str], list[tuple[bool, tuple[_Block, ...], ast.AST]]] = {}
+    for table, flow in ((olds, old), (news, new)):
+        for scope, name, store, chain, node in flow.names:
+            table.setdefault((scope, name), []).append((store, chain, node))
+    errors = []
+    for key, was in olds.items():
+        stores = [(c, n) for s, c, n in was if s]
+        now = news.get(key, [])
+        new_stores = [c for s, c, _ in now if s]
+        if key in skipped or not stores or not new_stores or not any(not s for s, _, _ in was):
+            continue
+        shared = set(new_stores[0]).intersection(*new_stores[1:])
+        for block in sorted(shared):
+            if block in existing or block[0] == "try" or any(block in c for c, _ in stores):
+                continue
+            if any(not s and block not in c for s, c, _ in now):
+                line = min(n.lineno for _, n in stores)
+                errors.append(
+                    (
+                        line,
+                        f"original line {line}: `{key[1]}` is now assigned only inside "
+                        f"{_block_text(block)} but is still used outside it, so it can be "
+                        "unset when that condition does not hold; keep the assignment where "
+                        "it was, before the branch",
+                    )
+                )
+                break
+    return sorted(errors)
 
 
 def _raises_at_import(node: ast.stmt) -> bool:

@@ -1097,3 +1097,94 @@ def test_a_raise_guard_inside_a_function_is_not_a_module_guard():
     findings = scan_text("ailabel/lib/llms.py", old, GENAI)
     errors = unrelated_edits(old, new, findings, GENAI.api_modules)
     assert not any("module-level guard" in e for e in errors)
+
+
+# --- control flow: a handler body re-indented into other branches -----------------------------
+
+RETRY_OLD = textwrap.dedent(
+    """\
+    import time
+
+    import google.generativeai as genai
+    from google.api_core import exceptions as google_exceptions
+
+
+    def generate(model, prompt, max_retries=3):
+        for attempt in range(max_retries):
+            try:
+                return model.generate_content(prompt)
+            except google_exceptions.ResourceExhausted as e:
+                retry_after = None
+                if getattr(e, "headers", None):
+                    retry_after = e.headers.get("Retry-After")
+                if retry_after:
+                    wait_time = float(retry_after)
+                else:
+                    wait_time = 2**attempt
+                if attempt < max_retries - 1:
+                    time.sleep(wait_time)
+                    continue
+                raise
+    """
+)
+RETRY_HEAD = RETRY_OLD.replace("google.generativeai as genai", "google.genai as genai").replace(
+    "from google.api_core import exceptions as google_exceptions",
+    "from google.genai import errors",
+)
+RETRY_GOOD = RETRY_HEAD.replace(
+    "except google_exceptions.ResourceExhausted as e:\n",
+    "except errors.ClientError as e:\n            if e.code != 429:\n                raise\n",
+)
+RETRY_WRAPPED = RETRY_HEAD.replace(
+    "except google_exceptions.ResourceExhausted as e:\n"
+    "            retry_after = None\n"
+    '            if getattr(e, "headers", None):\n'
+    '                retry_after = e.headers.get("Retry-After")\n'
+    "            if retry_after:\n"
+    "                wait_time = float(retry_after)\n"
+    "            else:\n"
+    "                wait_time = 2**attempt\n"
+    "            if attempt < max_retries - 1:\n"
+    "                time.sleep(wait_time)\n"
+    "                continue\n"
+    "            raise\n",
+    "except errors.ClientError as e:\n"
+    '            if getattr(e, "code", None) == 429:\n'
+    "                retry_after = None\n"
+    '                if getattr(e, "headers", None):\n'
+    '                    retry_after = e.headers.get("Retry-After")\n'
+    "            if retry_after:\n"
+    "                wait_time = float(retry_after)\n"
+    "            else:\n"
+    "                wait_time = 2**attempt\n"
+    "                if attempt < max_retries - 1:\n"
+    "                    time.sleep(wait_time)\n"
+    "                    continue\n"
+    "            raise\n",
+)
+
+
+def flow_errors(new: str) -> list[str]:
+    findings = scan_text("llm/gemini.py", RETRY_OLD, GENAI)
+    assert findings
+    errors = unrelated_edits(RETRY_OLD, new, findings, GENAI.api_modules)
+    return [e for e in errors if "now sits in" in e or "assigned only inside" in e]
+
+
+def test_a_guard_at_the_top_of_the_clause_keeps_the_control_flow():
+    assert flow_errors(RETRY_GOOD) == []
+    assert flow_errors(RETRY_HEAD) == []  # only the exception class renamed
+
+
+def test_a_statement_moved_into_an_existing_else_is_reported():
+    errors = flow_errors(RETRY_WRAPPED)
+    moved = [e for e in errors if "now sits in" in e]
+    assert len(moved) == 1  # one per block, not one per statement
+    assert "the else of `if retry_after:`" in moved[0]
+
+
+def test_a_variable_assigned_only_in_a_new_conditional_is_reported():
+    errors = [e for e in flow_errors(RETRY_WRAPPED) if "assigned only inside" in e]
+    assert len(errors) == 1
+    assert errors[0].startswith("original line 12: `retry_after` is now assigned only inside")
+    assert "`if getattr(e, 'code', None) == 429:`" in errors[0]

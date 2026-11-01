@@ -159,6 +159,17 @@ keeps one is rejected). Keep `google.api_core` only where the repo declares goog
 the file uses it for something besides the Gemini calls (another Google client, or retries on
 the exception types themselves rather than catching them).
 
+`ResourceExhausted` -> `ClientError` also catches the other 4xx codes, so keep the handler body
+as it is and guard on the code at the top of the clause, never around part of the body (wrapping
+and re-indenting part of it moves statements into other branches and leaves variables unset):
+
+```python
+except errors.ClientError as e:
+    if e.code != 429:
+        raise
+    <the original ResourceExhausted body, unchanged>
+```
+
 Do not change retry loops. Only the exception class names change
 (`google_exceptions.X` -> `errors.ClientError` / `errors.ServerError` / `errors.APIError`);
 the loop, its guards (attempt counts, which errors retry) and its waits (`time.sleep(...)`,

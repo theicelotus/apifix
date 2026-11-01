@@ -15,7 +15,7 @@ from pathlib import Path
 
 from apifix.engine.api_names import in_modules
 from apifix.engine.project import is_test_file
-from apifix.engine.verifier import Verification, module_names, test_files_of
+from apifix.engine.verifier import Verification, module_names, rot_module, test_files_of
 
 PATCH_CALLS = frozenset({"patch", "setattr", "setitem", "delitem", "delattr"})
 MAX_TESTS = 10
@@ -97,6 +97,16 @@ def missing_repo_module(
         ):
             return name
     return None
+
+
+def import_rot_tests(v: Verification, tests: Collection[str]) -> set[str]:
+    """The `tests` that `baseline_import_rot` explains: it is among the verification's reasons
+    and the test's output on the fixed code says a module holding changed files could not be
+    imported. They never ran the changed code, so another edit cannot make them pass."""
+    if not any(r.code == "baseline_import_rot" for r in v.reasons):
+        return set()
+    names = module_names(c.path for c in v.changes if c.kind != "deleted")
+    return {t for t in tests if rot_module(fixed_message(v, t), names)}
 
 
 def split_environmental(

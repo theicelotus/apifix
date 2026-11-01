@@ -1353,7 +1353,7 @@ def module_names(paths: Iterable[str]) -> set[str]:
     return names
 
 
-def _rot_module(message: str, names: set[str]) -> str | None:
+def rot_module(message: str, names: set[str]) -> str | None:
     """The changed module or package a failure's message says could not be imported (or has no
     attribute, the way `mock.patch("pkg.mod.x")` reports a module it failed to import)."""
     for pattern in (_ROT_ATTRIBUTE, _ROT_IMPORT):
@@ -1382,8 +1382,8 @@ def baseline_rot_reasons(
         other = fixed_failing.get(t.id)
         if t.outcome not in ("failed", "error") or other is None:
             continue
-        module = _rot_module(t.message, names)
-        if module and _rot_module(other.message, names):
+        module = rot_module(t.message, names)
+        if module and rot_module(other.message, names):
             rotten[t.id] = module
     if not rotten:
         return []
