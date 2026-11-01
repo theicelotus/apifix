@@ -404,6 +404,7 @@ def run_summary(run: SandboxResult) -> dict:
             if run.runner_error
             else {}
         ),
+        **({"timed_out_tests": list(run.timed_out_tests)} if run.timed_out_tests else {}),
         **({"smoke": asdict(run.smoke)} if run.smoke else {}),
         **({"not_installed": [asdict(n) for n in run.not_installed]} if run.not_installed else {}),
         **(
@@ -1656,6 +1657,9 @@ def _not_installed_section(left_out: Sequence[NotInstalled], shown: int = 12) ->
     return ["### Declared dependencies not installed", "", *_bullets(lines), ""]
 
 
+TIMEOUT_LIMIT_NOTE = "per-test time limit"
+
+
 def _report(v: Verification) -> str:
     out = [f"## Verification: {_VERDICT_TEXT[v.verdict]}", ""]
     out += [
@@ -1667,6 +1671,15 @@ def _report(v: Verification) -> str:
         f"| {v.fixed.python_version} / {v.fixed.image or '-'} |",
         "",
     ]
+    for label, run in (("original code", v.baseline), ("fixed code", v.fixed)):
+        if run.timed_out_tests:
+            names = ", ".join(f"`{t}`" for t in run.timed_out_tests[:12])
+            more = len(run.timed_out_tests) - 12
+            out.append(
+                f"**Timed out ({label}):** {names}"
+                + (f" and {more} more" if more > 0 else "")
+                + f" (stopped by the sandbox's {TIMEOUT_LIMIT_NOTE}; counted as failed)."
+            )
     ratio = v.coverage.ratio
     if ratio is not None and v.coverage.available:
         out.append(

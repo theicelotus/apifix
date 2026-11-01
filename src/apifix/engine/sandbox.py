@@ -62,6 +62,10 @@ PhaseStatus = Literal["ok", "failed", "timeout", "error", "skipped"]
 InstallMethod = Literal["editable", "pythonpath"]
 
 DRIVER = Path(__file__).with_name("sandbox_driver.py")
+PLUGIN_DIR = Path(__file__).with_name("sandbox_plugin")
+# A test that timed out (per-test limit or used-up budget): the JUnit failure message starts so.
+TIMEOUT_MARKER = "apifix-timeout:"
+TEST_BUDGET_MARGIN_S = 30  # left for the teardown, the JUnit report and coverage
 SMOKE_MARKER = "APIFIX_SMOKE_RESULT "  # sandbox_driver.SMOKE_MARKER
 INSTALL_STATS_MARKER = "APIFIX_INSTALL_STATS "  # sandbox_driver.INSTALL_STATS_MARKER
 PIP_CACHE_MOUNT = "/pipcache"
@@ -222,6 +226,9 @@ class SandboxConfig:
     tmpfs_size: str = "512m"
     install_timeout_s: float = 900
     test_timeout_s: float = 600
+    # One test's setup, call or teardown; the one it exceeds fails alone (0: no limit). The
+    # session's own budget is test_timeout_s minus TEST_BUDGET_MARGIN_S, so the report is written.
+    per_test_timeout_s: float = 120
     # Pulling the image, outside install_timeout_s (a slow or first pull must not eat the
     # install phase's own budget; see Sandbox._pull_image).
     image_pull_timeout_s: float = 300
@@ -368,6 +375,8 @@ class SandboxResult:
     # its output
     runner_error: str | None = None
     runner_output: str = ""
+    # tests stopped by the per-test limit or the session budget (they count as failed)
+    timed_out_tests: list[str] = field(default_factory=list)
     # dependency files left out because their pins conflict with an installed one's
     dropped_sources: list[DroppedSource] = field(default_factory=list)
     # pip's conflict lines when the install failed with ResolutionImpossible (install_conflict)
@@ -496,6 +505,7 @@ class _Workspace:
         (self.manifest / "requirements.txt").write_text("\n".join(plan.requirements) + "\n")
         (self.manifest / "constraints.txt").write_text("\n".join(plan.constraints) + "\n")
         shutil.copy2(DRIVER, self.tooling / "driver.py")
+        shutil.copytree(PLUGIN_DIR, self.tooling / "plugin", ignore=shutil.ignore_patterns("__*"))
         copy_repo(repo, self.work)
         if os.getuid() == 0:  # containers run as nobody: let it write where it must
             for d in (self.deps, self.work, self.results):
@@ -731,6 +741,10 @@ class Sandbox:
             command.append("--coverage")
         for path in tests.import_paths:
             command += ["--path", path]
+        if self.config.per_test_timeout_s > 0:
+            budget = max(self.config.test_timeout_s - TEST_BUDGET_MARGIN_S, 1)
+            command += ["--per-test-timeout", f"{self.config.per_test_timeout_s:g}"]
+            command += ["--budget", f"{budget:g}"]
         command += ["--", *tests.command]
         mounts = [
             Mount(ws.deps, "/deps", writable=False),
@@ -788,6 +802,7 @@ class Sandbox:
             except ReportError as exc:
                 result.status, result.reason = "error", str(exc)
                 return
+            result.timed_out_tests = [t.id for t in result.tests if TIMEOUT_MARKER in t.message]
         else:
             result.counts, result.tests = parse_unittest_output(phase.stderr + phase.stdout)
 

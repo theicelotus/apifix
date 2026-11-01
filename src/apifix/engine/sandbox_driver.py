@@ -31,6 +31,7 @@ OVERLAY = "/tmp/venv"
 MAX_LOG = 8000
 NO_PROJECT = "no pyproject.toml or setup.py"
 SMOKE_CHECK = "/apifix/smoke_check.py"
+PLUGINS = "/apifix/plugin"  # apifix_timeout.py
 SMOKE_MARKER = "APIFIX_SMOKE_RESULT "
 INSTALL_STATS_MARKER = "APIFIX_INSTALL_STATS "
 # pip's "Downloading x.whl (7.2 MB)" / "Using cached x.whl (7.2 MB)" (older pip: a URL, "7.2MB")
@@ -101,7 +102,7 @@ def _write_results(data):
         json.dump(data, f)
 
 
-def test(command, coverage=False, paths=()):
+def test(command, coverage=False, paths=(), per_test_timeout=0, budget=0):
     deps_venv = os.path.join(DEPS, "venv")
     subprocess.check_call([sys.executable, "-m", "venv", "--without-pip", OVERLAY])
     overlay_python = _venv_python(OVERLAY)
@@ -134,6 +135,14 @@ def test(command, coverage=False, paths=()):
     print("[apifix] repo install method: " + method, file=sys.stderr, flush=True)
 
     command = [overlay_python if part == "{python}" else part for part in command]
+    if per_test_timeout and command[1:3] == ["-m", "pytest"]:
+        # a per-test time limit (apifix_timeout.py); its dir is on PYTHONPATH for this alone
+        command[3:3] = ["-p", "apifix_timeout"]
+        env["PYTHONPATH"] = os.pathsep.join(
+            [PLUGINS] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
+        )
+        env["APIFIX_TEST_TIMEOUT"] = str(per_test_timeout)
+        env["APIFIX_TEST_BUDGET"] = str(budget)
     coverage = coverage and command[1:2] == ["-m"]  # wrap `python -m <runner> ...` only
     if coverage:
         env["COVERAGE_FILE"] = os.path.join(RESULTS, ".coverage")
@@ -202,7 +211,7 @@ def main(argv):
     if argv[:1] == ["test"] and "--" in argv:
         split = argv.index("--")
         options, command = argv[1:split], argv[split + 1 :]
-        coverage, paths, ok = False, [], True
+        coverage, paths, ok, limits = False, [], True, {}
         i = 0
         while i < len(options):
             if options[i] == "--coverage":
@@ -210,14 +219,26 @@ def main(argv):
             elif options[i] == "--path" and i + 1 < len(options):
                 i += 1
                 paths.append(options[i])
+            elif options[i] in ("--per-test-timeout", "--budget") and i + 1 < len(options):
+                i += 1
+                try:
+                    limits[options[i - 1]] = float(options[i])
+                except ValueError:
+                    ok = False
             else:
                 ok = False
             i += 1
         if ok and command:
-            return test(command, coverage=coverage, paths=paths)
+            return test(
+                command,
+                coverage=coverage,
+                paths=paths,
+                per_test_timeout=limits.get("--per-test-timeout", 0),
+                budget=limits.get("--budget", 0),
+            )
     print(
         "usage: driver.py install [--constraints] | smoke <distribution>"
-        " | test [--coverage] [--path DIR]... -- <cmd...>",
+        " | test [--coverage] [--path DIR]... [--per-test-timeout S] [--budget S] -- <cmd...>",
         file=sys.stderr,
     )
     return 2

@@ -167,7 +167,7 @@ def test_import_paths_go_on_pythonpath(env, pyproject):
 def test_main_passes_paths(monkeypatch):
     seen = {}
     monkeypatch.setattr(
-        driver, "test", lambda cmd, coverage=False, paths=(): seen.update(p=paths, c=cmd) or 0
+        driver, "test", lambda cmd, coverage=False, paths=(), **kw: seen.update(p=paths, c=cmd) or 0
     )
     assert driver.main(["test", "--path", "a", "--coverage", "--path", "b/c", "--", "x"]) == 0
     assert seen == {"p": ["a", "b/c"], "c": ["x"]}
@@ -241,7 +241,7 @@ def test_coverage_wraps_the_test_command(env, deps_with_coverage, monkeypatch):
 def test_coverage_flag_in_main(env, monkeypatch):
     seen = {}
     monkeypatch.setattr(
-        driver, "test", lambda cmd, coverage=False, paths=(): seen.update(c=coverage) or 0
+        driver, "test", lambda cmd, coverage=False, paths=(), **kw: seen.update(c=coverage) or 0
     )
     assert driver.main(["test", "--coverage", "--", "x"]) == 0
     assert seen == {"c": True}

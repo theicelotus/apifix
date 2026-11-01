@@ -224,7 +224,7 @@ def test_install_phase_never_sees_the_repo(repo):
         assert not host.resolve().is_relative_to(repo.resolve())
     seen = docker.snapshots[install.name]
     assert seen["/manifest"] == ["constraints.txt", "requirements.txt"]
-    assert seen["/apifix"] == ["driver.py"]
+    assert seen["/apifix"] == ["driver.py", "plugin", "plugin/apifix_timeout.py"]
     assert seen["/deps"] == []
     assert install.mounts["/manifest"][1] == "ro,z"
 
@@ -808,7 +808,9 @@ def test_import_paths_and_explicit_files_reach_the_driver(flat_service):
     result = run_sandbox(flat_service, docker=docker)
     (test_call,) = [c for c in docker.calls if c.phase == "test"]
     driver_args = test_call.args[test_call.args.index("/apifix/driver.py") + 1 :]
-    assert driver_args[:4] == ["test", "--path", "svc", "--"]
+    assert driver_args[:3] == ["test", "--path", "svc"]
+    assert driver_args[3:7] == ["--per-test-timeout", "120", "--budget", "570"]
+    assert driver_args[7] == "--"
     assert driver_args[-1] == "svc/test_server.py"
     assert result.import_paths == ["svc"]
     assert result.test_command[-1] == "svc/test_server.py"

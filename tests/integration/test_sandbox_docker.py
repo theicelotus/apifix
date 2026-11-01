@@ -337,8 +337,12 @@ def test_timeout_kills_and_removes_the_container(tmp_path, no_leftover_container
         tmp_path / "repo",
         {"tests/test_slow.py": "import time\n\ndef test_slow():\n    time.sleep(600)\n"},
     )
+    # no per-test limit: this is the backstop for a phase the plugin cannot interrupt
     config = SandboxConfig(
-        install_timeout_s=300, test_timeout_s=10, pip_cache_dir=default_pip_cache_dir()
+        install_timeout_s=300,
+        test_timeout_s=10,
+        per_test_timeout_s=0,
+        pip_cache_dir=default_pip_cache_dir(),
     )
     result = run_sandbox(repo, config)
     assert result.status == "timeout"
@@ -413,3 +417,23 @@ def test_resolution_conflict_keeps_pips_lines_and_is_not_retried(tmp_path):
     assert (result.status, result.reason) == ("error", "dependency install failed")
     assert len(result.install_attempts) == 1 and result.install_retried is False
     assert any("six==1.15.0" in line for line in result.install_conflict), result.install_conflict
+
+
+def test_per_test_timeout_stops_a_hanging_test_alone(tmp_path):
+    repo = make_repo(
+        tmp_path / "repo",
+        {
+            "tests/test_slow.py": "import time\n\ndef test_slow():\n    time.sleep(600)\n",
+            "tests/test_ok.py": "def test_ok():\n    pass\n",
+        },
+    )
+    config = SandboxConfig(
+        install_timeout_s=300,
+        test_timeout_s=120,
+        per_test_timeout_s=3,
+        pip_cache_dir=default_pip_cache_dir(),
+    )
+    result = run_sandbox(repo, config)
+    assert result.status == "failed", result.reason
+    assert [t.split("::")[-1] for t in result.timed_out_tests] == ["test_slow"]
+    assert result.counts.passed == 1
