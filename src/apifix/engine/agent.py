@@ -113,6 +113,7 @@ from apifix.engine.verifier import (
     verify,
 )
 from apifix.engine.walk import copy_repo, iter_files
+from apifix.engine.weak_retry import retry_prompt, retry_reason, still_failing_migrated
 from apifix.engine.whole_file import (
     CODE_BLOCK_NUDGE,
     DEFAULT_MAX_BYTES,
@@ -276,6 +277,10 @@ class Attempt:
     resend: dict[str, str] = field(default_factory=dict)
     diff: str = ""
     verification: Verification | None = None
+    # verified_weak: the migrated tests that fail before and after the fix (weak_retry), and,
+    # when an extra attempt followed for them, why (retry_reason)
+    weak_tests: dict[str, str] = field(default_factory=dict)
+    weak_retry: str = ""
     result: str = ""  # a verdict, "no_changes", "check_failed" (whole-file) or "aborted"
     usage: Usage = Usage()
     cost_usd: float = 0.0
@@ -297,6 +302,8 @@ class Attempt:
             "fell_back": self.fell_back,
             "resend": self.resend,
             "diff": self.diff,
+            "weak_tests": self.weak_tests,
+            "weak_retry": self.weak_retry,
             "verification": self.verification.to_dict() if self.verification else None,
             "verification_duration_s": round(self.verification_duration_s, 3),
             "usage": asdict(self.usage),
@@ -472,6 +479,7 @@ class _Job:
         self.wf_skipped: list[dict[str, object]] = []
         self.wf_pending: list[str] = []
         self.wf_verification: tuple[int, Verification] | None = None  # the last rejection
+        self.wf_weak_note = ""  # the feedback of an extra attempt for a verified_weak one
         self.wf_failing: set[str] = set()  # the tests it was about (failing_tests)
         # per verification (by id): its failure hints, with the uncalled-mock hint when the
         # working copy builds a client without a key (_failure_hints)
@@ -1020,6 +1028,7 @@ class _Job:
         version as a diff: only the files the rejection implicates (implicated_files), with
         why. The others keep their accepted versions."""
         self.wf_verification = (number, v)
+        self.wf_weak_note = ""
         failing = failing_tests(v)
         resend = implicated_files(
             v,
@@ -1029,6 +1038,29 @@ class _Job:
             still_failing=set(failing) & self.wf_failing,
         )
         self.wf_failing = set(failing)
+        self._resend(resend, v)
+        return resend
+
+    def _after_weak(self, number: int, v: Verification, tests: dict[str, str]) -> dict[str, str]:
+        """Whole-file, an extra attempt for a verified_weak one: the sendable files among the
+        still-failing tests' files and the code under test those reach. Empty when none."""
+        resend: dict[str, str] = {}
+        for test, why in tests.items():
+            file = test_files_of([test], self.repo)[0]
+            if file in self.wf_all:
+                resend.setdefault(file, f"{test} still fails ({why})")
+            else:
+                for module in self._code_under_test(file):
+                    resend.setdefault(module, f"imported by {file} ({test} still fails)")
+        resend = {p: resend[p] for p in self.wf_all if p in resend}
+        if resend:
+            self.wf_verification = None
+            self.wf_weak_note = retry_prompt(number, v, tests)
+            self.wf_failing = set(tests)
+            self._resend(resend, v)
+        return resend
+
+    def _resend(self, resend: dict[str, str], v: Verification) -> None:
         self.wf_pending = list(resend)
         self.wf_previous = {p: (self._read(self.work, p), "") for p in self.wf_pending}
         self.wf_region_previous = {
@@ -1038,7 +1070,6 @@ class _Job:
         for p in self.wf_pending:
             if p in self.wf_plans and self._form(p)[0] == "regions":
                 self._add_feedback_regions(p, v)
-        return resend
 
     def _code_under_test(self, test_file: str) -> list[str]:
         """The non-test files whole-file mode sends that `test_file` reaches through imports
@@ -1081,7 +1112,7 @@ class _Job:
         """The last rejection's feedback for a file's request (shorter test output once a
         token limit is known)."""
         if self.wf_verification is None:
-            return ""
+            return self.wf_weak_note
         number, v = self.wf_verification
         if dependency:
             return verification_feedback(number, v, dependency_file=True)
@@ -2322,10 +2353,16 @@ class _Job:
                     prompt = self._task_prompt()
                     if number > 1:
                         previous = self.attempts[-2]
-                        feedback = feedback_prompt(
-                            previous,
-                            self._failure_hints(previous.verification),
-                            _mock_hint(self.migration),
+                        feedback = (
+                            retry_prompt(
+                                previous.number, previous.verification, previous.weak_tests
+                            )
+                            if previous.weak_retry and previous.verification
+                            else feedback_prompt(
+                                previous,
+                                self._failure_hints(previous.verification),
+                                _mock_hint(self.migration),
+                            )
                         )
                         prompt = f"{prompt}\n\n{feedback}" if not self.messages else feedback
                     self.messages.append(Message("user", text=prompt))
@@ -2334,6 +2371,13 @@ class _Job:
             except _Abort as abort:
                 attempt.result = "aborted"
                 attempt.diff = unified_diff(self.repo, self.work)
+                best = self.best_attempt()
+                if best is not None and best.result in ("verified", "verified_weak"):
+                    self._restore(best.snapshot)  # the extra attempt for a weak one stopped
+                    return best.result, (
+                        f"{best.result} on attempt {best.number}; attempt {number} stopped: "
+                        f"{abort.code}: {abort}"
+                    )
                 return "aborted", f"{abort.code}: {abort}"
             if ready and attempt.fell_back and self._same_as_verified():
                 ready = False  # only fallbacks: the tree the last verification judged
@@ -2364,8 +2408,15 @@ class _Job:
             self.sandbox_seconds += attempt.verification_duration_s
             attempt.result = attempt.verification.verdict
             attempt.snapshot = self._snapshot()
-            if attempt.result in ("verified", "verified_weak"):
-                return attempt.result, f"{attempt.result} on attempt {number}"
+            if attempt.result == "verified_weak":
+                attempt.weak_tests = still_failing_migrated(
+                    attempt.verification, self.work, self.migration.api_modules
+                )
+                if not self._extra_attempt(attempt, counted):
+                    return self._finish(attempt)
+                continue
+            if attempt.result == "verified":
+                return "verified", f"verified on attempt {number}"
             if not self._retryable(attempt.verification):
                 break
             if self.whole_file:
@@ -2381,12 +2432,52 @@ class _Job:
                 return "aborted", "check_failed: no attempt's files passed the checks"
             return "aborted", "no_changes: the model made no edits in any attempt"
         self._restore(best.snapshot)
+        if best.result in ("verified", "verified_weak"):  # found before the later attempts
+            return best.result, f"{best.result} on attempt {best.number}; {self._after_best(best)}"
         outcome: Outcome = "rejected" if best.result == "rejected" else "unverified"
         stopped = f"; stopped early: {self.wf_stop}" if self.wf_stop else ""
         return outcome, (
             f"not verified after {len(self.attempts)} attempt(s); best was attempt "
             f"{best.number} ({best.result}){stopped}"
         )
+
+    def _extra_attempt(self, attempt: Attempt, counted: int) -> bool:
+        """After a verified_weak attempt: is another one worth making, for the migrated tests
+        that fail before and after the fix? (Sets up its feedback.) Not when no attempt is
+        left, the sandbox's environment is what is wrong, or the last weak one did not
+        leave fewer such tests than an earlier one."""
+        v = attempt.verification
+        assert v is not None
+        if not attempt.weak_tests:
+            return False
+        if counted >= self.config.max_retries + 1 or attempt.number >= self._max_attempts():
+            return False
+        if environment_incomplete(v) or sandbox_requirements_pin(v) or pytest_usage_error(v):
+            return False
+        earlier = [a for a in self.attempts[:-1] if a.result == "verified_weak"]
+        if any(len(a.weak_tests) <= len(attempt.weak_tests) for a in earlier):
+            return False
+        if self.whole_file:
+            attempt.resend = self._after_weak(attempt.number, v, attempt.weak_tests)
+            if not attempt.resend:
+                return False
+        attempt.weak_retry = retry_reason(attempt.number, attempt.weak_tests)
+        return True
+
+    def _finish(self, last: Attempt) -> tuple[Outcome, str]:
+        """The job ends with a verified or verified_weak `last` attempt: the best of the
+        attempts (a weak extra attempt that left as many tests failing is not better than
+        the one before it) is restored and returned."""
+        best = self.best_attempt()
+        assert best is not None
+        if best is last:
+            return last.result, f"{last.result} on attempt {last.number}"
+        self._restore(best.snapshot)
+        return best.result, f"{best.result} on attempt {best.number}; {self._after_best(best)}"
+
+    def _after_best(self, best: Attempt) -> str:
+        later = [a.number for a in self.attempts if a.number > best.number]
+        return f"attempt(s) {', '.join(map(str, later))} did not improve on it"
 
     def _set_pins(self) -> None:
         """Set the dependency pins apifix can set itself, in the working copy (the baseline
@@ -2477,7 +2568,13 @@ class _Job:
         verified = [a for a in self.attempts if a.verification is not None]
         if not verified:
             return None
-        return max(verified, key=lambda a: (_RANK[a.result], a.number))
+
+        def key(a: Attempt) -> tuple[int, int, int]:
+            if a.result == "verified_weak":  # fewer failing migrated tests; the earlier on a tie
+                return _RANK[a.result], -len(a.weak_tests), -a.number
+            return _RANK[a.result], 0, a.number
+
+        return max(verified, key=key)
 
     # --- output -----------------------------------------------------------------------------
 
@@ -3011,6 +3108,18 @@ def report_markdown(
         )
         + f"; cost: ${job.cost:.2f}",
     ]
+    for a in job.attempts:
+        if a.weak_retry:
+            after = next((b for b in job.attempts if b.number == a.number + 1), None)
+            lines.append(
+                f"- Extra attempt {a.number + 1}, before settling for weak evidence: "
+                f"{a.weak_retry}; it ended {after.result if after else 'not run'}"
+                + (
+                    f" ({len(after.weak_tests)} such test(s) still failing)"
+                    if after and after.result == "verified_weak"
+                    else ""
+                )
+            )
     if duration_s is not None:
         lines.append(time_line(job, duration_s))
     answered = sorted({r["model"] for a in job.attempts for r in a.responses})

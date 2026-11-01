@@ -1336,7 +1336,7 @@ _IMPORT_ERROR_LINE = re.compile(r"(?:ModuleNotFoundError|ImportError): [^\n]+")
 MAX_ROT_TESTS = 3
 
 
-def _module_names(paths: Iterable[str]) -> set[str]:
+def module_names(paths: Iterable[str]) -> set[str]:
     """Dotted names of the changed Python files' modules and the packages around them, from
     every layout (`src/pkg/mod.py` is `src.pkg.mod`, `pkg.mod`, `mod`; its packages `src`,
     `src.pkg`, `pkg`)."""
@@ -1373,7 +1373,7 @@ def baseline_rot_reasons(
     underlying import error found in the original's output and suggests pinning the dependency."""
     if not baseline_usable(baseline):
         return []
-    names = _module_names(c.path for c in changes if c.kind != "deleted")
+    names = module_names(c.path for c in changes if c.kind != "deleted")
     if not names:
         return []
     fixed_failing = {t.id: t for t in fixed.tests if t.outcome in ("failed", "error")}

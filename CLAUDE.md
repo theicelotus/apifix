@@ -34,6 +34,7 @@ src/apifix/engine/
   verifier.py               baseline vs fix -> verdict, reasons, report section
   llm.py, llm_*.py          provider-neutral LLM interface + price table; Claude; OpenAI-compatible
   agent.py, agent_tools.py  fix loop (agent and whole-file modes); the model's tools
+  weak_retry.py             extra attempt for tests still failing after a verified_weak fix
   verify_diff.py            `apifix verify`: re-check a saved diff, no LLM
   pin_edits.py              dependency pins apifix sets itself (no LLM)
   whole_file.py, regions.py whole-file mode; region edits for large files
