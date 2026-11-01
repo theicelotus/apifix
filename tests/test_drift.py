@@ -207,3 +207,71 @@ def test_from_clause_still_owed_while_the_same_except_remains():
     errors = check_genai(kept)
     assert len(errors) == 1
     assert errors[0].startswith("original line 15:")
+
+
+THREE_RAISES_ORIGINAL = textwrap.dedent(
+    """\
+    import google.generativeai as genai
+    from google.api_core import exceptions as google_exceptions
+
+
+    class GeminiProvider:
+        def generate(self, prompt):
+            model = genai.GenerativeModel("gemini-1.5-flash")
+            try:
+                response = model.generate_content(prompt)
+                try:
+                    text = response.text
+                except ValueError as e:
+                    raise RuntimeError("blocked") from e
+                return text
+            except google_exceptions.GoogleAPIError as e:
+                raise RuntimeError("api error") from e
+            except Exception as e:
+                raise RuntimeError("failed") from e
+    """
+)
+
+THREE_RAISES_MIGRATED = textwrap.dedent(
+    """\
+    from google import genai
+    from google.genai import errors
+
+
+    class GeminiProvider:
+        def generate(self, prompt):
+            try:
+                response = self.client.models.generate_content(
+                    model="gemini-1.5-flash", contents=prompt
+                )
+                text = response.text
+                if text is None:
+                    raise RuntimeError("blocked")
+                return text
+            except errors.APIError as e:
+                raise RuntimeError("api error") from e
+            except Exception as e:
+                raise RuntimeError("failed") from e
+    """
+)
+
+
+def check_three(candidate: str) -> list[str]:
+    findings = scan_text("m.py", THREE_RAISES_ORIGINAL, get_migration("google-genai"))
+    return unrelated_edits(
+        THREE_RAISES_ORIGINAL,
+        candidate,
+        findings,
+        frozenset({"google.generativeai", "google.genai"}),
+    )
+
+
+def test_removed_clause_does_not_take_the_match_of_a_kept_one():
+    assert check_three(THREE_RAISES_MIGRATED) == []
+
+
+def test_dropping_the_last_of_three_causes_is_reported_at_its_line():
+    errors = check_three(THREE_RAISES_MIGRATED.replace('"failed") from e', '"failed")'))
+    assert len(errors) == 1
+    assert errors[0].startswith("original line 18:")
+    assert "lost its `from e`" in errors[0]

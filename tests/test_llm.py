@@ -351,6 +351,35 @@ def test_api_key_comes_from_the_host_environment_only(monkeypatch):
     assert llm_anthropic.API_KEY_ENV == "ANTHROPIC_API_KEY"
 
 
+def test_api_key_is_stripped_and_a_blank_one_fails_before_any_request(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(anthropic, "Anthropic", lambda **kw: seen.update(kw) or object())
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "  sk-padded\n")
+    AnthropicLLM("claude-opus-5-5")
+    assert seen["api_key"] == "sk-padded"
+    seen.clear()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", " \n\t ")
+    with pytest.raises(LLMError, match=r"the API key in \$ANTHROPIC_API_KEY is empty"):
+        AnthropicLLM("claude-opus-5-5")
+    assert seen == {}
+
+
+def test_a_rejected_anthropic_key_shows_at_most_four_characters(monkeypatch):
+    monkeypatch.setattr(anthropic, "Anthropic", lambda **kw: object())
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-secretsecret")
+    llm = AnthropicLLM("claude-opus-5-5")
+    request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+    response = httpx2.Response(401, request=request)
+    llm.client = FakeClient(
+        anthropic.AuthenticationError("invalid x-api-key", response=response, body=None)
+    )
+    with pytest.raises(LLMError) as info:
+        complete(llm)
+    message = str(info.value)
+    assert "the server rejected the key in $ANTHROPIC_API_KEY (starts sk-a…)" in message
+    assert "sk-ant" not in message
+
+
 def test_no_tools_key_when_no_tools_are_offered():
     llm = AnthropicLLM("claude-opus-5-5", client=FakeClient())
     kw = llm.request(

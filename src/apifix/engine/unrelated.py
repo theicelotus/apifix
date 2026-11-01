@@ -1194,24 +1194,25 @@ def _dropped_causes(diff: _Diff) -> list[tuple[int, str]]:
     cause may be renamed (`from e` -> `from err`), not dropped: per scope, each original cause
     needs a candidate cause with the same text, or else any one not matched by another. A
     cause whose `except ... as Y` clause the migration removed is not owed (see
-    `_cause_handler_gone`)."""
+    `_cause_handler_gone`); those are dropped first, so they never take a match."""
     old = _by_scope(diff.old.tree, diff.old_scopes, ast.Raise)
     new = _by_scope(diff.new.tree, diff.new_scopes, ast.Raise)
     errors = []
     for scope, raises in old.items():
+        # raises whose clause is gone are not owed: set them aside before matching, or they
+        # would consume candidate causes that belong to the raises whose clause remains
+        owed = [
+            r for r in raises if r.cause is not None and not _cause_handler_gone(diff, r, scope)
+        ]
         have = Counter(ast.unparse(r.cause) for r in new.get(scope, []) if r.cause is not None)
         unmatched = []
-        for r in raises:
-            if r.cause is None:
-                continue
+        for r in owed:
             text = ast.unparse(r.cause)
             if have[text] > 0:
                 have[text] -= 1
             else:
                 unmatched.append((r, text))
         for r, text in unmatched:
-            if _cause_handler_gone(diff, r, scope):
-                continue
             spare = next((t for t, n in have.items() if n > 0), None)
             if spare is not None:
                 have[spare] -= 1

@@ -27,6 +27,25 @@ class LLMError(RuntimeError):
     """The provider failed (network, auth, rate limit after retries, bad request, ...)."""
 
 
+def read_api_key(var: str) -> str | None:
+    """The key in environment variable `var` without surrounding whitespace (a pasted key often
+    carries a newline); None when the variable is unset. A variable that is set but blank is an
+    error: sending it would only produce a confusing 401."""
+    raw = os.environ.get(var)
+    if raw is None:
+        return None
+    key = raw.strip()
+    if not key:
+        raise LLMError(f"the API key in ${var} is empty")
+    return key
+
+
+def rejected_key_message(var: str, key: str) -> str:
+    """What to say when the server answers 401: names the variable and shows at most the first
+    4 characters of the key, enough to tell a wrong or mismatched key apart."""
+    return f"the server rejected the key in ${var} (starts {key[:4]}…)"
+
+
 # An endpoint that answered earlier in the job and now cannot be reached (DNS failure, connection
 # refused or reset) is waited out between tries, these many seconds each, before the request
 # fails. Before its first answer nothing is waited (a server that is not running fails at once).

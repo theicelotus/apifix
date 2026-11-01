@@ -532,6 +532,30 @@ def test_auth_errors_mention_the_key():
         complete(llm)
 
 
+def test_preflight_401_names_the_variable_and_shows_four_characters(monkeypatch):
+    monkeypatch.setenv("MY_KEY", "gsk_abcdefghijkl")
+    llm, _ = make(
+        error(401, "bad key"), base_url="https://api.example.com/v1", api_key_env="MY_KEY"
+    )
+    with pytest.raises(LLMError) as info:
+        llm.preflight()
+    message = str(info.value)
+    assert "the server rejected the key in $MY_KEY (starts gsk_…)" in message
+    assert "gsk_a" not in message
+
+
+def test_key_is_stripped_and_a_blank_one_fails_before_preflight(monkeypatch):
+    monkeypatch.setenv("APIFIX_LLM_API_KEY", "  sk-padded \n")
+    llm, http = make(reply("ok"), base_url="https://api.example.com/v1")
+    complete(llm)
+    assert http.requests[0].headers["Authorization"] == "Bearer sk-padded"
+    monkeypatch.setenv("APIFIX_LLM_API_KEY", " \n")
+    http = FakeHTTP([])
+    with pytest.raises(LLMError, match=r"the API key in \$APIFIX_LLM_API_KEY is empty"):
+        OpenAICompatLLM("m", base_url="https://api.example.com/v1", transport=http)
+    assert http.requests == []
+
+
 def test_garbage_response():
     llm, _ = make(HTTPResponse(200, b"<html>proxy error</html>"))
     with pytest.raises(LLMError, match="no choices"):

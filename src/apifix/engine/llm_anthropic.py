@@ -12,7 +12,6 @@
 
 from __future__ import annotations
 
-import os
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -29,6 +28,8 @@ from apifix.engine.llm import (
     ToolCall,
     ToolSpec,
     Usage,
+    read_api_key,
+    rejected_key_message,
 )
 
 API_KEY_ENV = "ANTHROPIC_API_KEY"
@@ -68,9 +69,10 @@ class AnthropicLLM:
         # answered in this job, a longer outage is waited out too
         self.answered = False
         self.outage = OutageWaits(self.notes, sleep)
+        self._key: str | None = None  # only a key apifix read itself is named in errors
         if client is None:
-            key = os.environ.get(API_KEY_ENV)
-            if not key:
+            key = read_api_key(API_KEY_ENV)
+            if key is None:
                 raise LLMError(f"{API_KEY_ENV} is not set")
             try:
                 import anthropic
@@ -78,6 +80,7 @@ class AnthropicLLM:
                 raise LLMError(
                     "the anthropic SDK is not installed: pip install 'apifix[anthropic]'"
                 ) from exc
+            self._key = key
             client = anthropic.Anthropic(api_key=key, timeout=timeout_s, max_retries=max_retries)
         self.client = client
         if model not in self.models:
@@ -160,6 +163,10 @@ class AnthropicLLM:
                     waited.append(outage.pop(0))
                     self.outage.wait(waited[-1], f"{type(exc).__name__}: {exc}")
                     continue
+                if self._key and _is_auth_error(exc):
+                    raise LLMError(
+                        f"{type(exc).__name__}: {rejected_key_message(API_KEY_ENV, self._key)}"
+                    ) from exc
                 if _is_sdk_error(exc):
                     after = OutageWaits.gave_up(waited) if waited else ""
                     raise LLMError(f"{type(exc).__name__}: {exc}{after}") from exc
@@ -187,6 +194,14 @@ def _is_outage_status(exc: Exception) -> bool:
     except ImportError:
         return False
     return isinstance(exc, anthropic.APIStatusError) and exc.status_code in OUTAGE_STATUS_CODES
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    try:
+        import anthropic
+    except ImportError:
+        return False
+    return isinstance(exc, anthropic.AuthenticationError)
 
 
 def _is_sdk_error(exc: Exception) -> bool:

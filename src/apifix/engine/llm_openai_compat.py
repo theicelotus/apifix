@@ -50,6 +50,8 @@ from apifix.engine.llm import (
     ToolCall,
     ToolSpec,
     Usage,
+    read_api_key,
+    rejected_key_message,
     validate_tool_input,
 )
 
@@ -258,7 +260,8 @@ class OpenAICompatLLM:
         self.answered = False  # the endpoint sent an HTTP response in this job
         self.outage = OutageWaits(self.notes, self.sleep)
 
-        self._key = os.environ.get(api_key_env) or None
+        self._key = read_api_key(api_key_env)
+        self._key_env = api_key_env
         if self._key and parts.scheme == "http" and not self.local:
             raise LLMError(
                 f"refusing to send the API key from ${api_key_env} over plain http to "
@@ -494,6 +497,11 @@ class OpenAICompatLLM:
                 "probably blocked before it reached the API (a firewall, a region restriction "
                 "or a blocked client), not refused because of the API key. Check that this "
                 "machine can reach the endpoint"
+            )
+        if status == 401 and self._key:
+            return LLMError(
+                f"HTTP 401 from {self.endpoint}: {message} "
+                f"({rejected_key_message(self._key_env, self._key)})"
             )
         if status in (401, 403):
             return LLMError(f"HTTP {status} from {self.endpoint}: {message} (check the API key)")
