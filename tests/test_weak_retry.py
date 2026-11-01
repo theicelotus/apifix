@@ -10,7 +10,13 @@ import pytest
 from apifix.engine.diffing import FileChange
 from apifix.engine.test_results import FileCoverage
 from apifix.engine.verifier import TestDelta
-from apifix.engine.weak_retry import patches, retry_prompt, still_failing_migrated
+from apifix.engine.weak_retry import (
+    patches,
+    retry_prompt,
+    skip_reason,
+    split_environmental,
+    still_failing_migrated,
+)
 from tests.test_agent import (
     FIX_APP,
     FIX_TESTS,
@@ -99,8 +105,12 @@ def test_an_extra_attempt_that_leaves_the_same_tests_failing_is_not_better(repo)
 def test_no_extra_attempt_when_none_is_left(repo):
     result = go(repo, FakeLLM([tools(FIX_APP, FIX_TESTS), done()]), judging(), max_retries=0)
     assert (result.outcome, result.attempts) == ("verified_weak", 1)
-    assert result.trajectory["attempts"][0]["weak_retry"] == ""
-    assert result.trajectory["attempts"][0]["weak_tests"]  # still recorded
+    first = result.trajectory["attempts"][0]
+    assert first["weak_tests"] and first["weak_retried"] is False  # still recorded
+    assert first["weak_retry"].startswith("not retried: no attempt is left")
+    assert "No extra attempt before settling for weak evidence: not retried" in (
+        result.report_markdown
+    )
 
 
 def test_no_extra_attempt_for_a_failing_test_the_fix_did_not_touch(repo):
@@ -161,3 +171,66 @@ def test_retry_prompt_cuts_long_output(repo):
     text = retry_prompt(2, v, {STILL: "why"})
     assert "attempt 2 only with weak evidence" in text and "(output truncated)" in text
     assert len(text) < 2500
+
+
+def import_error(module: str, through: str = "") -> str:
+    """The shape of the output in ailabel-genai-4: a pytest collection failure."""
+    return (
+        "collection failure\nImportError while importing test module '/work/tests/test_cli.py'.\n"
+        "Traceback:\ntests/test_cli.py:6: in <module>\n    from pkg.cli import app\n"
+        + (f"{through}:16: in <module>\n    from x import y\n" if through else "")
+        + f"E   ModuleNotFoundError: No module named '{module}'"
+    )
+
+
+def collection_v(message, edited=("pkg/llms.py",)):
+    return SimpleNamespace(
+        changes=[FileChange(p, "modified") for p in edited],
+        delta=TestDelta(
+            no_signal_preexisting=["tests.test_cli"],
+            no_signal_messages={"tests.test_cli": {"baseline": message, "fixed": message}},
+        ),
+        fixed=SimpleNamespace(tests=[]),
+    )
+
+
+def test_collection_import_errors_are_split_by_whether_the_migration_is_involved(tmp_path):
+    root = write_tree(tmp_path, {"pkg/__init__.py": "", "pkg/cli.py": "", "pkg/llms.py": ""})
+    tests = {"tests.test_cli": "why"}
+
+    def split(message, edited=("pkg/llms.py",)):
+        return split_environmental(
+            collection_v(message, edited), root, {"google.generativeai"}, tests
+        )
+
+    assert split(import_error("pkg.label_prediction")) == (tests, {})  # the repo's own module
+    assert split(import_error("google.generativeai"))[1] == {}  # the migrated library
+    assert split(import_error("requests", through="pkg/llms.py"))[1] == {}  # a changed file
+    assert split("collection failure\nImportError while importing test module 'x'.\nTrace")[1] == {}
+    assert split(import_error("requests")) == ({}, {"tests.test_cli": "requests"})  # unrelated
+
+
+def test_retry_prompt_shows_a_collection_failure(tmp_path):
+    v = collection_v(import_error("pkg.label_prediction"))
+    text = retry_prompt(2, v, {"tests.test_cli": "why"})
+    assert "No module named 'pkg.label_prediction'" in text
+
+
+def test_the_skip_is_recorded_when_no_extra_attempt_is_made():
+    text = skip_reason("no attempt is left", {"a": "x", "b": "y"})
+    assert text == "not retried: no attempt is left (2 test(s) still failing: `a`, `b`)"
+
+
+def test_whole_file_resends_the_edited_files_when_the_failing_test_file_is_not_sendable(tmp_path):
+    """A test file that patches rewritten code but is not itself sent (and imports nothing
+    sendable) still gets a retry: the files the fix edited are sent again."""
+    other = 'from unittest import mock\n\n@mock.patch("app.client.chat")\ndef test_y(chat): pass\n'
+    repo = write_tree(tmp_path / "repo", {**ORIGINAL, "tests/test_other.py": other})
+    fixed_by = "def make_ask("
+    app_again = APP_NEW.replace("def ask(", "def make_ask(")
+    llm = FakeLLM([block(APP_NEW), block(TESTS_NEW), block(app_again), block(TESTS_NEW)] * 3)
+    result = wf(repo, llm, judging("tests.test_other::test_y", fixed_by=fixed_by))
+    first = result.trajectory["attempts"][0]
+    assert first["weak_tests"] and first["weak_retried"] is True
+    assert result.attempts >= 2
+    assert first["resend"]["app.py"].startswith("edited by the fix")

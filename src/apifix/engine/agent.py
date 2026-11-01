@@ -113,7 +113,13 @@ from apifix.engine.verifier import (
     verify,
 )
 from apifix.engine.walk import copy_repo, iter_files
-from apifix.engine.weak_retry import retry_prompt, retry_reason, still_failing_migrated
+from apifix.engine.weak_retry import (
+    retry_prompt,
+    retry_reason,
+    skip_reason,
+    split_environmental,
+    still_failing_migrated,
+)
 from apifix.engine.whole_file import (
     CODE_BLOCK_NUDGE,
     DEFAULT_MAX_BYTES,
@@ -278,9 +284,11 @@ class Attempt:
     diff: str = ""
     verification: Verification | None = None
     # verified_weak: the migrated tests that fail before and after the fix (weak_retry), and,
-    # when an extra attempt followed for them, why (retry_reason)
+    # the decision about an extra attempt for them: why it was made (retry_reason) or why not
+    # (skip_reason); always set when weak_tests is
     weak_tests: dict[str, str] = field(default_factory=dict)
     weak_retry: str = ""
+    weak_retried: bool = False
     result: str = ""  # a verdict, "no_changes", "check_failed" (whole-file) or "aborted"
     usage: Usage = Usage()
     cost_usd: float = 0.0
@@ -304,6 +312,7 @@ class Attempt:
             "diff": self.diff,
             "weak_tests": self.weak_tests,
             "weak_retry": self.weak_retry,
+            "weak_retried": self.weak_retried,
             "verification": self.verification.to_dict() if self.verification else None,
             "verification_duration_s": round(self.verification_duration_s, 3),
             "usage": asdict(self.usage),
@@ -1052,6 +1061,11 @@ class _Job:
             else:
                 for module in self._code_under_test(file):
                     resend.setdefault(module, f"imported by {file} ({test} still fails)")
+        if not resend:  # nothing the test reaches is sendable: the files the fix edited are
+            resend = {  # what it patches or imports, as far as the migration goes
+                p: "edited by the fix, which tests that still fail import or patch"
+                for p in self._edited_sendable()
+            }
         resend = {p: resend[p] for p in self.wf_all if p in resend}
         if resend:
             self.wf_verification = None
@@ -1059,6 +1073,10 @@ class _Job:
             self.wf_failing = set(tests)
             self._resend(resend, v)
         return resend
+
+    def _edited_sendable(self) -> list[str]:
+        """The files whole-file mode sends that the working copy changed."""
+        return [p for p in self.wf_all if self._read(self.work, p) != self._read(self.repo, p)]
 
     def _resend(self, resend: dict[str, str], v: Verification) -> None:
         self.wf_pending = list(resend)
@@ -2357,7 +2375,7 @@ class _Job:
                             retry_prompt(
                                 previous.number, previous.verification, previous.weak_tests
                             )
-                            if previous.weak_retry and previous.verification
+                            if previous.weak_retried and previous.verification
                             else feedback_prompt(
                                 previous,
                                 self._failure_hints(previous.verification),
@@ -2448,20 +2466,32 @@ class _Job:
         leave fewer such tests than an earlier one."""
         v = attempt.verification
         assert v is not None
-        if not attempt.weak_tests:
+        tests = attempt.weak_tests
+        if not tests:
             return False
+
+        def skip(why: str) -> bool:
+            attempt.weak_retry = skip_reason(why, tests)
+            return False
+
         if counted >= self.config.max_retries + 1 or attempt.number >= self._max_attempts():
-            return False
+            return skip("no attempt is left")
         if environment_incomplete(v) or sandbox_requirements_pin(v) or pytest_usage_error(v):
-            return False
+            return skip("the sandbox's environment is incomplete, which no edit fixes")
+        kept, environmental = split_environmental(v, self.work, self.migration.api_modules, tests)
+        if not kept:
+            modules = ", ".join(f"`{m}`" for m in sorted(set(environmental.values())))
+            return skip(f"they fail to import {modules}, a package the migration does not touch")
+        attempt.weak_tests = tests = kept
         earlier = [a for a in self.attempts[:-1] if a.result == "verified_weak"]
-        if any(len(a.weak_tests) <= len(attempt.weak_tests) for a in earlier):
-            return False
+        if any(len(a.weak_tests) <= len(tests) for a in earlier):
+            return skip("an earlier weak attempt left no more such tests failing")
         if self.whole_file:
-            attempt.resend = self._after_weak(attempt.number, v, attempt.weak_tests)
+            attempt.resend = self._after_weak(attempt.number, v, tests)
             if not attempt.resend:
-                return False
-        attempt.weak_retry = retry_reason(attempt.number, attempt.weak_tests)
+                return skip("no file the model may edit is implicated")
+        attempt.weak_retry = retry_reason(attempt.number, tests)
+        attempt.weak_retried = True
         return True
 
     def _finish(self, last: Attempt) -> tuple[Outcome, str]:
@@ -3109,7 +3139,9 @@ def report_markdown(
         + f"; cost: ${job.cost:.2f}",
     ]
     for a in job.attempts:
-        if a.weak_retry:
+        if a.weak_retry and not a.weak_retried:
+            lines.append(f"- No extra attempt before settling for weak evidence: {a.weak_retry}")
+        elif a.weak_retry:
             after = next((b for b in job.attempts if b.number == a.number + 1), None)
             lines.append(
                 f"- Extra attempt {a.number + 1}, before settling for weak evidence: "
