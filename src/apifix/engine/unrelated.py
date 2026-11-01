@@ -1145,10 +1145,56 @@ def _dropped_module_guards(diff: _Diff) -> list[tuple[int, str]]:
     ]
 
 
+def _is_builtin_exception(node: ast.expr | None) -> bool:
+    """Is an `except` clause's type only builtin exceptions (`ValueError`, `(OSError, KeyError)`)"""
+    if isinstance(node, ast.Tuple):
+        return bool(node.elts) and all(_is_builtin_exception(e) for e in node.elts)
+    if not isinstance(node, ast.Name):
+        return False
+    exc = getattr(builtins, node.id, None)
+    return isinstance(exc, type) and issubclass(exc, BaseException)
+
+
+def _cause_handler_gone(diff: _Diff, raise_node: ast.Raise, scope: str) -> bool:
+    """Did the `except ... as X` clause around `raise ... from X` go away in the candidate?
+    The migration may remove it: the old SDK raised `ValueError` on a blocked response and the
+    new one returns `None`, so the `try/except ValueError as e` becomes an `if text is None`
+    check and `from e` has nothing to refer to. The clause remains when the candidate has one
+    in the same scope binding the same name with the same exception type, or with a renamed
+    non-builtin type (`google_exceptions.X` -> `errors.ClientError`: a library exception is
+    renamed, not dropped). A builtin type that changed (`ValueError` -> `Exception`) is a
+    replaced clause."""
+    handler = None
+    for n in ast.walk(diff.old.tree):
+        if (
+            isinstance(n, ast.ExceptHandler)
+            and n.name
+            and any(m is raise_node for b in n.body for m in ast.walk(b))
+        ):
+            handler = n  # walk is outer-first: the innermost clause wins
+    if handler is None or not isinstance(raise_node.cause, ast.Name):
+        return False
+    if handler.name != raise_node.cause.id:
+        return False
+    old_type = ast.unparse(handler.type) if handler.type else ""
+    for n in ast.walk(diff.new.tree):
+        if (
+            isinstance(n, ast.ExceptHandler)
+            and n.name == handler.name
+            and diff.new_scopes.scope(n) == scope
+        ):
+            new_type = ast.unparse(n.type) if n.type else ""
+            if new_type == old_type or not _is_builtin_exception(handler.type):
+                return False
+    return True
+
+
 def _dropped_causes(diff: _Diff) -> list[tuple[int, str]]:
     """`raise X from Y` of the original with no `from` left in the candidate's same scope. A
     cause may be renamed (`from e` -> `from err`), not dropped: per scope, each original cause
-    needs a candidate cause with the same text, or else any one not matched by another."""
+    needs a candidate cause with the same text, or else any one not matched by another. A
+    cause whose `except ... as Y` clause the migration removed is not owed (see
+    `_cause_handler_gone`)."""
     old = _by_scope(diff.old.tree, diff.old_scopes, ast.Raise)
     new = _by_scope(diff.new.tree, diff.new_scopes, ast.Raise)
     errors = []
@@ -1164,6 +1210,8 @@ def _dropped_causes(diff: _Diff) -> list[tuple[int, str]]:
             else:
                 unmatched.append((r, text))
         for r, text in unmatched:
+            if _cause_handler_gone(diff, r, scope):
+                continue
             spare = next((t for t, n in have.items() if n > 0), None)
             if spare is not None:
                 have[spare] -= 1

@@ -95,7 +95,24 @@ keywords move into `config`. The result is an object, not a dict:
 
 `.text` returns `None` instead of raising `ValueError` when there is no text (a blocked prompt,
 a function-call-only response): change a `try: ... except ValueError:` around it into a `None`
-check. `usage_metadata` keeps the same field names (`prompt_token_count`,
+check. Keep the `raise` and its message, and keep any safety / `finish_reason` handling. The
+`from e` goes with the removed `except` clause (nothing is left to chain from); every other
+`raise ... from e` stays as it is:
+
+```python
+# before
+try:
+    text = response.text
+except ValueError as e:
+    raise GeminiError("response blocked") from e
+
+# after
+text = response.text
+if text is None:
+    raise GeminiError("response blocked")
+```
+
+`usage_metadata` keeps the same field names (`prompt_token_count`,
 `candidates_token_count`, `total_token_count`). `response.resolve()` is gone (iterate the stream
 to completion instead); `response.to_dict()` is `response.model_dump()`;
 `Model.supported_generation_methods` is renamed `supported_actions`.
@@ -141,6 +158,11 @@ repo declares google-api-core (apifix reports any such import as a finding, and 
 keeps one is rejected). Keep `google.api_core` only where the repo declares google-api-core and
 the file uses it for something besides the Gemini calls (another Google client, or retries on
 the exception types themselves rather than catching them).
+
+Do not change retry loops. Only the exception class names change
+(`google_exceptions.X` -> `errors.ClientError` / `errors.ServerError` / `errors.APIError`);
+the loop, its guards (attempt counts, which errors retry) and its waits (`time.sleep(...)`,
+backoff) stay exactly as written.
 
 <!-- part: tests -->
 ## Tests

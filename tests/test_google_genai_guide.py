@@ -77,3 +77,17 @@ def test_guide_tells_the_model_to_keep_the_repos_signatures_and_return_shapes():
         ["client"]
     )
     assert "return shapes" in get_migration("google-genai").guide
+
+
+def test_responses_part_shows_the_none_check_migration():
+    text = guide_parts.parts_text(["responses"])
+    assert "returns `None` instead of raising `ValueError`" in text
+    assert "if text is None:" in text
+    assert "keep any safety / `finish_reason` handling" in text
+    assert "`from e` goes with the removed `except` clause" in text
+
+
+def test_errors_part_says_not_to_change_retry_loops():
+    text = guide_parts.parts_text(["errors"])
+    assert "Do not change retry loops" in text
+    assert "Only the exception class names change" in text
