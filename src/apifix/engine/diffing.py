@@ -104,6 +104,34 @@ def hunks(old: str, new: str) -> tuple[Hunk, ...]:
     )
 
 
+_KEEPS_TRAILING_SPACE = (".md", ".markdown", ".rst")  # two trailing spaces mean a line break
+
+
+def strip_added_trailing_whitespace(original: Path, fixed: Path) -> list[str]:
+    """Remove trailing spaces / tabs from the lines the fix inserted or replaced, in place,
+    keeping line endings; lines it did not change are left alone. Returns the paths touched."""
+    touched: list[str] = []
+    for change in diff_trees(original, fixed):
+        if change.kind == "deleted" or change.path.lower().endswith(_KEEPS_TRAILING_SPACE):
+            continue
+        new = read_text(fixed / change.path)
+        if new is None:
+            continue
+        old = read_text(original / change.path) if change.kind == "modified" else ""
+        changed = set(changed_lines(old or "", new)[0])
+        lines = new.splitlines(keepends=True)
+        out = []
+        for number, line in enumerate(lines, 1):
+            body = line.rstrip("\r\n")
+            ending = line[len(body) :]
+            out.append(body.rstrip(" \t") + ending if number in changed else line)
+        text = "".join(out)
+        if text != new:
+            (fixed / change.path).write_text(text, encoding="utf-8", newline="")
+            touched.append(change.path)
+    return touched
+
+
 def unified_diff(original: Path, fixed: Path, changes: list[FileChange] | None = None) -> str:
     """A `git apply`-able unified diff of the text files that changed."""
     out = []

@@ -41,7 +41,12 @@ from apifix.engine.code_checks import (
 from apifix.engine.context import changed_statements, library_uses, reachable_modules
 from apifix.engine.contracts import ContractPatch, contract_tests
 from apifix.engine.dependencies import is_dependency_file
-from apifix.engine.diffing import diff_trees, read_text, unified_diff
+from apifix.engine.diffing import (
+    diff_trees,
+    read_text,
+    strip_added_trailing_whitespace,
+    unified_diff,
+)
 from apifix.engine.gitops import repo_state
 from apifix.engine.imports import (
     ImportableModules,
@@ -2412,6 +2417,7 @@ class _Job:
                     counted += 1
                 continue
             counted += 1
+            strip_added_trailing_whitespace(self.repo, self.work)
             changes = diff_trees(self.repo, self.work)
             attempt.diff = unified_diff(self.repo, self.work, changes)
             start = time.monotonic()

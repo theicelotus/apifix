@@ -197,6 +197,29 @@ PATCH_TARGET = (
     "patch `{prefix}.Client` instead ({what}) and set its models / chats return value"
 )
 
+# Old proto Candidate.FinishReason ints -> google.genai.types.FinishReason members (checked
+# against google-generativeai 0.8.6 and google-genai 2.34: the new enum is a str enum whose
+# values are the names, so an int never compares equal).
+FINISH_REASON_NAMES = {
+    0: "FINISH_REASON_UNSPECIFIED",
+    1: "STOP",
+    2: "MAX_TOKENS",
+    3: "SAFETY",
+    4: "RECITATION",
+    5: "OTHER",
+    6: "LANGUAGE",
+    7: "BLOCKLIST",
+    8: "PROHIBITED_CONTENT",
+    9: "SPII",
+    10: "MALFORMED_FUNCTION_CALL",
+    11: "IMAGE_SAFETY",
+}
+FINISH_REASON_INT = (
+    "finish_reason is a string enum in google-genai, so comparing it with an int is always "
+    "False (== never matches, != always does): compare with types.FinishReason.{names} "
+    "(from google.genai import types); the old ints map as {mapping}"
+)
+
 RESPONSE_TEXT_NONE = (
     "`.text` returns None instead of raising ValueError when there is no text; a "
     "try/except ValueError around it should become a None check"

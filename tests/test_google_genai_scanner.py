@@ -101,3 +101,27 @@ def test_no_findings_for_names_from_other_google_packages(tmp_path):
         "client = storage.Client()\n"
     )
     assert scan(tmp_path, "google-genai").findings == []
+
+
+def test_finish_reason_compared_with_int():
+    findings = _scan("finish_reason_int.py")
+    assert summary(findings) == [
+        (1, "import"),
+        (3, "api_call"),
+        (8, "response_access"),
+        (10, "response_access"),
+        (13, "response_access"),
+    ]
+    first = at(findings, 8).suggestion
+    assert "always False" in first and "FinishReason.MAX_TOKENS" in first
+    assert "2 = MAX_TOKENS" in first
+    assert "FinishReason.SAFETY" in at(findings, 10).suggestion
+    assert "3 = SAFETY, 4 = RECITATION" in at(findings, 13).suggestion
+
+
+def test_finish_reason_int_needs_the_old_sdk():
+    from apifix.engine.migrations import get_migration
+    from apifix.engine.scanner import scan_text
+
+    source = "def f(c):\n    return c.finish_reason == 2\n"
+    assert scan_text("app.py", source, get_migration("google-genai")) == []

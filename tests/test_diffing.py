@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import subprocess
 
-from apifix.engine.diffing import FileChange, Hunk, changed_lines, diff_trees, hunks, unified_diff
+from apifix.engine.diffing import (
+    FileChange,
+    Hunk,
+    changed_lines,
+    diff_trees,
+    hunks,
+    strip_added_trailing_whitespace,
+    unified_diff,
+)
 
 
 def test_changed_lines():
@@ -84,3 +92,23 @@ def test_crlf_files_keep_their_line_endings_and_the_diff_applies(tmp_path):
     assert "-y = 2\r\n+y = 3\r\n" in diff
     subprocess.run(["git", "apply", "-"], input=diff.encode(), cwd=original, check=True)
     assert (original / "app.py").read_bytes() == (fixed / "app.py").read_bytes()
+
+
+def test_strip_added_trailing_whitespace_only_touches_changed_lines(tmp_path):
+    orig, fixed = tmp_path / "orig", tmp_path / "fixed"
+    orig.mkdir()
+    fixed.mkdir()
+    (orig / "a.py").write_bytes(b"keep = 1   \r\nold = 2\r\n")
+    (fixed / "a.py").write_bytes(b"keep = 1   \r\nnew = 2  \r\n\t\r\nlast = 3 \t")
+    (orig / "b.md").write_text("x\n")
+    (fixed / "b.md").write_text("x\nline  \n")
+    (fixed / "c.txt").write_text("added  \nfile \n")
+    (orig / "same.py").write_text("untouched   \n")
+    (fixed / "same.py").write_text("untouched   \n")
+
+    assert sorted(strip_added_trailing_whitespace(orig, fixed)) == ["a.py", "c.txt"]
+    assert (fixed / "a.py").read_bytes() == b"keep = 1   \r\nnew = 2\r\n\r\nlast = 3"
+    assert (fixed / "b.md").read_text() == "x\nline  \n"
+    assert (fixed / "c.txt").read_text() == "added\nfile\n"
+    assert (fixed / "same.py").read_text() == "untouched   \n"
+    assert strip_added_trailing_whitespace(orig, fixed) == []

@@ -115,6 +115,25 @@ def _module_rule(suffix: str) -> _Rule | None:
     return None
 
 
+def _is_finish_reason(node: ast.AST) -> bool:
+    return (isinstance(node, ast.Name) and node.id == "finish_reason") or (
+        isinstance(node, ast.Attribute) and node.attr == "finish_reason"
+    )
+
+
+def _int_literals(node: ast.AST) -> list[int]:
+    """The int(s) in a literal `2` or a tuple / list / set of ints; [] if anything else."""
+    items = node.elts if isinstance(node, ast.Tuple | ast.List | ast.Set) else [node]
+    out = [
+        n.value
+        for n in items
+        if isinstance(n, ast.Constant)
+        and isinstance(n.value, int)
+        and not isinstance(n.value, bool)
+    ]
+    return out if items and len(out) == len(items) else []
+
+
 def _value_text(source: str, node: ast.AST) -> str:
     text = " ".join((ast.get_source_segment(source, node) or ast.unparse(node)).split())
     return text if len(text) <= _MAX_VALUE else "..."
@@ -451,6 +470,27 @@ class _Visitor(ast.NodeVisitor):
                 for t in node.targets:
                     if isinstance(t, ast.Name):
                         self.embedding_names.add(t.id)
+        self.generic_visit(node)
+
+    def visit_Compare(self, node: ast.Compare) -> None:
+        """`finish_reason == 2`, `x.finish_reason in (2, 3)`: always False on the new SDK."""
+        if bool(self.aliases):
+            operands = [node.left, *node.comparators]
+            for i, op in enumerate(node.ops):
+                if not isinstance(op, ast.Eq | ast.NotEq | ast.In | ast.NotIn):
+                    continue
+                left, right = operands[i], operands[i + 1]
+                if _is_finish_reason(right):
+                    left, right = right, left
+                ints = _int_literals(right)
+                if _is_finish_reason(left) and ints:
+                    names = [rules.FINISH_REASON_NAMES.get(n, f"<{n}>") for n in ints]
+                    mapping = ", ".join(
+                        f"{n} = {rules.FINISH_REASON_NAMES.get(n, '?')}" for n in ints
+                    )
+                    text = rules.FINISH_REASON_INT.format(names="/".join(names), mapping=mapping)
+                    self._report(node, "response_access", text, CERTAIN)
+                    break
         self.generic_visit(node)
 
     def visit_Try(self, node: ast.Try) -> None:
