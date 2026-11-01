@@ -67,7 +67,7 @@ Your repository is never modified: apifix works on a copy and writes
 
 ## Tested on
 
-8 public open-source repos, with the open-weight model `gpt-oss-120b`:
+11 public open-source repos, with the open-weight model `gpt-oss-120b`:
 
 | Repo | Result |
 |---|---|
@@ -79,6 +79,9 @@ Your repository is never modified: apifix works on a copy and writes
 | [HCAI-Lab-GT/SuspensePerception](https://github.com/HCAI-Lab-GT/SuspensePerception) | verified, weak evidence |
 | [stoyan-stoyanov/llmflows](https://github.com/stoyan-stoyanov/llmflows) | verified, weak evidence |
 | [saulpw/aipl](https://github.com/saulpw/aipl) | verified, weak evidence |
+| [thornewolf/ailabel](https://github.com/thornewolf/ailabel) | verified |
+| [Kaizen-agent/kaizen-agent](https://github.com/Kaizen-agent/kaizen-agent) | verified, weak evidence |
+| [arun-gupta/agentic-tictactoe](https://github.com/arun-gupta/agentic-tictactoe) | verified, weak evidence |
 
 *Verified*: the tests pass before and after, and they run at least half of the
 changed lines. *Weak evidence*: the tests pass but run less than half of the

@@ -1,0 +1,641 @@
+diff --git a/pyproject.toml b/pyproject.toml
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -29,7 +29,7 @@
+     "pydantic-ai>=0.0.1",
+     "openai>=1.3.0",
+     "anthropic>=0.7.0",
+-    "google-generativeai>=0.3.0",
++    "google-genai>=1.19.0,<3",
+ 
+     # HTTP Client
+     "httpx>=0.25.0",
+diff --git a/src/llm/gemini_provider.py b/src/llm/gemini_provider.py
+--- a/src/llm/gemini_provider.py
++++ b/src/llm/gemini_provider.py
+@@ -16,9 +16,8 @@
+ # Migration tracked in implementation plan section 5.0.4
+ with warnings.catch_warnings():
+     warnings.filterwarnings("ignore", category=FutureWarning)
+-    import google.generativeai as genai
+-from google.api_core import exceptions as google_exceptions
+-from google.generativeai.types import GenerateContentResponse
++    from google import genai
++from google.genai import errors, types
+ 
+ from src.config.llm_config import get_llm_config
+ from src.llm.provider import LLMProvider, LLMResponse
+@@ -42,7 +41,7 @@
+         """
+         self._api_key = self._load_api_key(api_key, "GOOGLE_API_KEY", "Google")
+ 
+-        genai.configure(api_key=self._api_key)  # type: ignore[attr-defined]
++        self._client = genai.Client(api_key=self._api_key)  # type: ignore[attr-defined]
+         self._config = get_llm_config()
+ 
+     @property
+@@ -99,11 +98,8 @@
+             # Handle cases where response was blocked by safety filters
+             text = ""
+             if hasattr(response, "text"):
+-                try:
+-                    text = response.text
+-                except ValueError as e:
+-                    # Response was blocked (finish_reason: SAFETY) or has no content
+-                    # Check finish_reason for more details
++                text = response.text
++                if text is None:
+                     if hasattr(response, "candidates") and response.candidates:
+                         candidate = response.candidates[0]
+                         finish_reason = getattr(candidate, "finish_reason", None)
+@@ -113,9 +109,8 @@
+                             raise RuntimeError(
+                                 "Google Gemini API blocked the response due to safety filters. "
+                                 "Try adjusting the prompt or safety settings."
+-                            ) from e
+-                    # Re-raise if it's a different error
+-                    raise
++                            )
++                    raise RuntimeError("Google Gemini API returned no text")
+ 
+             # Get token usage from response
+             tokens_used = 0
+@@ -137,7 +132,7 @@
+                 latency_ms=latency_ms,
+             )
+ 
+-        except google_exceptions.GoogleAPIError as e:
++        except errors.APIError as e:
+             latency_ms = (time.time() - start_time) * 1000
+             raise RuntimeError(f"Google Gemini API error: {e}") from e
+         except Exception as e:
+@@ -151,7 +146,7 @@
+         max_output_tokens: int,
+         temperature: float,
+         max_retries: int = 3,
+-    ) -> GenerateContentResponse:
++    ) -> types.GenerateContentResponse:
+         """Call Google Gemini API with exponential backoff retry logic.
+ 
+         Args:
+@@ -167,48 +162,45 @@
+         Raises:
+             google_exceptions.GoogleAPIError: If API call fails after all retries
+         """
++        safety_settings = [
++            types.SafetySetting(
++                category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"
++            ),
++            types.SafetySetting(
++                category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"
++            ),
++            types.SafetySetting(
++                category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"
++            ),
++            types.SafetySetting(
++                category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"
++            ),
++        ]
++
++        generation_cfg = types.GenerationConfig(
++            max_output_tokens=max_output_tokens,
++            temperature=temperature,
++        )
++
++        request_cfg = types.GenerateContentConfig(
++            safety_settings=safety_settings,
++            generation_config=generation_cfg,
++        )
++
+         last_exception: Exception | None = None
+ 
+         for attempt in range(max_retries):
+             try:
+-                # Create model instance with safety settings
+-                # Use lenient safety settings for testing/development
+-                safety_settings = [
+-                    {
+-                        "category": "HARM_CATEGORY_HARASSMENT",
+-                        "threshold": "BLOCK_NONE",
+-                    },
+-                    {
+-                        "category": "HARM_CATEGORY_HATE_SPEECH",
+-                        "threshold": "BLOCK_NONE",
+-                    },
+-                    {
+-                        "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+-                        "threshold": "BLOCK_NONE",
+-                    },
+-                    {
+-                        "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+-                        "threshold": "BLOCK_NONE",
+-                    },
+-                ]
+-
+-                gemini_model = genai.GenerativeModel(  # type: ignore[attr-defined]
+-                    model,
+-                    safety_settings=safety_settings,  # type: ignore[arg-type]
+-                )
+-
+-                # Generate content
+-                response = gemini_model.generate_content(
+-                    prompt,
+-                    generation_config={
+-                        "max_output_tokens": max_output_tokens,
+-                        "temperature": temperature,
+-                    },
++                response = self._client.models.generate_content(
++                    model=model,
++                    contents=prompt,
++                    config=request_cfg,
+                 )
+                 return response
+ 
+-            except google_exceptions.ResourceExhausted as e:
+-                # Rate limit error (429) - check for Retry-After header
++            except errors.ClientError as e:
++                if e.code != 429:
++                    raise
+                 retry_after = None
+                 if hasattr(e, "response") and e.response:
+                     headers = getattr(e.response, "headers", {})
+@@ -226,10 +218,7 @@
+                     continue
+                 raise
+ 
+-            except (
+-                google_exceptions.DeadlineExceeded,
+-                google_exceptions.ServiceUnavailable,
+-            ) as e:
++            except errors.ServerError as e:
+                 # Timeout or service unavailable - retry with exponential backoff
+                 if attempt < max_retries - 1:
+                     wait_time = 2**attempt  # 1s, 2s, 4s
+@@ -238,14 +227,7 @@
+                     continue
+                 raise
+ 
+-            except (
+-                google_exceptions.Unauthenticated,
+-                google_exceptions.PermissionDenied,
+-            ):
+-                # Authentication errors - don't retry
+-                raise
+-
+-            except google_exceptions.GoogleAPIError as e:
++            except errors.APIError as e:
+                 # Other API errors - retry with exponential backoff
+                 if attempt < max_retries - 1:
+                     wait_time = 2**attempt
+diff --git a/tests/unit/llm/test_gemini_provider.py b/tests/unit/llm/test_gemini_provider.py
+--- a/tests/unit/llm/test_gemini_provider.py
++++ b/tests/unit/llm/test_gemini_provider.py
+@@ -7,11 +7,12 @@
+ import os
+ from unittest.mock import MagicMock, Mock, PropertyMock, patch
+ 
+-import google.api_core.exceptions as google_exceptions
++from google.genai import errors
+ import pytest
+ 
+ from src.llm.gemini_provider import GeminiProvider
+ from src.llm.provider import LLMResponse
++from typing import Any
+ 
+ 
+ class TestGeminiProviderInterface:
+@@ -34,20 +35,20 @@
+ class TestGeminiProviderInitialization:
+     """Test GeminiProvider initialization."""
+ 
+-    @patch("src.llm.gemini_provider.genai.configure")
+-    def test_initialization_with_api_key(self, mock_configure: MagicMock) -> None:
++    @patch("src.llm.gemini_provider.genai.Client")
++    def test_initialization_with_api_key(self, mock_client: MagicMock) -> None:
+         """Test initialization with explicit API key."""
+         provider = GeminiProvider(api_key="test-key-123")
+         assert provider._api_key == "test-key-123"
+-        mock_configure.assert_called_once_with(api_key="test-key-123")
+-
+-    @patch("src.llm.gemini_provider.genai.configure")
+-    def test_initialization_with_env_var(self, mock_configure: MagicMock) -> None:
++        mock_client.assert_called_once_with(api_key="test-key-123")
++
++    @patch("src.llm.gemini_provider.genai.Client")
++    def test_initialization_with_env_var(self, mock_client: MagicMock) -> None:
+         """Test initialization reads API key from environment variable."""
+         with patch.dict(os.environ, {"GOOGLE_API_KEY": "env-key-456"}):
+             provider = GeminiProvider()
+             assert provider._api_key == "env-key-456"
+-            mock_configure.assert_called_once_with(api_key="env-key-456")
++            mock_client.assert_called_once_with(api_key="env-key-456")
+ 
+     def test_initialization_fails_without_api_key(self) -> None:
+         """Test initialization fails when no API key provided."""
+@@ -59,10 +60,9 @@
+ class TestGeminiProviderGenerate:
+     """Test GeminiProvider.generate() method."""
+ 
+-    @patch("src.llm.gemini_provider.genai.GenerativeModel")
+-    @patch("src.llm.gemini_provider.genai.configure")
++    @patch("src.llm.gemini_provider.genai.Client")
+     def test_generate_calls_gemini_api_with_correct_parameters(
+-        self, mock_configure: MagicMock, mock_generative_model: MagicMock
++        self, mock_client: MagicMock
+     ) -> None:
+         """Test that generate() calls Gemini API with correct parameters."""
+         # Setup mock response
+@@ -70,9 +70,9 @@
+         mock_response.text = "Test response"
+         mock_response.usage_metadata = Mock(prompt_token_count=50, candidates_token_count=50)
+ 
+-        mock_model = Mock()
+-        mock_model.generate_content.return_value = mock_response
+-        mock_generative_model.return_value = mock_model
++        mock_client_instance = mock_client.return_value
++        mock_client_instance.models = MagicMock()
++        mock_client_instance.models.generate_content.return_value = mock_response
+ 
+         provider = GeminiProvider(api_key="test-key")
+         response = provider.generate(
+@@ -83,16 +83,14 @@
+         )
+ 
+         # Verify API was called correctly
+-        # Note: safety_settings are now included to prevent false positive safety blocks
+-        mock_generative_model.assert_called_once()
+-        call_args = mock_generative_model.call_args
+-        assert call_args[0][0] == "gemini-2.5-flash"  # First positional arg is model name
+-        assert "safety_settings" in call_args[1]  # Keyword arg for safety settings
+-
+-        mock_model.generate_content.assert_called_once_with(
+-            "Test prompt",
+-            generation_config={"max_output_tokens": 100, "temperature": 0.7},
+-        )
++        mock_client.assert_called_once_with(api_key="test-key")
++        call_args = mock_client_instance.models.generate_content.call_args
++        assert call_args.kwargs["model"] == "gemini-2.5-flash"
++        assert call_args.kwargs["contents"] == "Test prompt"
++        gen_cfg = call_args.kwargs["config"]
++        assert gen_cfg.generation_config.max_output_tokens == 100
++        assert gen_cfg.generation_config.temperature == 0.7
++        assert hasattr(gen_cfg, "safety_settings")
+ 
+         # Verify response
+         assert isinstance(response, LLMResponse)
+@@ -100,42 +98,40 @@
+         assert response.tokens_used == 100  # prompt + candidates
+         assert response.latency_ms > 0
+ 
+-    @patch("src.llm.gemini_provider.genai.GenerativeModel")
+-    @patch("src.llm.gemini_provider.genai.configure")
++    @patch("src.llm.gemini_provider.genai.Client")
+     def test_generate_supports_gemini_3_flash_preview_model(
+-        self, mock_configure: MagicMock, mock_generative_model: MagicMock
++        self, mock_client: MagicMock
+     ) -> None:
+         """Test that GeminiProvider supports gemini-2.5-flash model."""
+         mock_response = Mock()
+         mock_response.text = "Response"
+         mock_response.usage_metadata = Mock(prompt_token_count=10, candidates_token_count=10)
+ 
+-        mock_model = Mock()
+-        mock_model.generate_content.return_value = mock_response
+-        mock_generative_model.return_value = mock_model
++        mock_client_instance = mock_client.return_value
++        mock_client_instance.models = MagicMock()
++        mock_client_instance.models.generate_content.return_value = mock_response
+ 
+         provider = GeminiProvider(api_key="test-key")
+         response = provider.generate(prompt="Test", model="gemini-2.5-flash")
+ 
+         assert response.text == "Response"
+         # Verify model was called (safety_settings are now included)
+-        mock_generative_model.assert_called_once()
+-        call_args = mock_generative_model.call_args
+-        assert call_args[0][0] == "gemini-2.5-flash"
+-
+-    @patch("src.llm.gemini_provider.genai.GenerativeModel")
+-    @patch("src.llm.gemini_provider.genai.configure")
++        mock_client.assert_called_once_with(api_key="test-key")
++        call_args = mock_client_instance.models.generate_content.call_args
++        assert call_args.kwargs["model"] == "gemini-2.5-flash"
++
++    @patch("src.llm.gemini_provider.genai.Client")
+     def test_generate_supports_configured_models(
+-        self, mock_configure: MagicMock, mock_generative_model: MagicMock
++        self, mock_client: MagicMock
+     ) -> None:
+         """Test that GeminiProvider supports all models configured in config.json."""
+         mock_response = Mock()
+         mock_response.text = "Response"
+         mock_response.usage_metadata = Mock(prompt_token_count=10, candidates_token_count=10)
+ 
+-        mock_model = Mock()
+-        mock_model.generate_content.return_value = mock_response
+-        mock_generative_model.return_value = mock_model
++        mock_client_instance = mock_client.return_value
++        mock_client_instance.models = MagicMock()
++        mock_client_instance.models.generate_content.return_value = mock_response
+ 
+         provider = GeminiProvider(api_key="test-key")
+ 
+@@ -144,8 +140,8 @@
+             response = provider.generate(prompt="Test", model=model)
+             assert response.text == "Response"
+             # Verify API was called with correct model (safety_settings are now included)
+-            call_args = mock_generative_model.call_args
+-            assert call_args[0][0] == model  # First positional arg is model name
++            call_args = mock_client_instance.models.generate_content.call_args
++            assert call_args.kwargs["model"] == model  # model name passed in config
+ 
+     def test_generate_rejects_unsupported_model(self) -> None:
+         """Test that generate() rejects unsupported models."""
+@@ -172,76 +168,77 @@
+ class TestGeminiProviderErrorHandling:
+     """Test GeminiProvider error handling and retries."""
+ 
+-    @patch("src.llm.gemini_provider.genai.GenerativeModel")
+-    @patch("src.llm.gemini_provider.genai.configure")
++    @patch("src.llm.gemini_provider.genai.Client")
+     @patch("src.llm.gemini_provider.time.sleep")
+     def test_handles_api_timeout_errors_with_retry(
+         self,
+         mock_sleep: MagicMock,
+-        mock_configure: MagicMock,
+-        mock_generative_model: MagicMock,
++        mock_client: MagicMock,
+     ) -> None:
+         """Test that GeminiProvider handles API timeout errors with retries."""
+-        timeout_error = google_exceptions.DeadlineExceeded("Timeout")
++        timeout_error = errors.DeadlineExceeded("Timeout")
+         mock_response = Mock()
+         mock_response.text = "Success"
+         mock_response.usage_metadata = Mock(prompt_token_count=10, candidates_token_count=10)
+ 
+-        mock_model = Mock()
+-        mock_model.generate_content.side_effect = [timeout_error, mock_response]
+-        mock_generative_model.return_value = mock_model
++        mock_client_instance = mock_client.return_value
++        mock_client_instance.models = MagicMock()
++        mock_client_instance.models.generate_content.side_effect = [timeout_error, mock_response]
+ 
+         provider = GeminiProvider(api_key="test-key")
+         response = provider.generate(prompt="Test", model="gemini-2.5-flash")
+ 
+         assert response.text == "Success"
+-        assert mock_model.generate_content.call_count == 2
++        assert mock_client_instance.models.generate_content.call_count == 2
+         mock_sleep.assert_called_once_with(1)  # First retry waits 1 second
+ 
+-    @patch("src.llm.gemini_provider.genai.GenerativeModel")
+-    @patch("src.llm.gemini_provider.genai.configure")
++    @patch("src.llm.gemini_provider.genai.Client")
+     def test_handles_authentication_errors_without_retry(
+-        self, mock_configure: MagicMock, mock_generative_model: MagicMock
++        self, mock_client: MagicMock
+     ) -> None:
+         """Test that GeminiProvider handles authentication errors without retry."""
+-        auth_error = google_exceptions.Unauthenticated("Invalid API key")
+-        mock_model = Mock()
+-        mock_model.generate_content.side_effect = auth_error
+-        mock_generative_model.return_value = mock_model
++        auth_error = errors.ClientError(
++            401,
++            {"error": {"code": 401, "message": "Invalid API key", "status": "UNAUTHENTICATED"}},
++        )
++        mock_client_instance = mock_client.return_value
++        mock_client_instance.models = MagicMock()
++        mock_client_instance.models.generate_content.side_effect = auth_error
+ 
+         provider = GeminiProvider(api_key="test-key")
+         with pytest.raises(RuntimeError):  # Our code wraps it in RuntimeError
+             provider.generate(prompt="Test", model="gemini-2.5-flash")
+ 
+         # Should not retry on auth errors
+-        assert mock_model.generate_content.call_count == 1
+-
+-    @patch("src.llm.gemini_provider.genai.GenerativeModel")
+-    @patch("src.llm.gemini_provider.genai.configure")
++        assert mock_client_instance.models.generate_content.call_count == 1
++
++    @patch("src.llm.gemini_provider.genai.Client")
+     @patch("src.llm.gemini_provider.time.sleep")
+     def test_handles_rate_limit_with_retry_after_header(
+         self,
+         mock_sleep: MagicMock,
+-        mock_configure: MagicMock,
+-        mock_generative_model: MagicMock,
++        mock_client: MagicMock,
+     ) -> None:
+         """Test that GeminiProvider handles rate limit with Retry-After header."""
+-        mock_model = Mock()
++        mock_client_instance = mock_client.return_value
++        mock_client_instance.models = MagicMock()
++
+         mock_response_obj = Mock()
+         mock_response_obj.headers = {"Retry-After": "4"}
+-        rate_limit_error = google_exceptions.ResourceExhausted(
+-            message="Rate limit exceeded", response=mock_response_obj
+-        )
++        rate_limit_error = errors.ClientError(
++            429,
++            {"error": {"code": 429, "message": "Rate limit exceeded", "status": "RESOURCE_EXHAUSTED"}},
++        )
++        rate_limit_error.response = mock_response_obj
+ 
+         # First call fails with rate limit, second succeeds
+-        mock_model.generate_content.side_effect = [
++        mock_client_instance.models.generate_content.side_effect = [
+             rate_limit_error,
+             Mock(
+                 text="Success",
+                 usage_metadata=Mock(prompt_token_count=10, candidates_token_count=10),
+             ),
+         ]
+-        mock_generative_model.return_value = mock_model
+ 
+         provider = GeminiProvider(api_key="test-key")
+         response = provider.generate(prompt="Test", model="gemini-2.5-flash")
+@@ -250,60 +247,67 @@
+         # Should wait 4 seconds (from Retry-After header) before retry
+         mock_sleep.assert_called_with(4.0)
+ 
+-    @patch("src.llm.gemini_provider.genai.GenerativeModel")
+-    @patch("src.llm.gemini_provider.genai.configure")
++    @patch("src.llm.gemini_provider.genai.Client")
+     @patch("src.llm.gemini_provider.time.sleep")
+     def test_handles_other_api_errors_with_retry(
+         self,
+         mock_sleep: MagicMock,
+-        mock_configure: MagicMock,
+-        mock_generative_model: MagicMock,
++        mock_client: MagicMock,
+     ) -> None:
+         """Test that GeminiProvider handles other API errors with retry."""
+-        mock_model = Mock()
+-        api_error = google_exceptions.GoogleAPIError("Internal server error")
++        mock_client_instance = mock_client.return_value
++        mock_client_instance.models = MagicMock()
++
++        api_error = errors.APIError(
++            500,
++            {"error": {"code": 500, "message": "Internal server error", "status": "INTERNAL"}},
++        )
+ 
+         # First call fails, second succeeds
+-        mock_model.generate_content.side_effect = [
++        mock_client_instance.models.generate_content.side_effect = [
+             api_error,
+             Mock(
+                 text="Success",
+                 usage_metadata=Mock(prompt_token_count=10, candidates_token_count=10),
+             ),
+         ]
+-        mock_generative_model.return_value = mock_model
+ 
+         provider = GeminiProvider(api_key="test-key")
+         response = provider.generate(prompt="Test", model="gemini-2.5-flash")
+ 
+         assert response.text == "Success"
+-        assert mock_model.generate_content.call_count == 2
++        assert mock_client_instance.models.generate_content.call_count == 2
+         mock_sleep.assert_called_once_with(1)  # Exponential backoff: 2^0 = 1
+ 
+-    @patch("src.llm.gemini_provider.genai.GenerativeModel")
+-    @patch("src.llm.gemini_provider.genai.configure")
++    @patch("src.llm.gemini_provider.genai.Client")
+     def test_handles_permission_denied_without_retry(
+-        self, mock_configure: MagicMock, mock_generative_model: MagicMock
++        self, mock_client: MagicMock
+     ) -> None:
+         """Test that GeminiProvider handles permission denied errors without retry."""
+-        mock_model = Mock()
+-        perm_error = google_exceptions.PermissionDenied("Permission denied")
+-        mock_model.generate_content.side_effect = perm_error
+-        mock_generative_model.return_value = mock_model
++        mock_client_instance = mock_client.return_value
++        mock_client_instance.models = MagicMock()
++
++        perm_error = errors.ClientError(
++            403,
++            {"error": {"code": 403, "message": "Permission denied", "status": "PERMISSION_DENIED"}},
++        )
++        mock_client_instance.models.generate_content.side_effect = perm_error
+ 
+         provider = GeminiProvider(api_key="test-key")
+         with pytest.raises(RuntimeError):
+             provider.generate(prompt="Test", model="gemini-2.5-flash")
+ 
+         # Should not retry on permission errors
+-        assert mock_model.generate_content.call_count == 1
+-
+-    @patch("src.llm.gemini_provider.genai.GenerativeModel")
+-    @patch("src.llm.gemini_provider.genai.configure")
++        assert mock_client_instance.models.generate_content.call_count == 1
++
++    @patch("src.llm.gemini_provider.genai.Client")
+     def test_handles_fallback_token_usage_calculation(
+-        self, mock_configure: MagicMock, mock_generative_model: MagicMock
++        self, mock_client: MagicMock
+     ) -> None:
+         """Test that GeminiProvider handles fallback token usage calculation."""
++        mock_client_instance = mock_client.return_value
++        mock_client_instance.models = MagicMock()
++
+         mock_model = Mock()
+         # Mock response with usage (not usage_metadata)
+         # Use getattr to return actual integers, not Mocks
+@@ -315,8 +319,7 @@
+         mock_response.usage = mock_usage
+         # Make sure response doesn't have usage_metadata
+         del mock_response.usage_metadata
+-        mock_model.generate_content.return_value = mock_response
+-        mock_generative_model.return_value = mock_model
++        mock_client_instance.models.generate_content.return_value = mock_response
+ 
+         provider = GeminiProvider(api_key="test-key")
+         response = provider.generate(prompt="Test", model="gemini-2.5-flash")
+@@ -324,48 +327,50 @@
+         assert response.text == "Response"
+         assert response.tokens_used == 10
+ 
+-    @patch("src.llm.gemini_provider.genai.GenerativeModel")
+-    @patch("src.llm.gemini_provider.genai.configure")
++    @patch("src.llm.gemini_provider.genai.Client")
+     def test_handles_api_error_exception_path(
+-        self, mock_configure: MagicMock, mock_generative_model: MagicMock
++        self, mock_client: MagicMock
+     ) -> None:
+         """Test that GeminiProvider handles GoogleAPIError exception path."""
+-        mock_model = Mock()
+-        api_error = google_exceptions.GoogleAPIError("API error")
+-        mock_model.generate_content.side_effect = api_error
+-        mock_generative_model.return_value = mock_model
++        mock_client_instance = mock_client.return_value
++        mock_client_instance.models = MagicMock()
++
++        api_error = errors.APIError(
++            500,
++            {"error": {"code": 500, "message": "API error", "status": "INTERNAL"}},
++        )
++        mock_client_instance.models.generate_content.side_effect = api_error
+ 
+         provider = GeminiProvider(api_key="test-key")
+         with pytest.raises(RuntimeError, match="Google Gemini API error"):
+             provider.generate(prompt="Test", model="gemini-2.5-flash")
+ 
+-    @patch("src.llm.gemini_provider.genai.GenerativeModel")
+-    @patch("src.llm.gemini_provider.genai.configure")
++    @patch("src.llm.gemini_provider.genai.Client")
+     def test_handles_unexpected_exception_path(
+-        self, mock_configure: MagicMock, mock_generative_model: MagicMock
++        self, mock_client: MagicMock
+     ) -> None:
+         """Test that GeminiProvider handles unexpected exceptions."""
+-        mock_model = Mock()
+-        mock_model.generate_content.side_effect = ValueError("Unexpected error")
+-        mock_generative_model.return_value = mock_model
++        mock_client_instance = mock_client.return_value
++        mock_client_instance.models = MagicMock()
++
++        mock_client_instance.models.generate_content.side_effect = ValueError("Unexpected error")
+ 
+         provider = GeminiProvider(api_key="test-key")
+         with pytest.raises(RuntimeError, match="Unexpected error"):
+             provider.generate(prompt="Test", model="gemini-2.5-flash")
+ 
+-    @patch("src.llm.gemini_provider.genai.GenerativeModel")
+-    @patch("src.llm.gemini_provider.genai.configure")
++    @patch("src.llm.gemini_provider.genai.Client")
+     def test_returns_structured_response(
+-        self, mock_configure: MagicMock, mock_generative_model: MagicMock
++        self, mock_client: MagicMock
+     ) -> None:
+         """Test that GeminiProvider returns structured response with text, tokens_used, latency_ms."""
+         mock_response = Mock()
+         mock_response.text = "Generated text"
+         mock_response.usage_metadata = Mock(prompt_token_count=75, candidates_token_count=75)
+ 
+-        mock_model = Mock()
+-        mock_model.generate_content.return_value = mock_response
+-        mock_generative_model.return_value = mock_model
++        mock_client_instance = mock_client.return_value
++        mock_client_instance.models = MagicMock()
++        mock_client_instance.models.generate_content.return_value = mock_response
+ 
+         provider = GeminiProvider(api_key="test-key")
+         response = provider.generate(prompt="Test", model="gemini-2.5-flash")
+@@ -375,10 +380,9 @@
+         assert response.tokens_used == 150  # prompt + candidates
+         assert response.latency_ms > 0
+ 
+-    @patch("src.llm.gemini_provider.genai.GenerativeModel")
+-    @patch("src.llm.gemini_provider.genai.configure")
++    @patch("src.llm.gemini_provider.genai.Client")
+     def test_handles_rate_limit_errors_with_retry_logic(
+-        self, mock_configure: MagicMock, mock_generative_model: MagicMock
++        self, mock_client: MagicMock
+     ) -> None:
+         """Test that GeminiProvider has retry logic for rate limit errors.
+ 

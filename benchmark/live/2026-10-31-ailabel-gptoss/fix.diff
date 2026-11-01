@@ -1,0 +1,215 @@
+diff --git a/ailabel/lib/llms.py b/ailabel/lib/llms.py
+--- a/ailabel/lib/llms.py
++++ b/ailabel/lib/llms.py
+@@ -15,15 +15,17 @@
+ """
+ 
+ import os
+-from typing import Dict, Any
+ import json
+ import functools
++import copy
++from dataclasses import dataclass
++from typing import Dict, Any
+ from enum import Enum
+-import google.generativeai as genai
+-from google.generativeai.types import GenerationConfig, ContentDict
+ 
++from google import genai
++from google.genai import types
++from google.genai.types import ContentDict  # type: ignore  # noqa: F401 (re‑exported for callers)
+ 
+-# Configure the Gemini API client
+ api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+ if not api_key:
+     raise ValueError(
+@@ -31,7 +33,12 @@
+         "You can do this by running: export GOOGLE_API_KEY=\"your-api-key\"\n"
+         "Or by creating a .env.secret file with GOOGLE_API_KEY=your-api-key"
+     )
+-genai.configure(api_key=api_key, transport="rest")
++
++# Predefined tools and configurations
++JSON_CONFIG: types.GenerateContentConfig = types.GenerateContentConfig(
++    response_mime_type="application/json",
++    temperature=0.0,
++)
+ 
+ 
+ class Models(str, Enum):
+@@ -46,12 +53,54 @@
+     GEMINI_2_0_FLASH_8B = "models/gemini-2.0-flash-8b"
+ 
+ 
+-# Predefined tools and configurations
+-JSON_CONFIG: GenerationConfig = genai.GenerationConfig(response_mime_type="application/json", temperature=0.0)
++@dataclass(frozen=True)
++class _GeminiModel:
++    """Lightweight wrapper mimicking the old GenerativeModel interface."""
++
++    client: genai.Client
++    model_name: str
++    system_instruction: str | None = None
++
++    def generate_content(
++        self,
++        *args,
++        generation_config: types.GenerateContentConfig | None = None,
++        **kwargs,
++    ):
++        """Forward call to the new client API.
++
++        The wrapper accepts the same call patterns used in the old SDK:
++        - a single prompt string
++        - a list of content dictionaries (history)
++
++        It builds the appropriate ``contents`` list and merges any provided
++        ``generation_config`` with the stored ``system_instruction``.
++        """
++        first = args[0] if args else None
++
++        if isinstance(first, list):
++            contents = first
++        else:
++            contents = [{"role": "user", "parts": [first]}]
++
++        if generation_config is not None:
++            config = copy.deepcopy(generation_config)
++        else:
++            config = types.GenerateContentConfig()
++
++        if self.system_instruction:
++            system_content = {"role": "system", "parts": [self.system_instruction]}
++            contents = [system_content] + contents
++
++        return self.client.models.generate_content(
++            model=self.model_name,
++            contents=contents,
++            config=config,
++        )
+ 
+ 
+ @functools.cache
+-def get_gemini(system_instruction: str | None = None) -> genai.GenerativeModel:
++def get_gemini(system_instruction: str | None = None) -> _GeminiModel:
+     """Get a configured Gemini model instance.
+ 
+     Creates a GenerativeModel instance with the specified system instruction.
+@@ -64,14 +113,18 @@
+     Returns:
+         A configured GenerativeModel instance
+     """
+-    return genai.GenerativeModel(
+-        Models.GEMINI_2_0_FLASH,
++    client = genai.Client(api_key=api_key)
++    return _GeminiModel(
++        client=client,
++        model_name=Models.GEMINI_2_0_FLASH,
+         system_instruction=system_instruction,
+     )
+ 
+ 
+ def generate_json(
+-    prompt: str, history: list[ContentDict] | None = None, system_instruction: str | None = None
++    prompt: str,
++    history: list[ContentDict] | None = None,
++    system_instruction: str | None = None,
+ ) -> Dict[str, Any]:
+     """Generate a JSON response from the model.
+ 
+@@ -92,7 +145,8 @@
+     model = get_gemini(system_instruction=system_instruction)
+     if history:
+         response = model.generate_content(
+-            history + [{"role": "user", "parts": [prompt]}], generation_config=JSON_CONFIG
++            history + [{"role": "user", "parts": [prompt]}],
++            generation_config=JSON_CONFIG,
+         )
+     else:
+         response = model.generate_content(prompt, generation_config=JSON_CONFIG)
+diff --git a/pyproject.toml b/pyproject.toml
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -10,7 +10,7 @@
+ keywords = ["ai", "machine-learning", "labeling", "datasets", "classification"]
+ requires-python = ">=3.13"
+ dependencies = [
+-    "google-generativeai>=0.8.3",
++    "google-genai>=1.19.0,<3",
+     "python-dotenv>=1.0.1",
+     "requests>=2.32.3",
+     "sqlmodel>=0.0.22",
+diff --git a/tests/lib/test_llms.py b/tests/lib/test_llms.py
+--- a/tests/lib/test_llms.py
++++ b/tests/lib/test_llms.py
+@@ -5,7 +5,8 @@
+ from ailabel.lib.llms import (
+     get_gemini,
+     generate_json,
+-    Models
++    Models,
++    api_key,
+ )
+ 
+ 
+@@ -16,40 +17,34 @@
+     assert Models.GEMINI_2_0_FLASH_8B == "models/gemini-2.0-flash-8b"
+ 
+ 
+-@patch("ailabel.lib.llms.genai.GenerativeModel")
+-def test_get_gemini(mock_generative_model):
++@patch("ailabel.lib.llms.genai.Client")
++def test_get_gemini(mock_client):
+     """Test the get_gemini function."""
+-    # Set up mock
+-    mock_model = MagicMock()
+-    mock_generative_model.return_value = mock_model
+-    
++    mock_client_instance = MagicMock()
++    mock_client.return_value = mock_client_instance
++
+     # Call with no system instruction
+     model = get_gemini()
+-    assert model == mock_model
+-    mock_generative_model.assert_called_once_with(
+-        Models.GEMINI_2_0_FLASH,
+-        system_instruction=None
+-    )
+-    
+-    # Reset mock
+-    mock_generative_model.reset_mock()
+-    
++    assert model.client is mock_client_instance
++    assert model.system_instruction is None
++    mock_client.assert_called_once_with(api_key=api_key)
++
++    mock_client.reset_mock()
++
+     # Call with system instruction
+     system_instruction = "You are a helpful assistant."
+-    model = get_gemini(system_instruction=system_instruction)
+-    assert model == mock_model
+-    mock_generative_model.assert_called_once_with(
+-        Models.GEMINI_2_0_FLASH,
+-        system_instruction=system_instruction
+-    )
+-    
++    model_with_instr = get_gemini(system_instruction=system_instruction)
++    assert model_with_instr.client is mock_client_instance
++    assert model_with_instr.system_instruction == system_instruction
++    mock_client.assert_called_once_with(api_key=api_key)
++
+     # Test caching (the function is decorated with @functools.cache)
+     # If we call get_gemini again with the same system_instruction,
+     # the mock shouldn't be called again
+-    mock_generative_model.reset_mock()
+-    model = get_gemini(system_instruction=system_instruction)
+-    assert model == mock_model
+-    mock_generative_model.assert_not_called()
++    mock_client.reset_mock()
++    cached_model = get_gemini(system_instruction=system_instruction)
++    assert cached_model is model_with_instr
++    mock_client.assert_not_called()
+ 
+ 
+ @patch("ailabel.lib.llms.get_gemini")

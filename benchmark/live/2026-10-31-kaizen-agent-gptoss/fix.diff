@@ -1,0 +1,451 @@
+diff --git a/kaizen/autofix/code/llm_fixer.py b/kaizen/autofix/code/llm_fixer.py
+--- a/kaizen/autofix/code/llm_fixer.py
++++ b/kaizen/autofix/code/llm_fixer.py
+@@ -3,7 +3,7 @@
+ import os
+ import logging
+ from typing import Dict, Any, Optional, List, TYPE_CHECKING
+-import google.generativeai as genai
++from google import genai
+ from dataclasses import dataclass
+ from abc import ABC, abstractmethod
+ import traceback
+@@ -1176,7 +1176,7 @@
+             config: Configuration dictionary for the LLM fixer
+         """
+         self.config = config
+-        self.model = self._initialize_model()
++        self.client, self.model_name = self._initialize_model()
+         self.prompt_builder = PromptBuilder()
+         self.response_processor = ResponseProcessor()
+     
+@@ -1187,11 +1187,12 @@
+             if not api_key:
+                 raise LLMError("GOOGLE_API_KEY environment variable not set")
+                 
+-            genai.configure(api_key=api_key)
++            client = genai.Client(api_key=api_key)
+             if self.config.get('better_ai', False):
+-                return genai.GenerativeModel('gemini-2.5-pro')
++                model_name = 'gemini-2.5-pro'
+             else:
+-                return genai.GenerativeModel('gemini-2.5-flash-preview-05-20')
++                model_name = 'gemini-2.5-flash-preview-05-20'
++            return client, model_name
+         except Exception as e:
+             raise LLMError(f"Failed to initialize LLM model: {str(e)}")
+     
+@@ -1397,13 +1398,16 @@
+             LLMConnectionError: If there's a connection issue
+         """
+         try:
+-            response = self.model.generate_content(
+-                prompt,
+-                generation_config=genai.types.GenerationConfig(
+-                    temperature=0.1,  # Low temperature for more focused results
+-                    max_output_tokens=20000,
+-                    top_p=0.8,
+-                    top_k=40,
++            response = self.client.models.generate_content(
++                model=self.model_name,
++                contents=prompt,
++                config=genai.types.GenerateContentConfig(
++                    generation_config=genai.types.GenerationConfig(
++                        temperature=0.1,  # Low temperature for more focused results
++                        max_output_tokens=20000,
++                        top_p=0.8,
++                        top_k=40,
++                    )
+                 )
+             )
+             
+@@ -1413,15 +1417,22 @@
+             
+             # Check if response has a valid finish reason
+             if hasattr(response, 'candidates') and response.candidates:
+-                finish_reason = response.candidates[0].finish_reason
++                finish_reason = getattr(response.candidates[0], 'finish_reason', None)
+                 if finish_reason == 2:  # Safety or other constraint
+                     raise LLMResponseError("Model stopped due to safety constraints or other limitations")
+             
+-            # Check if response has text
+-            if not hasattr(response, 'text') or not response.text:
+-                raise LLMResponseError("No text content in LLM response")
++            if hasattr(response, "text"):
++                text = response.text
++            else:
++                try:
++                    text = response.candidates[0].content.parts[0].text
++                except Exception:
++                    raise LLMResponseError("No text content in LLM response")
+                 
+-            return response.text
++            if not text:
++                raise LLMResponseError("Empty text content in LLM response")
++                
++            return text
+             
+         except ConnectionError as e:
+             raise LLMConnectionError(f"Failed to connect to LLM: {str(e)}")
+diff --git a/kaizen/autofix/file/dependency.py b/kaizen/autofix/file/dependency.py
+--- a/kaizen/autofix/file/dependency.py
++++ b/kaizen/autofix/file/dependency.py
+@@ -7,7 +7,7 @@
+ from pathlib import Path
+ from dataclasses import dataclass
+ from difflib import SequenceMatcher
+-import google.generativeai as genai
++from google import genai
+ from enum import Enum
+ 
+ # Configure logging
+@@ -608,25 +608,45 @@
+             return set()
+             
+         logger.info("Initializing Gemini model")
+-        genai.configure(api_key=api_key)
+-        model = genai.GenerativeModel('gemini-2.5-flash-preview-05-20')
+-        
+-        # Get response from Gemini
+-        logger.info("Sending prompt to Gemini model")
+-        response = model.generate_content(
+-            prompt,
++        client = genai.Client(api_key=api_key)
++        model_name = 'gemini-2.5-flash-preview-05-20'
++        
++        generation_cfg = genai.types.GenerateContentConfig(
+             generation_config=genai.types.GenerationConfig(
+-                temperature=0.1,  # Low temperature for more focused results
++                temperature=0.1,
+                 max_output_tokens=1024,
+                 top_p=0.8,
+                 top_k=40,
+             )
+         )
++        
++        # Get response from Gemini
++        logger.info("Sending prompt to Gemini model")
++        response = client.models.generate_content(
++            model=model_name,
++            contents=prompt,
++            config=generation_cfg
++        )
+         logger.debug("Received response from Gemini model")
++        
++        response_text = None
++        if hasattr(response, "text"):
++            response_text = response.text
++        else:
++            if getattr(response, "candidates", None):
++                first_candidate = response.candidates[0]
++                if getattr(first_candidate, "content", None):
++                    parts = getattr(first_candidate.content, "parts", [])
++                    if parts:
++                        response_text = getattr(parts[0], "text", None)
++        
++        if not response_text:
++            logger.warning("No text found in Gemini response")
++            return set()
+         
+         # Parse the response
+         try:
+-            suggested_files = json.loads(response.text)
++            suggested_files = json.loads(response_text)
+             logger.info(f"Successfully parsed LLM response: {len(suggested_files)} files suggested")
+             logger.debug(f"Suggested files: {suggested_files}")
+             
+@@ -642,7 +662,7 @@
+             return relevant_files
+             
+         except json.JSONDecodeError:
+-            logger.warning(f"Failed to parse LLM response as JSON: {response.text}")
++            logger.warning(f"Failed to parse LLM response as JSON: {response_text}")
+             return set()
+             
+     except Exception as e:
+diff --git a/kaizen/autofix/main.py b/kaizen/autofix/main.py
+--- a/kaizen/autofix/main.py
++++ b/kaizen/autofix/main.py
+@@ -12,7 +12,7 @@
+ import shutil
+ import tempfile
+ import traceback
+-import google.generativeai as genai
++from google import genai
+ 
+ from kaizen.cli.commands.memory import ExecutionMemory
+ from kaizen.cli.commands.models import TestExecutionHistory
+@@ -336,14 +336,15 @@
+                 if not api_key:
+                     raise ValueError("GOOGLE_API_KEY environment variable not set")
+                     
+-                genai.configure(api_key=api_key)
+-                self.model = genai.GenerativeModel('gemini-2.5-flash-preview-05-20')
++                self.client = genai.Client(api_key=api_key)
++                self.model_name = 'gemini-2.5-flash-preview-05-20'
+                 self.logger.debug("Gemini model initialized successfully for Python formatting")
+             except Exception as e:
+                 self.logger.error(f"Failed to initialize Gemini model: {str(e)}")
+                 raise
+         else:
+-            self.model = None
++            self.client = None
++            self.model_name = None
+             self.logger.debug(f"Initialized formatter for {self.language} (no LLM support)")
+     
+     def _format_with_llm(self, code: str) -> str:
+@@ -385,13 +386,16 @@
+             
+             # Call LLM for formatting
+             try:
+-                response = self.model.generate_content(
+-                    prompt,
+-                    generation_config=genai.types.GenerationConfig(
+-                        temperature=0.1,  # Low temperature for more focused results
+-                        max_output_tokens=20000,
+-                        top_p=0.8,
+-                        top_k=40,
++                response = self.client.models.generate_content(
++                    model=self.model_name,
++                    contents=prompt,
++                    config=genai.types.GenerateContentConfig(
++                        generation_config=genai.types.GenerationConfig(
++                            temperature=0.1,  # Low temperature for more focused results
++                            max_output_tokens=20000,
++                            top_p=0.8,
++                            top_k=40,
++                        )
+                     )
+                 )
+                 
+diff --git a/kaizen/autofix/pr/manager.py b/kaizen/autofix/pr/manager.py
+--- a/kaizen/autofix/pr/manager.py
++++ b/kaizen/autofix/pr/manager.py
+@@ -8,7 +8,7 @@
+ from datetime import datetime
+ from github import Github, GithubException
+ from github.PullRequest import PullRequest
+-import google.generativeai as genai
++from google import genai
+ import traceback
+ 
+ # Configure logging
+@@ -324,8 +324,8 @@
+                 logger.warning("GOOGLE_API_KEY not found, using algorithmic fallback description")
+                 return self._generate_algorithmic_description(changes, test_results)
+             
+-            genai.configure(api_key=api_key)
+-            model = genai.GenerativeModel('gemini-2.5-flash-preview-05-20')
++            client = genai.Client(api_key=api_key)
++            model_name = 'gemini-2.5-flash-preview-05-20'
+             
+             # Generate algorithmic detailed results first
+             algorithmic_detailed_results = self._generate_optimized_detailed_results(test_results)
+@@ -346,14 +346,16 @@
+                 return self._generate_algorithmic_description(changes, test_results)
+             
+             # Get response from LLM for summary only
+-            response = model.generate_content(
+-                prompt,
+-                generation_config=genai.types.GenerationConfig(
+-                    temperature=0.1,  # Low temperature for consistent results
+-                    max_output_tokens=4000,  # Reduced since we're only generating summary
+-                    top_p=0.8,
+-                    top_k=40,
+-                )
++            config = genai.types.GenerateContentConfig(
++                temperature=0.1,          # Low temperature for consistent results
++                max_output_tokens=4000,   # Reduced since we're only generating summary
++                top_p=0.8,
++                top_k=40,
++            )
++            response = client.models.generate_content(
++                model=model_name,
++                contents=prompt,
++                config=config,
+             )
+             
+             if not response or not hasattr(response, 'text') or not response.text:
+diff --git a/kaizen/autofix/test/test_case.py b/kaizen/autofix/test/test_case.py
+--- a/kaizen/autofix/test/test_case.py
++++ b/kaizen/autofix/test/test_case.py
+@@ -7,7 +7,7 @@
+ import json
+ import os
+ from pathlib import Path
+-import google.generativeai as genai
++from google import genai
+ from pydantic import BaseModel, Field, validator
+ import yaml
+ from tenacity import retry, stop_after_attempt, wait_exponential
+@@ -355,11 +355,11 @@
+     def _initialize_model(self):
+         """Initialize the LLM model with proper configuration."""
+         try:
+-            genai.configure(api_key=self.config.api_key)
++            self.client = genai.Client(api_key=self.config.api_key)
+             if self.better_ai:
+-                self.model = genai.GenerativeModel('gemini-2.5-pro')
++                self.model_name = 'gemini-2.5-pro'
+             else:
+-                self.model = genai.GenerativeModel(self.config.model_name)
++                self.model_name = self.config.model_name
+         except Exception as e:
+             logger.error(f"Failed to initialize LLM model: {str(e)}")
+             raise RuntimeError(f"LLM initialization failed: {str(e)}")
+@@ -383,7 +383,11 @@
+         """
+         try:
+             prompt = PromptBuilder.build_evaluation_prompt(test_case, actual_output, tracked_values)
+-            response = self.model.generate_content(prompt)
++            response = self.client.models.generate_content(
++                model=self.model_name,
++                contents=prompt,
++                config=genai.types.GenerateContentConfig()
++            )
+             
+             evaluation_result = self._parse_llm_response(response.text)
+             return self._format_evaluation_result(evaluation_result)
+diff --git a/kaizen/cli/commands/augment.py b/kaizen/cli/commands/augment.py
+--- a/kaizen/cli/commands/augment.py
++++ b/kaizen/cli/commands/augment.py
+@@ -22,7 +22,7 @@
+ 
+ # Third-party imports
+ import click
+-import google.generativeai as genai
++from google import genai
+ from rich.console import Console
+ from rich.logging import RichHandler
+ from ruamel.yaml import YAML
+@@ -401,13 +401,12 @@
+     if not api_key:
+         raise ValueError("GOOGLE_API_KEY environment variable not set")
+     
+-    genai.configure(api_key=api_key)
+-    
+-    # Select model based on better_ai flag
++    client = genai.Client(api_key=api_key)
++    
+     if use_better_ai:
+-        model = genai.GenerativeModel('gemini-2.5-pro')
++        model_name = 'gemini-2.5-pro'
+     else:
+-        model = genai.GenerativeModel('gemini-2.5-flash-preview-05-20')
++        model_name = 'gemini-2.5-flash-preview-05-20'
+     
+     # Analyze the structure of existing tests to understand the pattern
+     test_structure = analyze_test_structure(existing_tests)
+@@ -502,9 +501,10 @@
+     
+     try:
+         # Generate response from Gemini
+-        response = model.generate_content(
+-            prompt,
+-            generation_config=genai.types.GenerationConfig(
++        response = client.models.generate_content(
++            model=model_name,
++            contents=prompt,
++            config=genai.types.GenerateContentConfig(
+                 temperature=0.3,  # Moderate creativity
+                 max_output_tokens=4000,
+                 top_p=0.8,
+@@ -512,7 +512,7 @@
+             )
+         )
+         
+-        if not response.text:
++        if not getattr(response, "text", None):
+             raise ValueError("Empty response from Gemini")
+         
+         # Parse the response as YAML
+diff --git a/kaizen/cli/commands/memory.py b/kaizen/cli/commands/memory.py
+--- a/kaizen/cli/commands/memory.py
++++ b/kaizen/cli/commands/memory.py
+@@ -113,7 +113,7 @@
+ from dataclasses import dataclass, asdict
+ import json
+ import os
+-import google.generativeai as genai
++from google import genai  # Updated import for google-genai SDK
+ 
+ 
+ @dataclass
+@@ -1279,24 +1279,29 @@
+                 self.logger.warning("GOOGLE_API_KEY not found, using fallback analysis")
+                 return self._fallback_analysis(test_results_before, test_results_after)
+             
+-            genai.configure(api_key=api_key)
+-            model = genai.GenerativeModel('gemini-2.5-flash-preview-05-20')
++            client = genai.Client(api_key=api_key)
++            model_name = 'gemini-2.5-flash-preview-05-20'
+             
+             # Build analysis prompt
+             prompt = self._build_analysis_prompt(test_results_before, test_results_after)
+             
+-            # Get LLM response
+-            response = model.generate_content(
+-                prompt,
+-                generation_config=genai.types.GenerationConfig(
+-                    temperature=0.1,  # Low temperature for more focused results
+-                    max_output_tokens=2000,
+-                    top_p=0.8,
+-                    top_k=40,
+-                )
++            generation_cfg = genai.types.GenerationConfig(
++                temperature=0.1,  # Low temperature for more focused results
++                max_output_tokens=2000,
++                top_p=0.8,
++                top_k=40,
+             )
+-            
+-            if not response or not response.text:
++            content_cfg = genai.types.GenerateContentConfig(
++                generation_config=generation_cfg
++            )
++            
++            response = client.models.generate_content(
++                model=model_name,
++                contents=prompt,
++                config=content_cfg
++            )
++            
++            if not response or not getattr(response, "text", None):
+                 self.logger.warning("Empty LLM response, using fallback analysis")
+                 return self._fallback_analysis(test_results_before, test_results_after)
+             
+diff --git a/pyproject.toml b/pyproject.toml
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -33,7 +33,7 @@
+     "pydantic>=1.10.0",
+     "PyGithub>=1.59.0",
+     "python-dotenv>=0.19.0",
+-    "google-generativeai>=0.3.2",
++    "google-genai>=1.19.0,<3",
+ ]
+ 
+ [project.optional-dependencies]
+diff --git a/requirements.txt b/requirements.txt
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -7,4 +7,4 @@
+ pydantic>=1.10.0
+ PyGithub>=1.59.0
+ python-dotenv>=0.19.0
+-google-generativeai>=0.3.2 
+\ No newline at end of file
++google-genai>=1.19.0,<3 
+\ No newline at end of file
+diff --git a/setup.py b/setup.py
+--- a/setup.py
++++ b/setup.py
+@@ -20,6 +20,6 @@
+         "pydantic>=1.10.0",
+         "PyGithub>=1.59.0",
+         "python-dotenv>=0.19.0",
+-        "google-generativeai>=0.3.2",
++        "google-genai>=1.19.0,<3",
+     ],
+ ) 
+\ No newline at end of file
