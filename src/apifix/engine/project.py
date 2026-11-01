@@ -143,6 +143,59 @@ def ci_env_vars(repo: Path, names: Iterable[str]) -> dict[str, str]:
     return found
 
 
+_TEST_CONFIG_FILES = ("pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml", ".env", ".env.test")
+_CONFTEST_ENV = re.compile(r"environ|setenv|putenv|load_dotenv")
+DEFAULT_ENV_ORIGIN = "default"
+
+
+def repo_test_env_vars(repo: Path, names: Iterable[str]) -> set[str]:
+    """Which of `names` the repo's own test setup sets: in a pytest/tox config or `.env` file
+    (`NAME=`, `NAME:`, a quoted key) or in a `conftest.py` that writes the environment."""
+    wanted = [n for n in names if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", n)]
+    found: set[str] = set()
+    files = [repo / f for f in _TEST_CONFIG_FILES]
+    files += [repo / "conftest.py", *sorted((repo / "tests").glob("conftest.py"))]
+    for path in files:
+        text = _read(path) if path.is_file() and not path.is_symlink() else None
+        if not text:
+            continue
+        if path.name == "conftest.py" and not _CONFTEST_ENV.search(text):
+            continue
+        for name in wanted:
+            if re.search(rf"(?<![\w$]){name}\s*[=:]|[\"']{name}[\"']", text):
+                found.add(name)
+    return found
+
+
+def sandbox_env_vars(repo: Path, names: Iterable[str]) -> dict[str, str]:
+    """The variables the sandbox's test phase gets a placeholder for (name -> why): all of
+    `names`, as the repo's tests run with no key and network off, except those the repo's own
+    test setup sets. Where a CI workflow sets one, the value is the workflow file; otherwise
+    DEFAULT_ENV_ORIGIN."""
+    names = list(names)
+    own = repo_test_env_vars(repo, names)
+    ci = ci_env_vars(repo, names)
+    return {n: ci.get(n, DEFAULT_ENV_ORIGIN) for n in names if n not in own}
+
+
+def sandbox_env_lines(env: dict[str, str]) -> list[str]:
+    """The report's bullets for `sandbox_env_vars`: one per variable a CI workflow sets, one for
+    the dummy values the sandbox set on its own."""
+    lines = [
+        f"- Sandbox env: `{name}` set to a placeholder in the test phase, because the repo's "
+        f"CI sets it (`{origin}`); the sandbox has no network"
+        for name, origin in env.items()
+        if origin != DEFAULT_ENV_ORIGIN
+    ]
+    dummy = [name for name, origin in env.items() if origin == DEFAULT_ENV_ORIGIN]
+    if dummy:
+        lines.append(
+            f"- Sandbox env: sandbox set dummy {', '.join(dummy)} (the repo's own test setup "
+            "does not set them; the sandbox has no network, so no real key is needed)"
+        )
+    return lines
+
+
 def _python_constraint(repo: Path) -> tuple[tuple[tuple[str, str], ...], str] | None:
     text = _read(repo / "pyproject.toml")
     if text:

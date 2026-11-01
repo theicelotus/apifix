@@ -37,14 +37,14 @@ MARK = "# EXTRA-FIXED"
 MESSAGE = "AssertionError: assert fake_answer == 'extra'"
 
 
-def judging(extra: str = STILL, *, fixed_by: str = MARK):
+def judging(extra: str = STILL, *, fixed_by: str = MARK, message: str = MESSAGE):
     """The fake test run plus one test that fails until `fixed_by` is in app.py or the tests,
     and a fix whose changed lines no test executes (verified_weak)."""
 
     def judge_with_extra(tree: Path):
         r = judge(tree)
         text = (tree / "app.py").read_text() + (tree / "tests" / "test_app.py").read_text()
-        outcome = ("passed",) if fixed_by in text else ("failed", MESSAGE)
+        outcome = ("passed",) if fixed_by in text else ("failed", message)
         weak = run(*[(t.id, t.outcome, t.message) for t in r.tests], (extra, *outcome))
         weak.coverage = {"app.py": FileCoverage(frozenset({1}), frozenset(range(2, 30)))}
         return weak
@@ -111,6 +111,19 @@ def test_no_extra_attempt_when_none_is_left(repo):
     assert "No extra attempt before settling for weak evidence: not retried" in (
         result.report_markdown
     )
+
+
+def test_no_extra_attempt_when_the_test_imports_a_repo_module_the_checkout_lacks(tmp_path):
+    repo = write_tree(tmp_path / "repo", {**ORIGINAL, "pkg/__init__.py": ""})
+    message = (
+        "ImportError while importing test module\nTraceback:\npkg/cli.py:16: in <module>\n"
+        "E   ModuleNotFoundError: No module named 'pkg.label_prediction'"
+    )
+    result = go(repo, FakeLLM([tools(FIX_APP, FIX_TESTS), done()]), judging(message=message))
+    assert (result.outcome, result.attempts) == ("verified_weak", 1)
+    first = result.trajectory["attempts"][0]
+    assert first["weak_retried"] is False
+    assert first["weak_retry"].startswith("not retried: missing repo module pkg.label_prediction")
 
 
 def test_no_extra_attempt_for_a_failing_test_the_fix_did_not_touch(repo):
@@ -203,11 +216,33 @@ def test_collection_import_errors_are_split_by_whether_the_migration_is_involved
             collection_v(message, edited), root, {"google.generativeai"}, tests
         )
 
-    assert split(import_error("pkg.label_prediction")) == (tests, {})  # the repo's own module
-    assert split(import_error("google.generativeai"))[1] == {}  # the migrated library
-    assert split(import_error("requests", through="pkg/llms.py"))[1] == {}  # a changed file
-    assert split("collection failure\nImportError while importing test module 'x'.\nTrace")[1] == {}
-    assert split(import_error("requests")) == ({}, {"tests.test_cli": "requests"})  # unrelated
+    assert split(import_error("pkg.cli"))[0] == tests  # a module of the repo that exists
+    assert split(import_error("google.generativeai"))[1:] == ({}, {})  # the migrated library
+    assert split(import_error("requests", through="pkg/llms.py"))[1:] == ({}, {})  # a changed file
+    cut = "collection failure\nImportError while importing test module 'x'.\nTrace"
+    assert split(cut) == (tests, {}, {})
+    assert split(import_error("requests")) == ({}, {"tests.test_cli": "requests"}, {})  # unrelated
+
+
+def test_a_module_the_checkout_lacks_is_not_retried(tmp_path):
+    """ailabel-genai-4: tests/entrypoints/test_cli.py -> ailabel.entrypoints.cli ->
+    `from ailabel.label_prediction import ...`, which the checkout does not have."""
+    root = write_tree(tmp_path, {"pkg/__init__.py": "", "pkg/cli.py": "", "pkg/llms.py": ""})
+    tests = {"tests.test_cli": "why"}
+
+    def split(message, edited=("pkg/llms.py",)):
+        return split_environmental(
+            collection_v(message, edited), root, {"google.generativeai"}, tests
+        )
+
+    absent = {"tests.test_cli": "pkg.label_prediction"}
+    assert split(import_error("pkg.label_prediction", through="pkg/cli.py")) == ({}, {}, absent)
+    # the traceback runs through a file the fix edited: the migration may be involved
+    assert split(import_error("pkg.label_prediction", through="pkg/llms.py"))[0] == tests
+    # a package or module that exists is not missing, nor is a top-level module (environmental)
+    assert split(import_error("pkg.llms"))[2] == {}
+    assert split(import_error("nopkg.sub"))[2] == {}
+    assert split(import_error("nopkg"))[2] == {}
 
 
 def test_retry_prompt_shows_a_collection_failure(tmp_path):

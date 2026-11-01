@@ -71,10 +71,11 @@ from apifix.engine.pin_edits import (
 )
 from apifix.engine.project import (
     DEFAULT_PYTHON,
-    ci_env_vars,
     detect_python_version,
     is_test_file,
     python_at_least,
+    sandbox_env_lines,
+    sandbox_env_vars,
 )
 from apifix.engine.regions import (
     IMPORTS,
@@ -516,7 +517,7 @@ class _Job:
         self.already_migrated: AlreadyMigrated | None = None
         # third-party modules the repo imports but declares nowhere (read before the baseline)
         self.undeclared: list[UndeclaredImport] = []
-        self.ci_env = ci_env_vars(repo, migration.ci_env_placeholders)
+        self.ci_env = sandbox_env_vars(repo, migration.ci_env_placeholders)
         self.sandbox_env = {name: migration.ci_env_placeholders[name] for name in self.ci_env}
         # wall-clock seconds: LLM requests, and sandbox work (baseline run, verify() calls)
         self.llm_seconds = 0.0
@@ -2478,10 +2479,19 @@ class _Job:
             return skip("no attempt is left")
         if environment_incomplete(v) or sandbox_requirements_pin(v) or pytest_usage_error(v):
             return skip("the sandbox's environment is incomplete, which no edit fixes")
-        kept, environmental = split_environmental(v, self.work, self.migration.api_modules, tests)
+        kept, environmental, missing = split_environmental(
+            v, self.work, self.migration.api_modules, tests
+        )
         if not kept:
-            modules = ", ".join(f"`{m}`" for m in sorted(set(environmental.values())))
-            return skip(f"they fail to import {modules}, a package the migration does not touch")
+            reasons = []
+            if missing:
+                reasons.append("missing repo module " + ", ".join(sorted(set(missing.values()))))
+            if environmental:
+                modules = ", ".join(f"`{m}`" for m in sorted(set(environmental.values())))
+                reasons.append(
+                    f"they fail to import {modules}, a package the migration does not touch"
+                )
+            return skip("; ".join(reasons))
         attempt.weak_tests = tests = kept
         earlier = [a for a in self.attempts[:-1] if a.result == "verified_weak"]
         if any(len(a.weak_tests) <= len(tests) for a in earlier):
@@ -3185,11 +3195,7 @@ def report_markdown(
             f"- Files that failed a check and were sent back once: {nudges.count('check_retry')}"
         )
     lines += _truncation_lines(job)
-    for name, workflow in job.ci_env.items():
-        lines.append(
-            f"- Sandbox env: `{name}` set to a placeholder in the test phase, because the repo's "
-            f"CI sets it (`{workflow}`); the sandbox has no network"
-        )
+    lines += sandbox_env_lines(job.ci_env)
     lines += sandbox_requirements_lines(job.sandbox)
     lines += _upgraded_lines(job)
     lines += [f"- apifix set: {pin_line(e)}" for f in job.pin_files for e in f.edits]

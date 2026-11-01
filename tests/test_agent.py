@@ -1036,11 +1036,12 @@ def _uncalled_feedback(repo, app_edit, tests_edit=FIX_TESTS) -> str:
     return last_user_text(llm.requests[2])
 
 
-def test_an_uncalled_mock_with_a_keyless_client_gets_the_missing_key_hint(repo):
+def test_an_uncalled_mock_with_a_keyless_client_gets_no_missing_key_hint_with_the_dummy_key(repo):
+    # the sandbox sets a dummy key unless the repo's test setup sets one, so the hint (the tests
+    # run without a key) applies only when the migration's key variables are not placeholders
     feedback = _uncalled_feedback(repo, edit("app.py", APP_OLD, APP_KEYLESS))
-    assert UNCALLED_HINT in feedback
-    assert 'patch("app.openai.OpenAI"), without autospec' in feedback
-    assert feedback.count("Hint: a mock was never called") == 1
+    assert UNCALLED_HINT not in feedback  # the dummy OPENAI_API_KEY is set: nothing to explain
+    assert "Hint: a mock was never called" not in feedback
 
 
 def test_an_uncalled_mock_in_a_test_patching_the_client_class_gets_no_missing_key_hint(repo):
@@ -1883,10 +1884,23 @@ def test_ci_env_placeholder_reaches_every_sandbox_run_and_the_report(repo):
     ) in result.report_markdown
 
 
-def test_no_placeholder_without_ci_setting_the_key(repo):
+def test_dummy_key_is_set_when_the_repo_does_not_set_one(repo):
     sandbox = JudgingSandbox()
     result = go(repo, FakeLLM([tools(FIX_APP, FIX_TESTS), done()]), sandbox)
-    assert sandbox.envs == [{}, {}]  # agent mode too: baseline and verification
+    placeholder = {
+        "OPENAI_API_KEY": get_migration("openai-v1").ci_env_placeholders["OPENAI_API_KEY"]
+    }
+    assert sandbox.envs == [placeholder, placeholder]  # agent mode too: baseline and verification
+    assert result.trajectory["job"]["sandbox_env_placeholders"] == {"OPENAI_API_KEY": "default"}
+    assert "- Sandbox env: sandbox set dummy OPENAI_API_KEY" in result.report_markdown
+    assert "because the repo's CI sets it" not in result.report_markdown
+
+
+def test_no_dummy_key_when_the_repos_own_test_config_sets_it(repo):
+    (repo / "pytest.ini").write_text("[pytest]\nenv =\n    OPENAI_API_KEY=test\n")
+    sandbox = JudgingSandbox()
+    result = go(repo, FakeLLM([tools(FIX_APP, FIX_TESTS), done()]), sandbox)
+    assert sandbox.envs == [{}, {}]
     assert result.trajectory["job"]["sandbox_env_placeholders"] == {}
     assert "Sandbox env" not in result.report_markdown
 

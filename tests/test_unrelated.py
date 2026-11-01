@@ -1011,3 +1011,89 @@ def test_a_literal_the_migrated_file_lacks_is_reported_at_its_original_line():
     assert genai_errors(GENAI_OLD, gone) == [
         f"original line 20: the string 'Test prompt' {MISSING}"
     ]
+
+
+# The module-level key check of ailabel/lib/llms.py: ailabel-genai-2 removed it.
+GUARD_OLD = textwrap.dedent(
+    """\
+    import os
+    import google.generativeai as genai
+
+    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "API key not found. Please set the GOOGLE_API_KEY environment variable."
+        )
+    genai.configure(api_key=api_key, transport="rest")
+
+
+    def get_gemini(system_instruction=None):
+        return genai.GenerativeModel("gemini-2.0-flash", system_instruction=system_instruction)
+    """
+)
+GUARD_KEPT = textwrap.dedent(
+    """\
+    import os
+    from google import genai
+
+    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "API key not found. Please set the GOOGLE_API_KEY environment variable."
+        )
+    client = genai.Client(api_key=api_key)
+
+
+    def get_gemini(system_instruction=None):
+        return client.models.generate_content(model="gemini-2.0-flash", contents="x")
+    """
+)
+GUARD_REMOVED = GUARD_KEPT.replace(
+    "if not api_key:\n    raise ValueError(\n"
+    '        "API key not found. Please set the GOOGLE_API_KEY environment variable."\n'
+    "    )\n",
+    "",
+)
+GUARD_MOVED = GUARD_REMOVED.replace(
+    "def get_gemini(system_instruction=None):\n",
+    "def get_gemini(system_instruction=None):\n"
+    "    if not api_key:\n"
+    '        raise ValueError("API key not found.")\n',
+)
+
+
+def guard_errors(new: str) -> list[str]:
+    findings = scan_text("ailabel/lib/llms.py", GUARD_OLD, GENAI)
+    assert findings
+    return unrelated_edits(GUARD_OLD, new, findings, GENAI.api_modules)
+
+
+def test_a_kept_module_level_guard_passes():
+    assert guard_errors(GUARD_KEPT) == []
+
+
+def test_a_removed_module_level_raise_guard_is_reported():
+    assert GUARD_REMOVED != GUARD_KEPT
+    errors = guard_errors(GUARD_REMOVED)
+    assert sum("module-level guard" in e for e in errors) == 1
+    assert any(
+        e.startswith("original line 5: the module-level guard `if not api_key: raise")
+        for e in errors
+    )
+
+
+def test_a_guard_moved_into_a_function_is_reported():
+    assert sum("module-level guard" in e for e in guard_errors(GUARD_MOVED)) == 1
+
+
+def test_a_raise_guard_inside_a_function_is_not_a_module_guard():
+    old = GUARD_OLD.replace(
+        "def get_gemini(system_instruction=None):\n",
+        "def get_gemini(system_instruction=None):\n"
+        "    if not api_key:\n"
+        "        raise ValueError('k')\n",
+    )
+    new = GUARD_KEPT
+    findings = scan_text("ailabel/lib/llms.py", old, GENAI)
+    errors = unrelated_edits(old, new, findings, GENAI.api_modules)
+    assert not any("module-level guard" in e for e in errors)

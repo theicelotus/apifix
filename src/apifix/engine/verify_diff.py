@@ -27,7 +27,7 @@ from apifix.engine.imports import (
     undeclared_section,
 )
 from apifix.engine.migrations import Migration, get_migration
-from apifix.engine.project import ci_env_vars
+from apifix.engine.project import sandbox_env_lines, sandbox_env_vars
 from apifix.engine.sandbox import Sandbox, SandboxResult
 from apifix.engine.scanner import scan
 from apifix.engine.verifier import (
@@ -132,7 +132,7 @@ def verify_diff(
     start = time.monotonic()
     repo_commit, repo_dirty = repo_state(original)
     findings = scan(original, mig).findings
-    ci_env = ci_env_vars(original, mig.ci_env_placeholders)
+    ci_env = sandbox_env_vars(original, mig.ci_env_placeholders)
     env = {name: mig.ci_env_placeholders[name] for name in ci_env}
     with tempfile.TemporaryDirectory(prefix="apifix-verify-") as tmp:
         work = Path(tmp) / original.name
@@ -232,11 +232,7 @@ def _report(
         f"- Time: {_seconds(duration)} total; sandbox {_seconds(baseline_s + verify_s)} "
         f"(baseline {_seconds(baseline_s)}, verification {_seconds(verify_s)})",
     ]
-    for name, workflow in ci_env.items():
-        lines.append(
-            f"- Sandbox env: `{name}` set to a placeholder in the test phase, because the repo's "
-            f"CI sets it (`{workflow}`); the sandbox has no network"
-        )
+    lines += sandbox_env_lines(ci_env)
     lines += dependency_lines
     retried = [
         label

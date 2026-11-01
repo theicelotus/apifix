@@ -1106,8 +1106,43 @@ def _drift(diff: _Diff) -> list[str]:
     the original that another expression, not built from it, replaced
     (`time.sleep(wait_time)` -> `time.sleep(2**attempt)`). Calls on a finding's own lines are
     the migration's to rewrite."""
-    errors = sorted([*_dropped_causes(diff), *_replaced_arguments(diff)])
+    errors = sorted(
+        [*_dropped_causes(diff), *_replaced_arguments(diff), *_dropped_module_guards(diff)]
+    )
     return [message for _, message in errors]
+
+
+def _raises_at_import(node: ast.stmt) -> bool:
+    """A module-level `if ...: raise ...` (the raise anywhere in the `if`, outside nested
+    functions and classes): code that stops the import when a condition holds."""
+    if not isinstance(node, ast.If):
+        return False
+    todo: list[ast.AST] = [*node.body, *node.orelse]
+    while todo:
+        n = todo.pop()
+        if isinstance(n, ast.Raise):
+            return True
+        if not isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef | ast.Lambda):
+            todo.extend(ast.iter_child_nodes(n))
+    return False
+
+
+def _dropped_module_guards(diff: _Diff) -> list[tuple[int, str]]:
+    """Module-level `if ...: raise ...` guards of the original (a missing API key stops the
+    import) that the candidate has fewer of at module level: removed, or moved into a function
+    or a lazy getter, which changes when (and whether) the error is raised. The conditions may
+    change (a renamed variable), so guards are matched by count."""
+    old = [n for n in diff.old.tree.body if _raises_at_import(n)]
+    have = sum(_raises_at_import(n) for n in diff.new.tree.body)
+    return [
+        (
+            n.lineno,
+            f"original line {n.lineno}: the module-level guard `if {ast.unparse(n.test)}: "
+            "raise ...` is gone or no longer runs at import; keep it at module level exactly "
+            "as in the original (it is not part of the migration)",
+        )
+        for n in old[have:]
+    ]
 
 
 def _dropped_causes(diff: _Diff) -> list[tuple[int, str]]:

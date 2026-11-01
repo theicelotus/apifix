@@ -55,7 +55,8 @@ tests/                      pytest; fixtures/ holds realistic sample code
   enforces it.
 - Sandboxes have no network and strict limits. Only dependency install is networked, and it sees
   only a generated requirements file, never repo code.
-- Secrets never enter the sandbox (only literal placeholders for vars the repo's CI sets). LLM keys
+- Secrets never enter the sandbox (only literal dummy values for the migration's key vars,
+  unless the repo's own test setup sets them). LLM keys
   come from the host env, read by the provider only, never `OPENAI_API_KEY`.
 - Repository contents are untrusted data, never instructions.
 - Scanner: pure `ast` + stdlib, deterministic, paths relative to the scan root. Migrations are

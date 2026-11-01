@@ -21,6 +21,9 @@ from apifix.engine.project import (
     load_sandbox_requirements,
     missing_old_side,
     pytest_config,
+    repo_test_env_vars,
+    sandbox_env_lines,
+    sandbox_env_vars,
 )
 
 # what detect_tests runs: pytest, past collection errors
@@ -859,6 +862,55 @@ def test_ci_env_vars_without_workflows_or_names(tmp_path):
     assert ci_env_vars(tmp_path, ["OPENAI_API_KEY"]) == {
         "OPENAI_API_KEY": ".github/workflows/a.yml"
     }
+
+
+KEYS = ["GOOGLE_API_KEY", "GEMINI_API_KEY"]
+
+
+def test_sandbox_env_vars_default_to_dummy_keys_for_every_name(tmp_path):
+    assert sandbox_env_vars(tmp_path, KEYS) == {k: "default" for k in KEYS}
+
+
+def test_sandbox_env_vars_name_the_workflow_when_ci_sets_one(tmp_path):
+    _workflow(tmp_path, "ci.yml", "env:\n  GEMINI_API_KEY: ${{ secrets.K }}\n")
+    assert sandbox_env_vars(tmp_path, KEYS) == {
+        "GOOGLE_API_KEY": "default",
+        "GEMINI_API_KEY": ".github/workflows/ci.yml",
+    }
+
+
+@pytest.mark.parametrize(
+    ("path", "text"),
+    [
+        ("pytest.ini", "[pytest]\nenv =\n    GOOGLE_API_KEY=test\n"),
+        ("tox.ini", "[testenv]\nsetenv =\n    GOOGLE_API_KEY = test\n"),
+        ("pyproject.toml", '[tool.pytest.ini_options]\nenv = ["GOOGLE_API_KEY=test"]\n'),
+        (".env", "GOOGLE_API_KEY=test\n"),
+        ("conftest.py", 'import os\nos.environ["GOOGLE_API_KEY"] = "test"\n'),
+        (
+            "tests/conftest.py",
+            'def pytest_configure():\n    os.environ.setdefault("GOOGLE_API_KEY", "t")\n',
+        ),
+    ],
+)
+def test_a_key_the_repos_own_test_setup_sets_gets_no_dummy(tmp_path, path, text):
+    (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / path).write_text(text)
+    assert repo_test_env_vars(tmp_path, KEYS) == {"GOOGLE_API_KEY"}
+    assert sandbox_env_vars(tmp_path, KEYS) == {"GEMINI_API_KEY": "default"}
+
+
+def test_a_conftest_that_does_not_touch_the_environment_sets_nothing(tmp_path):
+    (tmp_path / "conftest.py").write_text('KEY = "GOOGLE_API_KEY"\n')
+    assert sandbox_env_vars(tmp_path, KEYS) == {k: "default" for k in KEYS}
+
+
+def test_sandbox_env_lines_say_which_dummy_values_the_sandbox_set():
+    env = {"GOOGLE_API_KEY": "default", "GEMINI_API_KEY": "default", "X": ".github/workflows/a.yml"}
+    lines = sandbox_env_lines(env)
+    assert lines[0].startswith("- Sandbox env: `X` set to a placeholder")
+    assert lines[1].startswith("- Sandbox env: sandbox set dummy GOOGLE_API_KEY, GEMINI_API_KEY")
+    assert sandbox_env_lines({}) == []
 
 
 # --- declared dependencies and --sandbox-requirements ---------------------------------------

@@ -71,21 +71,54 @@ def environmental_import_error(
     )
 
 
+def missing_repo_module(
+    message: str, work: Path, api_modules: Collection[str], edited: Collection[str]
+) -> str | None:
+    """The dotted module a collection ImportError names when it is a submodule of one of the
+    repo's own packages that the checkout does not have (`from ailabel.label_prediction import
+    ...` with `ailabel/` present and no `label_prediction` in it): the migration cannot create
+    it. None when the traceback runs through a file the fix edited, the module is the migrated
+    library's, or it is not a submodule of a package in the checkout."""
+    found = MISSING_MODULE.search(message)
+    if not found or "ImportError" not in message or "." not in found.group(1):
+        return None
+    if any(path in message for path in edited):
+        return None
+    name = found.group(1)
+    if in_modules(name, api_modules):
+        return None
+    parts = name.split(".")
+    for base in ("", "src"):
+        root = work / base
+        if not (root / parts[0]).is_dir():
+            continue
+        if not any(
+            (root.joinpath(*parts[:-1]) / f"{parts[-1]}{suffix}").exists() for suffix in ("", ".py")
+        ):
+            return name
+    return None
+
+
 def split_environmental(
     v: Verification, work: Path, api_modules: Collection[str], tests: dict[str, str]
-) -> tuple[dict[str, str], dict[str, str]]:
-    """`tests` split into those worth a retry and those whose failure is an import error about
-    an unrelated missing package (test id -> the missing module)."""
+) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    """`tests` split into those worth a retry, those whose failure is an import error about an
+    unrelated missing package (test id -> the missing module), and those that import a module
+    of the repo's own that the checkout lacks (test id -> its dotted name)."""
     edited = {c.path for c in v.changes if c.kind != "deleted"}
     kept: dict[str, str] = {}
     environmental: dict[str, str] = {}
+    missing: dict[str, str] = {}
     for test, why in tests.items():
         message = fixed_message(v, test)
-        if environmental_import_error(message, work, api_modules, edited):
+        absent = missing_repo_module(message, work, api_modules, edited)
+        if absent:
+            missing[test] = absent
+        elif environmental_import_error(message, work, api_modules, edited):
             environmental[test] = MISSING_MODULE.search(message).group(1)  # type: ignore[union-attr]
         else:
             kept[test] = why
-    return kept, environmental
+    return kept, environmental, missing
 
 
 def patches(path: Path, modules: Collection[str]) -> bool:
